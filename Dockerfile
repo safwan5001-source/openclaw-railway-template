@@ -12,6 +12,21 @@ RUN apt-get update \
     build-essential \
     zip \
     unzip \
+    libnspr4 \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libdbus-1-3 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libasound2 \
+    libgbm1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libatspi2.0-0 \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g \
