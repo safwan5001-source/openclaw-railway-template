@@ -27,6 +27,9 @@ RUN apt-get update \
     libxfixes3 \
     libxrandr2 \
     libatspi2.0-0 \
+    chromium \
+  && command -v chromium \
+  && chromium --version \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g \
