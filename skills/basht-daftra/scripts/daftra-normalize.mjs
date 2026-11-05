@@ -84,3 +84,16 @@ export function pickColumns(records, columns) {
   if (columns.length < 1 || columns.length > 100 || columns.some(c => !/^[a-zA-Z0-9_]+$/.test(c))) throw Error('Invalid columns');
   return records.map(record => Object.fromEntries(columns.map(col => [col, record?.[col] ?? null])));
 }
+
+// Daftra list rows can carry secrets: invoices include `password` plus hash-authenticated
+// `invoice_pdf_url` / `invoice_html_url` links. These must never reach an export or a chat reply
+// unless the caller explicitly allowlists the column (and even then URLs/passwords stay blocked).
+const SENSITIVE_KEY = /(^|_)(password|passwd|token|secret|apikey|api_key|hash)(_|$)|_url$/i;
+export function isSensitiveKey(key) { return SENSITIVE_KEY.test(String(key)); }
+export function redactRecord(value) {
+  if (Array.isArray(value)) return value.map(redactRecord);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).filter(([k]) => !isSensitiveKey(k)).map(([k, v]) => [k, redactRecord(v)]));
+  }
+  return value;
+}
