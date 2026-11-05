@@ -106,6 +106,7 @@ function buildItems(rawItems, kind, index, warnings) {
     return body;
   });
   const total = subtotal + tax1Total + tax2Total;
+  if (total >= 10n ** 12n * ONE) throw Error('Document total exceeds the supported maximum');
   return { items, totals: { subtotal: format(subtotal), tax1: format(tax1Total), tax2: format(tax2Total), total: format(total), estimated: true } };
 }
 
@@ -224,4 +225,27 @@ export function prepareFinancialAction(type, input, options = {}) {
     canSubmit: false,
     requiresExplicitApproval: true,
   });
+}
+
+// ---- strict body shape (defence in depth: execute rebuilds nothing, it only sends what fits this) ------
+const LINE_KEYS = ['item', 'quantity', 'unit_price', 'tax1', 'tax2', 'discount', 'discount_type', 'product_id', 'description'];
+export const BODY_SHAPES = Object.freeze({
+  sales_invoice:    { Invoice: ['client_id', 'draft', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
+  estimate:         { Invoice: ['client_id', 'draft', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
+  purchase_invoice: { PurchaseOrder: ['supplier_id', 'date', 'currency_code'], PurchaseOrderItem: LINE_KEYS },
+  expense:          { Expense: ['amount', 'date', 'note', 'expense_category_id', 'supplier_id', 'treasury_id', 'vendor', 'unique_id', 'status'] },
+  invoice_payment:  { InvoicePayment: ['invoice_id', 'amount', 'payment_method', 'date', 'transaction_id', 'treasury_id'] },
+  client_payment:   { ClientPayment: ['client_id', 'amount', 'payment_method', 'date', 'transaction_id', 'treasury_id', 'notes'] },
+});
+export function assertBodyShape(type, body) {
+  const shape = Object.hasOwn(BODY_SHAPES, type) ? BODY_SHAPES[type] : null;
+  if (!shape || !body || typeof body !== 'object' || Array.isArray(body)) throw Error('Unknown request body');
+  const top = Object.keys(body);
+  if (top.length !== Object.keys(shape).length || top.some((k) => !Object.hasOwn(shape, k))) throw Error('Request body has unexpected sections');
+  for (const [section, keys] of Object.entries(shape)) {
+    const value = body[section];
+    const rows = Array.isArray(value) ? value : [value];
+    if (!rows.length || rows.some((r) => !r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).some((k) => !keys.includes(k))))
+      throw Error('Request body has unexpected fields in ' + section);
+  }
 }

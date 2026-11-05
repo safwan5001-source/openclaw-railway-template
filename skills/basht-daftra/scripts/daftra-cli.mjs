@@ -55,9 +55,8 @@ function publicProposal(p) {
     checks: p.checks, blocking: p.blocking, warnings: p.warnings, duplicates: p.duplicates,
     request_hash: p.request_hash,
     next: p.status === 'READY_FOR_APPROVAL'
-      ? 'NOTHING HAS BEEN SENT. Show this preview to the user. Only if they reply with exactly this phrase may you run execute: ' + p.required_phrase
+      ? 'NOTHING HAS BEEN SENT. Show this preview to the user and ask them to review and obtain the approval phrase from the operator tool: `node daftra-approve.mjs show ' + p.id + '` (run in a trusted shell). You cannot derive the phrase. Run execute only with the phrase the user sends you.'
       : 'BLOCKED: nothing can be executed. Fix the blocking items and propose again.',
-    approval_phrase: p.status === 'READY_FOR_APPROVAL' ? p.required_phrase : undefined,
   };
 }
 
@@ -137,8 +136,8 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
       return await executeProposal({ id: a1, phrase: flags.phrase, actor }, { env, fetcher });
     }
     case 'resolve': {
-      if (!a1 || !['true', 'false'].includes(flags.created)) throw Error('Usage: resolve <proposal-id> --created true|false [--record-id N]');
-      return await resolveProposal({ id: a1, created: flags.created === 'true', recordId: flags['record-id'], actor }, { env });
+      if (!a1 || !['true', 'false'].includes(flags.created) || !flags.code) throw Error('Usage: resolve <proposal-id> --created true|false --code <code from daftra-approve.mjs resolve> [--record-id N]');
+      return await resolveProposal({ id: a1, created: flags.created === 'true', recordId: flags['record-id'], code: flags.code, actor }, { env });
     }
     default:
       throw Error('Unknown command. Run: capabilities');

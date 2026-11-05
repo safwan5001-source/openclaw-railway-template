@@ -8,7 +8,7 @@ import { FakeDaftra } from './daftra-fake.test-helper.mjs';
 
 async function setup(seed, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'basht-cli-'));
-  const env = { OPENCLAW_WORKSPACE_DIR: dir, DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: 'k-secret', ...extra };
+  const env = { OPENCLAW_WORKSPACE_DIR: dir, DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: 'k-secret', DAFTRA_APPROVAL_SECRET: 'operator-secret-0123456789-0123456789-abcdef', ...extra };
   return { dir, env, fake: new FakeDaftra(seed), done: () => rm(dir, { recursive: true, force: true }) };
 }
 const noSleep = async () => {};
@@ -79,11 +79,14 @@ test('propose -> show -> execute end to end through the CLI, with writes gated',
     const p = await run(['propose', 'sales_invoice', '--input', input, '--actor', 'user-1'], { env, fetcher: fake.fetch });
     assert.equal(p.status, 'READY_FOR_APPROVAL');
     assert.match(p.next, /NOTHING HAS BEEN SENT/);
+    assert.equal(JSON.stringify(p).includes('APPROVE prop_'), false);
     assert.equal(fake.posts.length, 0);
     assert.equal((await run(['show', p.proposal_id], { env, fetcher: fake.fetch })).request_hash, p.request_hash);
     await assert.rejects(run(['execute', p.proposal_id, '--phrase', 'ok go'], { env, fetcher: fake.fetch }), (e) => e.code === 'PHRASE_MISMATCH');
     assert.equal(fake.posts.length, 0);
-    const done_ = await run(['execute', p.proposal_id, '--phrase', p.approval_phrase, '--actor', 'user-1'], { env, fetcher: fake.fetch });
+    const { review } = await import('./daftra-approve.mjs');
+    const phrase = (await review(p.proposal_id, env)).match(/APPROVE prop_\S+ \S+ DRAFT [0-9a-f]{16}/)[0];
+    const done_ = await run(['execute', p.proposal_id, '--phrase', phrase, '--actor', 'user-1'], { env, fetcher: fake.fetch });
     assert.equal(done_.status, 'submitted');
     assert.equal(fake.posts.length, 1);
     assert.ok(!JSON.stringify([p, done_]).includes('k-secret'));

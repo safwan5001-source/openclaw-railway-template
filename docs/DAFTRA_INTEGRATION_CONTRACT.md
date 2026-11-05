@@ -50,20 +50,25 @@ Tenant is pinned to `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` root); redirects are
 - Spreadsheet injection: cells starting `= + - @`/control chars get an apostrophe, except strict numbers.
 - Sensitive keys (`password`, `token`, `secret`, `apikey`, `hash`, `*_url`) are stripped; requesting one explicitly is refused.
 
-## 5. Transaction safety (implemented in `daftra-proposal/write/ledger`)
+## 5. Transaction safety (implemented in `daftra-proposal/write/ledger/auth/approve`)
 
-1. **Preview** (`propose`, GET only): references exist, tax ids exist & active in the tenant tax table, exact decimal totals (tax-exclusive/inclusive), API-key role can read the entity, remote duplicates (same party/date/total), payment ≤ invoice `summary_unpaid`, invoice not draft, local ledger duplicate.
-2. **Bound approval**: phrase `APPROVE <proposal-id> <hash8> <DRAFT|FINAL>`, bound to the SHA-256 of the exact request; 15-minute TTL; single use; stored request re-hashed (tamper → refuse).
-3. **Operator kill switch**: `DAFTRA_WRITES_ENABLED=1` must be set on the server (default off).
-4. **Route allowlist**: six POST endpoints (`?send=draft` only query). PUT/PATCH/DELETE do not exist in the code.
-5. **Pre-submit re-check**: balance/duplicates/permissions re-read immediately before sending.
-6. **No blind retry**: one attempt. Network error / 5xx / success-without-id ⇒ `ambiguous`; the identical request is blocked until a human runs `resolve`. 4xx ⇒ `rejected` (nothing created, may re-propose).
-7. **Idempotency**: expenses carry a deterministic `unique_id`; for the others the ledger + duplicate scan is the protection.
-8. **Rate limit**: `DAFTRA_MAX_WRITES_PER_HOUR` (default 20).
-9. **Read-back**: after creation the record is re-read and the total compared with the approved total; mismatch is reported.
-10. **Ledger** `daftra-ledger/ledger.jsonl` (0600): ts, state, proposal id, type, request hash, endpoint, actor, record id, HTTP status. No amounts, names or secrets.
+Threat model: the agent controls CLI arguments and can read/write the workspace, so everything it can see or write is untrusted. The one thing it must not have is the operator's `DAFTRA_APPROVAL_SECRET`; all trust is anchored in HMAC-SHA256 under that secret. (An independent adversarial review found the first design, which printed a derivable phrase and kept unauthenticated proposal/ledger files, bypassable — see "Review findings" below; this section describes the fixed design.)
 
-**Known limit:** the approval phrase proves the agent was given the phrase, not that a human typed it. The hard out-of-band control is the operator's `DAFTRA_WRITES_ENABLED` switch; keep it off except for supervised sessions.
+1. **Preview** (`propose`, GET only): references exist, tax ids exist & are active, exact decimal totals (tax-exclusive/inclusive, ≤12 integer digits), API-key role can read the entity, remote duplicates over **all pages**, payment ≤ invoice `summary_unpaid`, invoice not draft, ledger duplicate.
+2. **Authenticated proposals**: every field that affects what is sent or checked (type, request, hash, totals, party, expiry, mode, acknowledged duplicates, `ready`) is covered by an HMAC `auth`. Any edit without the secret ⇒ `TAMPERED`. Expiry fails closed.
+3. **Out-of-band human approval**: phrase `APPROVE <id> <hash8> <DRAFT|FINAL> <code>`; `<code>` is an HMAC the agent cannot compute and no agent-facing command prints. The human runs the operator tool `daftra-approve.mjs show <id>` in a trusted shell, reviews the stored request, and sends the phrase. Bound to the proposal, 15-minute TTL.
+4. **Operator switches**: `DAFTRA_WRITES_ENABLED=1` (default off) and `DAFTRA_APPROVAL_SECRET` (required).
+5. **Route + body allowlist**: six POST endpoints (`?send=draft` only query) and a per-type body key allowlist. PUT/PATCH/DELETE do not exist in the code.
+6. **Atomic claims**: O_EXCL locks per proposal and per request hash ⇒ parallel `execute` calls send at most once. A proposal is single-use even when it is refused before sending.
+7. **HMAC-chained ledger** (`daftra-ledger/ledger.jsonl`): edits or mid-file truncation ⇒ `LEDGER_TAMPERED`, all writes stop. Records ids, hashes, states, actor, record id — no amounts, names or secrets.
+8. **Pre-submit re-check**: balance/duplicates/permissions re-read immediately before sending, derived from the authenticated request body only.
+9. **No blind retry**: one attempt. Network error / 5xx / success-without-id ⇒ `ambiguous`; the identical request is blocked until a human obtains a resolve code from the operator tool. 4xx ⇒ `rejected` (nothing created, may re-propose).
+10. **Idempotency**: expenses carry a deterministic `unique_id`; others rely on the ledger + duplicate scan. **Rate limit** `DAFTRA_MAX_WRITES_PER_HOUR` (default 20). **Read-back** compares the created total with the approved total.
+
+**Residual limits (honest):**
+- If the agent's process can read the server environment, it can read `DAFTRA_APPROVAL_SECRET` **and `DAFTRA_API_KEY`** and bypass everything (including calling Daftra directly with the key). Software in the same trust domain cannot prevent that. Mitigations: keep writes off (`DAFTRA_WRITES_ENABLED` unset) except in supervised sessions; keep the approval secret only in the operator's shell/secret store rather than the gateway service where the platform allows; use OpenClaw exec allow-lists/sandboxing; restrict the Daftra API key's roles.
+- Truncating the **tail** of the ledger cannot be detected by a chain alone; replay is limited by the 15-minute proposal expiry and the proposal claim lock.
+- Review findings fixed in this revision: self-approval, forged proposals/ledger, parallel double-send, unsigned side fields, ungated `resolve`, page-1-only duplicate scan, export-path TOCTOU, key-name-only redaction, unbounded totals.
 
 ## 6. Not verified / needs the real tenant
 

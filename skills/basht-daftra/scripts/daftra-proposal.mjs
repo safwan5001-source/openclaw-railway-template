@@ -2,16 +2,13 @@
 // validates references, taxes, permissions and duplicates, then stores the exact request that a
 // human must approve by hash. It never creates anything in Daftra.
 import { ACTION_TYPES, prepareFinancialAction, hashRequest } from './daftra-finance-preflight.mjs';
-import { DaftraError, getOne, listPage, listRecords } from './daftra-readonly.mjs';
-import { extractPage } from './daftra-normalize.mjs';
+import { DaftraError, getOne, listPage, listRecords, fetchAllRecords } from './daftra-readonly.mjs';
+import { approvalSecret } from './daftra-auth.mjs';
 import { newProposalId, saveProposal, readLedger, isBlockedByLedger } from './daftra-ledger.mjs';
 import { parseDecimal, format } from './daftra-money.mjs';
 
 export const PROPOSAL_TTL_MS = 15 * 60 * 1000;
 
-export function approvalPhrase(proposal) {
-  return 'APPROVE ' + proposal.id + ' ' + proposal.request_hash.slice(0, 8) + ' ' + (proposal.mode === 'draft' ? 'DRAFT' : 'FINAL');
-}
 
 const num = (v) => { try { return parseDecimal(String(v ?? ''), 'n', { maxDecimals: 6 }); } catch { return null; } };
 
@@ -42,16 +39,16 @@ async function findDuplicates(type, preview, env, fetcher) {
   const near = (v) => { const a = num(v); const b = num(total); return a !== null && b !== null && (a > b ? a - b : b - a) <= 10_000n; }; // <= 0.01
   if (type === 'sales_invoice' || type === 'estimate') {
     const entity = type === 'sales_invoice' ? 'invoices' : 'estimates';
-    const page = await listPage(entity, { client_id: preview.client_id, date_from: preview.date, date_to: preview.date, limit: 100 }, env, fetcher);
+    const page = await fetchAllRecords(entity, { query: { client_id: preview.client_id, date_from: preview.date, date_to: preview.date } }, env, fetcher);
     for (const r of page.records) if (near(r.summary_total)) out.push({ entity, id: String(r.id) });
   } else if (type === 'expense') {
-    const page = await listPage('expenses', { date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total, limit: 100 }, env, fetcher);
+    const page = await fetchAllRecords('expenses', { query: { date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total } }, env, fetcher);
     for (const r of page.records) out.push({ entity: 'expenses', id: String(r.id) });
   } else if (type === 'client_payment') {
-    const page = await listPage('client_payments', { client_id: preview.client_id, date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total, limit: 100 }, env, fetcher);
+    const page = await fetchAllRecords('client_payments', { query: { client_id: preview.client_id, date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total } }, env, fetcher);
     for (const r of page.records) out.push({ entity: 'client_payments', id: String(r.id) });
   } else if (type === 'invoice_payment') {
-    const page = await listPage('invoice_payments', { date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total, limit: 100 }, env, fetcher);
+    const page = await fetchAllRecords('invoice_payments', { query: { date_from: preview.date, date_to: preview.date, amount_from: total, amount_to: total } }, env, fetcher);
     for (const r of page.records) if (String(r.invoice_id) === String(preview.invoice_id)) out.push({ entity: 'invoice_payments', id: String(r.id) });
   }
   return out;
@@ -98,6 +95,7 @@ export async function collectChecks(type, preview, env, fetcher, acknowledged = 
 
 export async function createProposal(type, input, { env = process.env, fetcher = fetch, actor = 'unknown', now = Date.now() } = {}) {
   if (!Object.hasOwn(ACTION_TYPES, type)) throw Error('Unsupported financial action');
+  approvalSecret(env); // proposals are authenticated; refuse early when the operator secret is not configured
   // Tax table: required for invoice-like documents so every tax id is verified against this tenant.
   let taxes; const preBlocking = [];
   if (['sales_invoice', 'estimate', 'purchase_invoice'].includes(type)) {
@@ -124,6 +122,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     expires_at: new Date(now + PROPOSAL_TTL_MS).toISOString(),
     actor,
     type,
+    ready: effective.length === 0,
     status: effective.length ? 'BLOCKED' : 'READY_FOR_APPROVAL',
     mode: preview.mode,
     effects: preview.effects,
@@ -139,7 +138,6 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     acknowledged_duplicates: [...acknowledged],
   };
   if (hashRequest(proposal.request) !== proposal.request_hash) throw Error('Internal hash mismatch');
-  proposal.required_phrase = approvalPhrase(proposal);
   await saveProposal(proposal, env);
   return proposal;
 }

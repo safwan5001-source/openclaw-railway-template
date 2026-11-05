@@ -2,6 +2,7 @@
 // No API calls or financial writes. Generated files are never "official Daftra documents".
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
+import { safeOutputPath } from './daftra-paths.mjs';
 import { resolve } from 'node:path';
 import { guessNumericColumns, safeCell } from './daftra-cells.mjs';
 import { toDocx, toXlsx } from './daftra-office.mjs';
@@ -54,7 +55,8 @@ export async function exportData(format, records, columns, metadata, output, opt
   else if (format === 'xlsx') body = toXlsx(records, columns, { title, metadata: meta, numericColumns, maxRows });
   else if (format === 'docx') body = toDocx(records, columns, { title, metadata: meta, maxRows: Math.min(maxRows, MAX_ROWS) });
   else body = await renderReportPdf({ title, columns, records, metadata: meta }, { env: opts.env, runner: opts.runner });
-  const path = resolve(output);
+  // Re-validate immediately before writing: the fetch above may have taken minutes (symlink swap / TOCTOU).
+  const path = opts.env ? safeOutputPath(output, format, opts.env) : resolve(output);
   await writeFile(path, body, { flag: 'wx', mode: 0o600 });
   return { path, format, record_count: records.length, bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') };
 }

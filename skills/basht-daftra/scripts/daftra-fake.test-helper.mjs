@@ -38,10 +38,13 @@ export class FakeDaftra {
       return rec ? new Response(JSON.stringify({ code: 200, data: { [model]: rec } }), { status: 200 })
         : new Response(JSON.stringify({ message: 'not found' }), { status: 404 });
     }
-    const rows = resource === 'taxes' ? this.taxes : (this.lists[resource] ?? []);
+    const all = resource === 'taxes' ? this.taxes : (this.lists[resource] ?? []);
+    const limit = Number(url.searchParams.get('limit') || 20); const page = Number(url.searchParams.get('page') || 1);
+    const pageCount = Math.ceil(all.length / limit);
+    const rows = all.slice((page - 1) * limit, page * limit);
     return new Response(JSON.stringify({
       code: 200, data: rows.map((r) => ({ [model]: r })),
-      pagination: { prev: null, next: null, page: 1, page_count: rows.length ? 1 : 0, total_results: rows.length },
+      pagination: { prev: page > 1 ? 'p' : null, next: page < pageCount ? 'n' : null, page, page_count: pageCount, total_results: all.length },
     }), { status: 200 });
   };
 }

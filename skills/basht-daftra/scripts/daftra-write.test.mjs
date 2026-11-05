@@ -4,19 +4,25 @@ import { mkdtemp, rm, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeDaftra } from './daftra-fake.test-helper.mjs';
-import { createProposal, approvalPhrase } from './daftra-proposal.mjs';
+import { createProposal } from './daftra-proposal.mjs';
+import { approvalPhrase, resolveCode, proposalAuth } from './daftra-auth.mjs';
+import { review } from './daftra-approve.mjs';
 import { executeProposal, resolveProposal, assertWriteAllowed, WriteRefused, WRITE_ROUTES } from './daftra-write.mjs';
 import { readLedger, loadProposal, ledgerDir } from './daftra-ledger.mjs';
 
 const SECRET = 'sk-test-SECRET-KEY-123';
+const OP_SECRET = 'operator-secret-0123456789-0123456789-abcdef';
+let ENV;
 async function setup(seed, extraEnv = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'basht-ledger-'));
-  const env = { OPENCLAW_WORKSPACE_DIR: dir, DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: SECRET, DAFTRA_WRITES_ENABLED: '1', ...extraEnv };
+  const env = { OPENCLAW_WORKSPACE_DIR: dir, DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: SECRET, DAFTRA_WRITES_ENABLED: '1', DAFTRA_APPROVAL_SECRET: OP_SECRET, ...extraEnv };
+  ENV = env;
   const fake = new FakeDaftra(seed);
   return { dir, env, fake, done: () => rm(dir, { recursive: true, force: true }) };
 }
 const invoiceInput = { client_id: 4, date: '2025-03-01', items: [{ item: 'Diesel', quantity: '100', unit_price: '2', tax1: 1 }] };
-const approve = (p) => ({ id: p.id, phrase: p.required_phrase, actor: 'user-1' });
+const phraseOf = (p, env = ENV) => approvalPhrase(env, p);
+const approve = (p) => ({ id: p.id, phrase: phraseOf(p), actor: 'user-1' });
 
 test('proposing never writes: only GET requests, nothing created, ledger stays empty', async () => {
   const { env, fake, done } = await setup();
@@ -29,7 +35,8 @@ test('proposing never writes: only GET requests, nothing created, ledger stays e
     assert.equal(fake.posts.length, 0);
     assert.ok(fake.calls.every((c) => c.method === 'GET'));
     assert.deepEqual(await readLedger(env), []);
-    assert.match(p.required_phrase, /^APPROVE prop_[0-9a-f]{16} [0-9a-f]{8} DRAFT$/);
+    assert.match(phraseOf(p), /^APPROVE prop_[0-9a-f]{16} [0-9a-f]{8} DRAFT [0-9a-f]{16}$/);
+    assert.equal(JSON.stringify(p).includes(phraseOf(p)), false);
   } finally { await done(); }
 });
 
@@ -86,7 +93,7 @@ test('approval is bound to the exact proposal: wrong id, hash, mode or wording i
   try {
     const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     const other = await createProposal('sales_invoice', { ...invoiceInput, items: [{ ...invoiceInput.items[0], quantity: '101' }] }, { env, fetcher: fake.fetch });
-    for (const phrase of ['', 'yes', 'continue', 'APPROVE', other.required_phrase, p.required_phrase.replace('DRAFT', 'FINAL'), p.required_phrase.toLowerCase(), p.required_phrase + ' extra']) {
+    for (const phrase of ['', 'yes', 'continue', 'APPROVE', phraseOf(other), phraseOf(p).replace('DRAFT', 'FINAL'), phraseOf(p).toLowerCase(), phraseOf(p) + ' extra', 'APPROVE ' + p.id + ' ' + p.request_hash.slice(0, 8) + ' DRAFT']) {
       await assert.rejects(executeProposal({ id: p.id, phrase }, { env, fetcher: fake.fetch }), (e) => e.code === 'PHRASE_MISMATCH', phrase);
     }
     assert.equal(fake.posts.length, 0);
@@ -115,7 +122,7 @@ test('proposals expire after 15 minutes and are single use', async () => {
     const fresh = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
     await executeProposal(approve(fresh), { env, fetcher: fake.fetch });
-    await assert.rejects(executeProposal(approve(fresh), { env, fetcher: fake.fetch }), (e) => e.code === 'NOT_READY');
+    await assert.rejects(executeProposal(approve(fresh), { env, fetcher: fake.fetch }), (e) => e.code === 'ALREADY_USED');
     assert.equal(fake.posts.length, 1);
   } finally { await done(); }
 });
@@ -141,11 +148,12 @@ test('network failure is AMBIGUOUS: never auto-retried; re-send needs a human re
     const r = await executeProposal(approve(p), { env, fetcher: fake.fetch });
     assert.equal(r.status, 'ambiguous');
     assert.equal(fake.posts.length, 1);
-    await assert.rejects(executeProposal(approve(p), { env, fetcher: fake.fetch }), (e) => e.code === 'NOT_READY');
+    await assert.rejects(executeProposal(approve(p), { env, fetcher: fake.fetch }), (e) => e.code === 'ALREADY_USED');
     const again = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     assert.equal(again.status, 'BLOCKED');
     await assert.rejects(resolveProposal({ id: p.id, created: 'maybe' }, { env }), /true or false/);
-    await resolveProposal({ id: p.id, created: false, actor: 'user-1' }, { env });
+    await assert.rejects(resolveProposal({ id: p.id, created: false, code: 'guess' }, { env }), (e) => e.code === 'PHRASE_MISMATCH');
+    await resolveProposal({ id: p.id, created: false, code: resolveCode(env, p.id, false), actor: 'user-1' }, { env });
     fake.postError = null;
     fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
     const retry = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
@@ -159,9 +167,9 @@ test('resolved_created permanently blocks the same request', async () => {
   try {
     const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     assert.equal((await executeProposal(approve(p), { env, fetcher: fake.fetch })).status, 'ambiguous');
-    await resolveProposal({ id: p.id, created: true, recordId: 77 }, { env });
+    await resolveProposal({ id: p.id, created: true, recordId: 77, code: resolveCode(env, p.id, true) }, { env });
     assert.equal((await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch })).status, 'BLOCKED');
-    await assert.rejects(resolveProposal({ id: p.id, created: true }, { env }), (e) => e.code === 'NOT_AMBIGUOUS');
+    await assert.rejects(resolveProposal({ id: p.id, created: true, code: resolveCode(env, p.id, true) }, { env }), (e) => e.code === 'NOT_AMBIGUOUS');
   } finally { await done(); }
 });
 
@@ -214,7 +222,7 @@ test('blocking checks: unknown client, forbidden API role, duplicates, overpayme
     assert.match(over.blocking.join(' '), /exceed unpaid/);
     const ok = await createProposal('invoice_payment', { invoice_id: 3, amount: '115.00', payment_method: 'cash', date: '2025-03-01' }, { env: ctx.env, fetcher: ctx.fake.fetch });
     assert.equal(ok.status, 'READY_FOR_APPROVAL');
-    assert.match(ok.required_phrase, / FINAL$/);
+    assert.match(phraseOf(ok), / FINAL [0-9a-f]{16}$/);
   } finally { await ctx.done(); }
   ctx = await setup({ records: { invoices: { 3: { id: 3, draft: 1, summary_unpaid: '115' } } } });
   try {
@@ -262,9 +270,10 @@ test('rate limit stops runaway writes', async () => {
 
 test('route allowlist: POST create endpoints only; PUT/PATCH/DELETE and foreign paths are impossible', () => {
   assert.deepEqual(Object.values(WRITE_ROUTES).map((r) => r.method), Array(6).fill('POST'));
-  const ok = { method: 'POST', path: '/api2/invoices.json', query: '' };
+  const inv = { Invoice: { client_id: 4, draft: 1, date: '2025-03-01' }, InvoiceItem: [{ item: 'x', quantity: '1', unit_price: '1', tax1: 0, tax2: 0 }] };
+  const ok = { method: 'POST', path: '/api2/invoices.json', query: '', body: inv };
   assert.doesNotThrow(() => assertWriteAllowed('sales_invoice', ok));
-  assert.doesNotThrow(() => assertWriteAllowed('expense', { method: 'POST', path: '/api2/expenses.json', query: 'send=draft' }));
+  assert.doesNotThrow(() => assertWriteAllowed('expense', { method: 'POST', path: '/api2/expenses.json', query: 'send=draft', body: { Expense: { amount: '1.00', date: '2025-03-01', status: 'draft' } } }));
   for (const bad of [
     { ...ok, method: 'PUT' }, { ...ok, method: 'DELETE' }, { ...ok, method: 'PATCH' }, { ...ok, method: 'GET' },
     { ...ok, path: '/api2/invoices/3.json' }, { ...ok, path: '/api2/users.json' }, { ...ok, path: '/api2/invoices.json/../x' },
@@ -279,8 +288,8 @@ test('approvalPhrase differs per proposal and per mode', async () => {
   try {
     const d = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     const f = await createProposal('sales_invoice', { ...invoiceInput, finalize: true }, { env, fetcher: fake.fetch });
-    assert.notEqual(approvalPhrase(d), approvalPhrase(f));
-    assert.match(approvalPhrase(f), / FINAL$/);
+    assert.notEqual(phraseOf(d), phraseOf(f));
+    assert.match(phraseOf(f), / FINAL /);
     assert.ok(f.effects.includes('posts_to_accounts'));
   } finally { await done(); }
 });
@@ -299,20 +308,217 @@ test('two identical proposals prepared in parallel: only the first can ever be s
   } finally { await done(); }
 });
 
-test('even a proposal file rewritten with a consistent hash cannot POST outside the allowlist', async () => {
+test('a proposal rewritten with a consistent hash but without the operator secret is rejected', async () => {
   const { env, fake, done } = await setup();
   try {
     const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
     const file = join(ledgerDir(env), 'proposals', p.id + '.json');
-    const stored = JSON.parse(await readFile(file, 'utf8'));
     const { hashRequest } = await import('./daftra-finance-preflight.mjs');
     for (const patch of [{ path: '/api2/users.json' }, { method: 'DELETE', path: '/api2/invoices/3.json' }, { query: 'force=1' }]) {
+      const stored = JSON.parse(await readFile(file, 'utf8'));
       stored.request = { ...p.request, ...patch };
       stored.request_hash = hashRequest(stored.request);
-      stored.required_phrase = approvalPhrase(stored);
       await writeFile(file, JSON.stringify(stored));
-      await assert.rejects(executeProposal({ id: p.id, phrase: stored.required_phrase }, { env, fetcher: fake.fetch }), (e) => e.code === 'ROUTE_DENIED');
+      await assert.rejects(executeProposal({ id: p.id, phrase: phraseOf(stored) }, { env, fetcher: fake.fetch }), (e) => e.code === 'TAMPERED');
     }
     assert.equal(fake.posts.length, 0);
+  } finally { await done(); }
+});
+
+// ---- findings from the independent security review: each one is an attack that must now fail ----------
+
+test('REVIEW#1 an agent cannot approve its own write: no phrase is ever printed, and a guessed/derived phrase fails', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const { run } = await import('./daftra-cli.mjs');
+    const out = await run(['propose', 'sales_invoice', '--input', JSON.stringify(invoiceInput)], { env, fetcher: fake.fetch });
+    assert.equal(JSON.stringify(out).includes('APPROVE prop_'), false);
+    assert.equal('approval_phrase' in out, false);
+    const guessed = 'APPROVE ' + out.proposal_id + ' ' + out.request_hash.slice(0, 8) + ' DRAFT';
+    await assert.rejects(run(['execute', out.proposal_id, '--phrase', guessed], { env, fetcher: fake.fetch }), (e) => e.code === 'PHRASE_MISMATCH');
+    await assert.rejects(run(['execute', out.proposal_id, '--phrase', guessed + ' 0000000000000000'], { env, fetcher: fake.fetch }), (e) => e.code === 'PHRASE_MISMATCH');
+    assert.equal(fake.posts.length, 0);
+    // the operator tool, holding the secret, shows the stored request and yields the phrase that does work
+    const text = await review(out.proposal_id, env);
+    const phrase = text.match(/APPROVE prop_\S+ \S+ DRAFT [0-9a-f]{16}/)[0];
+    assert.match(text, /\/api2\/invoices\.json/);
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    assert.equal((await run(['execute', out.proposal_id, '--phrase', phrase], { env, fetcher: fake.fetch })).status, 'submitted');
+  } finally { await done(); }
+});
+
+test('REVIEW#1/#2 a proposal or phrase made with a different secret is worthless; blocked proposals show no phrase', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    const attackerEnv = { ...env, DAFTRA_APPROVAL_SECRET: 'attacker-secret-0123456789-0123456789-xyz' };
+    await assert.rejects(executeProposal({ id: p.id, phrase: phraseOf(p, attackerEnv) }, { env, fetcher: fake.fetch }), (e) => e.code === 'PHRASE_MISMATCH');
+    // forged proposal, authenticated with the attacker's secret
+    const forged = { ...p, id: 'prop_' + 'a'.repeat(16), request: { ...p.request, body: { ClientPayment: { client_id: 4, amount: '99999.00', payment_method: 'cash' } }, path: '/api2/client_payments.json' }, type: 'client_payment' };
+    const { hashRequest } = await import('./daftra-finance-preflight.mjs');
+    forged.request_hash = hashRequest(forged.request);
+    await writeFile(join(ledgerDir(env), 'proposals', forged.id + '.json'), JSON.stringify({ ...forged, auth: proposalAuth(attackerEnv, forged) }));
+    await assert.rejects(executeProposal({ id: forged.id, phrase: phraseOf(forged, attackerEnv) }, { env, fetcher: fake.fetch }), (e) => e.code === 'TAMPERED');
+    const blocked = await createProposal('sales_invoice', { ...invoiceInput, client_id: 999 }, { env, fetcher: fake.fetch });
+    assert.equal(blocked.status, 'BLOCKED');
+    assert.match(await review(blocked.id, env), /No approval phrase: the proposal is blocked/);
+    assert.equal(fake.posts.length, 0);
+  } finally { await done(); }
+});
+
+test('REVIEW#4 editing ANY signed side-field (status/ready/party/totals/expiry/acknowledgements/mode) is detected', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const bad = await createProposal('invoice_payment', { invoice_id: 3, amount: '500.00', payment_method: 'cash', date: '2025-03-01' }, { env, fetcher: fake.fetch });
+    assert.equal(bad.status, 'BLOCKED');                      // overpayment
+    const file = join(ledgerDir(env), 'proposals', bad.id + '.json');
+    const original = JSON.parse(await readFile(file, 'utf8'));
+    const edits = [
+      (s) => { s.status = 'READY_FOR_APPROVAL'; s.ready = true; },
+      (s) => { s.party.invoice_id = 8; s.ready = true; },
+      (s) => { s.acknowledged_duplicates = ['invoices#1']; s.ready = true; },
+      (s) => { s.expires_at = 'garbage'; s.ready = true; },
+      (s) => { s.expires_at = '2999-01-01T00:00:00Z'; s.ready = true; },
+      (s) => { s.mode = 'draft'; s.ready = true; },
+      (s) => { s.totals.total = '1.00'; s.ready = true; },
+      (s) => { delete s.auth; s.ready = true; },
+    ];
+    for (const edit of edits) {
+      const s = structuredClone(original); edit(s);
+      await writeFile(file, JSON.stringify(s));
+      await assert.rejects(executeProposal({ id: bad.id, phrase: 'x' }, { env, fetcher: fake.fetch }), (e) => e.code === 'TAMPERED', edit.toString());
+    }
+    assert.equal(fake.posts.length, 0);
+  } finally { await done(); }
+});
+
+test('REVIEW#4b a BLOCKED proposal can never run even though only the unsigned status was flipped', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const bad = await createProposal('invoice_payment', { invoice_id: 3, amount: '500.00', payment_method: 'cash', date: '2025-03-01' }, { env, fetcher: fake.fetch });
+    const file = join(ledgerDir(env), 'proposals', bad.id + '.json');
+    await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, 'utf8')), status: 'READY_FOR_APPROVAL' }));
+    await assert.rejects(executeProposal({ id: bad.id, phrase: phraseOf(bad) }, { env, fetcher: fake.fetch }), (e) => e.code === 'NOT_READY');
+    assert.equal(fake.posts.length, 0);
+  } finally { await done(); }
+});
+
+test('REVIEW#2b editing, truncating or re-chaining the ledger is detected and stops all writes', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const a = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    await executeProposal(approve(a), { env, fetcher: fake.fetch });
+    const file = join(ledgerDir(env), 'ledger.jsonl');
+    const lines = (await readFile(file, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 2);
+    for (const forged of [
+      lines[1] + '\n',                                                      // drop the "submitting" line: chain no longer starts at genesis
+      lines[0] + '\n' + lines[1].replace('"submitted"', '"rejected"') + '\n', // flip a state
+      lines[0].replace('"submitting"', '"rejected"') + '\n',               // rewrite line 1
+    ]) {
+      await writeFile(file, forged);
+      await assert.rejects(createProposal('sales_invoice', { ...invoiceInput, items: [{ ...invoiceInput.items[0], quantity: '9' }] }, { env, fetcher: fake.fetch }), (e) => e.code === 'LEDGER_TAMPERED');
+    }
+    assert.equal(fake.posts.length, 1);
+  } finally { await done(); }
+});
+
+test('REVIEW#3 parallel execute of one approved proposal sends exactly once', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    const results = await Promise.allSettled(Array.from({ length: 6 }, () => executeProposal(approve(p), { env, fetcher: fake.fetch })));
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+    assert.equal(fake.posts.length, 1);
+    assert.ok(results.filter((r) => r.status === 'rejected').every((r) => ['ALREADY_USED', 'DUPLICATE'].includes(r.reason.code)));
+  } finally { await done(); }
+});
+
+test('REVIEW#3b parallel execute of two proposals with the SAME request sends exactly once', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const a = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    const b = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    await Promise.allSettled([executeProposal(approve(a), { env, fetcher: fake.fetch }), executeProposal(approve(b), { env, fetcher: fake.fetch })]);
+    assert.equal(fake.posts.length, 1);
+  } finally { await done(); }
+});
+
+test('REVIEW#5 resolve needs an operator-derived code: the agent cannot clear an ambiguous block itself', async () => {
+  const { env, fake, done } = await setup({ post: () => ({ status: 503, json: {} }) });
+  try {
+    const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    assert.equal((await executeProposal(approve(p), { env, fetcher: fake.fetch })).status, 'ambiguous');
+    for (const code of [undefined, '', 'x', resolveCode(env, p.id, true)])            // right code for the WRONG decision also fails
+      await assert.rejects(resolveProposal({ id: p.id, created: false, code }, { env }), (e) => e.code === 'PHRASE_MISMATCH');
+    assert.equal((await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch })).status, 'BLOCKED');
+    await resolveProposal({ id: p.id, created: false, code: resolveCode(env, p.id, false) }, { env });
+    assert.equal((await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch })).status, 'READY_FOR_APPROVAL');
+  } finally { await done(); }
+});
+
+test('REVIEW#6 duplicate scan reads ALL pages: a match on page 2 blocks the proposal', async () => {
+  const lists = { invoices: [...Array.from({ length: 100 }, (_, i) => ({ id: 1000 + i, summary_total: '1.00' })), { id: 2000, summary_total: '230.00' }] };
+  const { env, fake, done } = await setup({ lists });
+  try {
+    const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    assert.equal(p.status, 'BLOCKED');
+    assert.match(p.blocking.join(' '), /invoices#2000/);
+  } finally { await done(); }
+});
+
+test('operator secret is mandatory: without it nothing can be proposed or executed', async () => {
+  const { env, fake, done } = await setup({}, { DAFTRA_APPROVAL_SECRET: undefined });
+  try {
+    await assert.rejects(createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch }), (e) => e.code === 'APPROVAL_NOT_CONFIGURED');
+    await assert.rejects(createProposal('sales_invoice', invoiceInput, { env: { ...env, DAFTRA_APPROVAL_SECRET: 'short' }, fetcher: fake.fetch }), (e) => e.code === 'APPROVAL_NOT_CONFIGURED');
+    await assert.rejects(executeProposal({ id: 'prop_' + '1'.repeat(16), phrase: 'x' }, { env, fetcher: fake.fetch }), (e) => e.code === 'APPROVAL_NOT_CONFIGURED');
+  } finally { await done(); }
+});
+
+test('strict body shape: unknown sections/keys (id, status, extra fields) can never be sent', () => {
+  const ok = { method: 'POST', path: '/api2/expenses.json', query: '', body: { Expense: { amount: '1.00', date: '2025-03-01', note: 'x' } } };
+  assert.doesNotThrow(() => assertWriteAllowed('expense', ok));
+  for (const body of [
+    { Expense: { amount: '1.00', date: '2025-03-01', id: 7 } },
+    { Expense: { amount: '1.00', date: '2025-03-01' }, Extra: {} },
+    { Expense: [] }, { Expense: null }, {}, { InvoicePayment: { invoice_id: 1, amount: '1', payment_method: 'cash' } },
+  ]) assert.throws(() => assertWriteAllowed('expense', { ...ok, body }), (e) => e instanceof WriteRefused && e.code === 'BODY_DENIED', JSON.stringify(body));
+});
+
+test('document totals above 12 integer digits are refused', async () => {
+  const { prepareFinancialAction } = await import('./daftra-finance-preflight.mjs');
+  assert.throws(() => prepareFinancialAction('sales_invoice', { client_id: 4, date: '2025-03-01', items: [{ item: 'x', quantity: '999999999999', unit_price: '999999999999', tax1: 0 }] }), /maximum/);
+});
+
+test('defence in depth: even a properly SIGNED proposal cannot bypass expiry, route/body allowlist or the ledger', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const { hashRequest } = await import('./daftra-finance-preflight.mjs');
+    const { forceUnlock } = await import('./daftra-ledger.mjs');
+    const base = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    const sign = async (patch, idChar) => {
+      const p = { ...base, ...patch, id: 'prop_' + idChar.repeat(16) };
+      p.request_hash = hashRequest(p.request);
+      await writeFile(join(ledgerDir(env), 'proposals', p.id + '.json'), JSON.stringify({ ...p, auth: proposalAuth(env, p) }));
+      return p;
+    };
+    const garbage = await sign({ expires_at: 'garbage' }, 'b');
+    await assert.rejects(executeProposal({ id: garbage.id, phrase: phraseOf(garbage) }, { env, fetcher: fake.fetch }), (e) => e.code === 'EXPIRED');
+    const route = await sign({ request: { ...base.request, path: '/api2/users.json' } }, 'c');
+    await assert.rejects(executeProposal({ id: route.id, phrase: phraseOf(route) }, { env, fetcher: fake.fetch }), (e) => e.code === 'ROUTE_DENIED');
+    const body = await sign({ request: { ...base.request, body: { ...base.request.body, Invoice: { ...base.request.body.Invoice, id: 1 } } } }, 'd');
+    await assert.rejects(executeProposal({ id: body.id, phrase: phraseOf(body) }, { env, fetcher: fake.fetch }), (e) => e.code === 'BODY_DENIED');
+    assert.equal(fake.posts.length, 0);
+    // ledger is an independent second line behind the hash lock
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const b = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    await executeProposal(approve(base), { env, fetcher: fake.fetch });
+    await forceUnlock(env, base.request_hash + '.lock');
+    await assert.rejects(executeProposal(approve(b), { env, fetcher: fake.fetch }), (e) => e.code === 'DUPLICATE');
+    assert.equal(fake.posts.length, 1);
   } finally { await done(); }
 });

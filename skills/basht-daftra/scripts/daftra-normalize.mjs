@@ -88,12 +88,15 @@ export function pickColumns(records, columns) {
 // Daftra list rows can carry secrets: invoices include `password` plus hash-authenticated
 // `invoice_pdf_url` / `invoice_html_url` links. These must never reach an export or a chat reply
 // unless the caller explicitly allowlists the column (and even then URLs/passwords stay blocked).
-const SENSITIVE_KEY = /(^|_)(password|passwd|token|secret|apikey|api_key|hash)(_|$)|_url$/i;
-export function isSensitiveKey(key) { return SENSITIVE_KEY.test(String(key)); }
+// Keys are normalised (lower-case, no `_`/`-`/spaces) so accessToken, access-token and passwordConfirm match too.
+const SENSITIVE_NORMALISED = /(password|passwd|token|secret|apikey|hash|signature|credential)|(url|link|uri)$/;
+// Values: any URL carrying a credential-looking query parameter is dropped even under an innocent key.
+const SENSITIVE_VALUE = /^https?:\/\/\S*[?&](hash|token|key|signature|sig|apikey|access_token)=/i;
+export function isSensitiveKey(key) { return SENSITIVE_NORMALISED.test(String(key).toLowerCase().replace(/[\s_-]+/g, '')); }
 export function redactRecord(value) {
   if (Array.isArray(value)) return value.map(redactRecord);
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).filter(([k]) => !isSensitiveKey(k)).map(([k, v]) => [k, redactRecord(v)]));
+    return Object.fromEntries(Object.entries(value).filter(([k, v]) => !isSensitiveKey(k) && !(typeof v === 'string' && SENSITIVE_VALUE.test(v))).map(([k, v]) => [k, redactRecord(v)]));
   }
   return value;
 }
