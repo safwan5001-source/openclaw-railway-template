@@ -34,8 +34,25 @@ export function invoiceId(value) {
 export async function getInvoice(id, env, fetcher) {
   return apiGet('/api2/invoices/' + invoiceId(id) + '.json', env, fetcher);
 }
+export const READABLE_ENTITIES = Object.freeze({
+  invoices: 'invoices',
+  estimates: 'estimates',
+  clients: 'clients',
+  products: 'products',
+  invoice_payments: 'invoice_payments',
+  client_payments: 'client_payments',
+  expenses: 'expenses',
+});
+export async function listRecords(entity, env, fetcher) {
+  if (!Object.hasOwn(READABLE_ENTITIES, entity)) throw new Error('Entity not authorized');
+  return apiGet('/api2/' + READABLE_ENTITIES[entity] + '.json', env, fetcher);
+}
+export async function getRecord(entity, id, env, fetcher) {
+  if (!Object.hasOwn(READABLE_ENTITIES, entity)) throw new Error('Entity not authorized');
+  return apiGet('/api2/' + READABLE_ENTITIES[entity] + '/' + invoiceId(id) + '.json', env, fetcher);
+}
 export async function listInvoices(env, fetcher) {
-  return apiGet('/api2/invoices.json', env, fetcher);
+  return listRecords('invoices', env, fetcher);
 }
 export function pdfUrl(invoice, env = process.env) {
   const { base } = config(env);
@@ -44,7 +61,7 @@ export function pdfUrl(invoice, env = process.env) {
     ?? invoice?.data?.invoice_pdf_url;
   if (!candidate || typeof candidate !== 'string') throw new Error('Invoice has no PDF URL');
   const url = new URL(candidate);
-  if (url.protocol !== 'https:' || url.origin !== base.origin || !/\\.pdf$/i.test(url.pathname) || url.username || url.password)
+  if (url.protocol !== 'https:' || url.origin !== base.origin || !/\.pdf$/i.test(url.pathname) || url.username || url.password)
     throw new Error('PDF URL is not a same-tenant HTTPS PDF');
   return url;
 }
@@ -67,9 +84,9 @@ export async function downloadInvoicePdf(id, outPath, env = process.env, fetcher
 if (process.argv[1] && import.meta.url === new URL('file://' + resolve(process.argv[1])).href) {
   const [command, id, output] = process.argv.slice(2);
   try {
-    if (command === 'list') console.log(JSON.stringify(await listInvoices()));
-    else if (command === 'get') console.log(JSON.stringify(await getInvoice(id)));
+    if (command === 'list') console.log(JSON.stringify(await listRecords(id || 'invoices')));
+    else if (command === 'get') console.log(JSON.stringify(await getRecord(id || 'invoices', output)));
     else if (command === 'pdf' && output) console.log(JSON.stringify(await downloadInvoicePdf(id, output)));
-    else throw new Error('Usage: node src/daftra-readonly.mjs list| get <invoice-id> | pdf <invoice-id> <output.pdf>');
+    else throw new Error('Usage: node src/daftra-readonly.mjs list [entity] | get <entity> <id> | pdf <invoice-id> <output.pdf>');
   } catch (e) { console.error(e.message); process.exitCode = 1; }
 }
