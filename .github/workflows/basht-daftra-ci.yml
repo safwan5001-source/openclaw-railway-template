@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Test read-only connector and CSV/JSON
-        run: node --test src/daftra-readonly.test.mjs src/daftra-exports.test.mjs
+      - name: Test all Daftra Node.js modules including finance and export safeguards
+        run: node --test src/daftra-*.test.mjs
       - name: Test XLSX and DOCX
         run: python3 -m unittest discover -s src -p test_daftra_office_export.py -v
