@@ -1,65 +1,77 @@
-# BASHT × Daftra — Integration Contract v1
+# BASHT × Daftra — Integration Contract v2
 
-Status: **DESIGN / NOT DEPLOYED**. The existing pilot code is read-only; this contract expands the planned scope without enabling writes.
+Status: **IMPLEMENTED & UNIT-TESTED AGAINST A FAKE — NOT LIVE-TESTED, NOT DEPLOYED.**
+Code: `skills/basht-daftra/` (self-contained OpenClaw skill: `SKILL.md` + `scripts/`). Zero runtime npm dependencies.
 
-## Objective
-A full accounting assistant for the user's Daftra tenant. Arabic conversational actions, draft-first workflows, and downloadable PDF, XLSX, CSV, DOCX, and JSON. PDF is the preferred *output format*, not the only operation or format.
+## 1. Verified API facts (official docs, https://docs.daftara.dev)
 
-## Verified references
-- API key header `APIKEY`, only-allow route rules: https://docs.daftra.com/tutorial/api/
-- Invoice list `GET /api2/invoices.json`: https://docs.daftara.dev/15115241e0
-- Single invoice `GET /api2/invoices/{id}.json`: https://docs.daftara.dev/15115238e0
-- Estimate creation `POST /api2/estimates.json`: https://docs.daftara.dev/15115247e0
-- Expense creation `POST /api2/expenses.json`: https://docs.daftara.dev/40881052e0
-- Invoice payments list `GET /api2/invoice_payments.json`: https://docs.daftara.dev/15115306e0
-- Daftra UI export and print actions: https://docs.daftra.com/en/tutorial/bulk-actions-in-system-lists/
+| Fact | Source page |
+| --- | --- |
+| Auth header `APIKEY` (API-key roles are **per entity, not per method**; 403 when blocked). Docs flag `apikey` as deprecated in favour of an OAuth Bearer token; this skill keeps `APIKEY` and never uses an OAuth client secret. | 933385m0, 15115241e0 |
+| List: `GET /api2/<resource>.json` → `{code,result,data:[{<Model>:{…}}],pagination}` | 15115241e0 and siblings |
+| **Pagination = `{prev,next,page,page_count,total_results}`; `total_results` counts ALL pages.** Default 20/page, `limit` has no server maximum. | every list page |
+| Model keys: `Invoice Estimate Client Supplier Product InvoicePayment ClientPayment Expense Tax Treasury`; purchase invoices use **`PurchaseOrder`** (not `PurchaseInvoice`). | 15115351e0 |
+| Single: `GET /api2/<resource>/<id>.json` → `{data:{<Model>:{…}}}` (invoices endpoint returns standard invoices only). | 15115238e0 |
+| Official PDF exists **only for invoices**: `invoice_pdf_url` (hash-authenticated, same tenant). No official PDF for estimates, payments, expenses or reports. | 15115238e0 |
+| Reports: `GET /api2/reports/<name>` (**no `.json`**), 26 reports, JSON only. Single response, HTTP 400 above size ceilings instead of truncating — **except `financial_transactions`, which is paged (300 rows/page, `pagination {page,per_page,total_rows,total_pages}`, per-page totals).** | 46396925e0 … 46527358e0 |
+| Invoice list rows contain `password`, `invoice_html_url`, `invoice_pdf_url`: sensitive. | 15115241e0 |
+| Write shapes: `Invoice`+`InvoiceItem[]` (draft = `Invoice.draft` 0/1), estimates same shape, `PurchaseOrder`+`PurchaseOrderItem[]` (`?send=draft`), `Expense` (`?send=draft` **and** `status:"draft"`; real idempotency via `unique_id`), `InvoicePayment`, `ClientPayment`. Success = HTTP 202 + `id`. | 15115242e0, 15115247e0, 15115352e0, 40881052e0, 15115307e0, 15115312e0 |
+| Invoice `unique_id` is *not* idempotency (server recalculates offers/discounts when present) → never sent for invoices. Payments have no idempotency key. | 15115242e0 |
+| Omitting `tax1` makes Daftra inherit the product's tax → every line must send `tax1` explicitly (`0` = no tax). | 15115242e0 |
+| `GET /site_payment_gateway/list/1` (payment methods) is a v2 endpoint on **Bearer** auth → payment-method validity cannot be verified with an API key; Daftra rejects unknown methods. | 40952350e0 |
 
-Docs use both `.daftara.com` examples and `.daftra.com` tenant domains; the user's actual tenant is `https://nepras.daftra.com`. Probe only that allowlisted tenant. API examples sometimes show both APIKEY and Authorization Bearer; verify the minimum required authentication using a GET request before enabling additional methods.
+Tenant is pinned to `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` root); redirects are never followed.
 
-## Operations matrix
+## 2. Operations matrix
 
-| Business function | API implementation | Current status | Approval |
-| --- | --- | --- | --- |
-| Read/search invoices | GET /api2/invoices.json | Pilot written, not live-tested | None for authorized reads |
-| Read one invoice | GET /api2/invoices/{id}.json | Pilot written, not live-tested | None for authorized reads |
-| Read customers, suppliers, products, balances | Verify exact endpoints, pagination and permissions | Planned | None for authorized reads |
-| Sales invoice | Verify create, draft, tax, numbering, e-invoice semantics | Planned | Explicit for creation/issuance |
-| Purchase invoice | Verify create & tax/accounting effects | Planned | Explicit |
-| Quote/estimate | POST /api2/estimates.json | Documented, not implemented | Explicit for creation; sending separately |
-| Expense | POST /api2/expenses.json | Documented, not implemented | Explicit for creation/posting |
-| Invoice payment / client payment | Verify respective endpoints, immediate settlement, idempotency | Planned | Explicit for every payment |
-| Customer/supplier/product maintenance | Verify each action and permissions | Planned | Explicit for mutations |
-| PDF/Excel/CSV/DOCX/JSON exports | Native where available; locally generated otherwise | Planned except invoice PDF pilot | None for authorized download |
+| Business function | Implementation | Tests | Live-tested | Approval |
+| --- | --- | --- | --- | --- |
+| Read/search sales invoices, estimates, purchase invoices, expenses, invoice & client payments, clients, suppliers, products, taxes, treasuries | `list`, `get` (allowlisted entities + query params, GET only) | ✔ | ✘ | none |
+| **Complete** collections | `list --all` → `fetchAllRecords` (page walk + proof) | ✔ | ✘ | none |
+| Official reports (ledger, trial balance, income statement, balance sheet, tax, revenue, payments, expenses, cash flow, chart of accounts, …) | `report <name>`; `financial_transactions` auto-walks pages | ✔ | ✘ | none |
+| Client statement | `statement` (local, reconciles against per-invoice `summary_unpaid`, `official:false`) | ✔ | ✘ | none |
+| Supplier statement | **Not implemented**: purchase-invoice list exposes no totals/payments; use the `ledger` report with `journal_account_id` | — | — | — |
+| Official invoice PDF | `pdf <invoice-id> <file>` | ✔ | ✘ | none |
+| Exports PDF/XLSX/CSV/DOCX/JSON | `export`, `export-report`, `export-statement` | ✔ (opened with openpyxl / python-docx / LibreOffice / Chromium) | n/a | none |
+| Create sales invoice · estimate · purchase invoice · expense · invoice payment · client payment | `propose` → `execute` (draft by default; payments are final) | ✔ (fake) | ✘ | **explicit, per operation** |
+| Edit / delete / refund / e-invoice submission / create clients, suppliers, products | **Not implemented** (no PUT/PATCH/DELETE code exists) | — | — | — |
 
-## Exports contract
-- PDF: use Daftra's official PDF for invoices/quotes/receipts where supported and authenticated; preserve original template and all mandated invoice fields. Never represent generated PDFs as an official Daftra document.
-- XLSX: safe spreadsheet export with typed amounts/dates, preserved leading zeros in IDs, and sheet name validation. Source records must match the chosen date/filter scope.
-- CSV: UTF-8 BOM where useful for Excel, localized dates only in presentation, formula injection protection for cells beginning with =,+,-,@, tab, CR.
-- DOCX: editable letters/summaries, never substitute for a legally required original invoice.
-- JSON: documented schema, source record IDs, retrieval timestamp, pagination completeness and redaction of secrets.
-- All formats: attach/source provenance, filter summary, record count and safe file names. No private link in logs. Set access controls, delivery channel confirmation, short retention and deletion policy.
-- Direct UI exports do **not** establish an equivalent programmatic endpoint. Missing API export endpoints mean locally generating a file from authorized data.
+## 3. Pagination contract
 
-## Transaction safety contract
-1. Resolve exact customer, branch, products, currency, tax rate, amounts, and line rounding before drafting.
-2. Show a preflight preview: operation type, counterparty, totals, tax, dates, duplicate candidates, posting/ZATCA effects, user-confirmable action.
-3. Default to draft where the actual API supports it; never assume posting is reversible or that a payment can be saved as draft.
-4. Require *per-operation* explicit user confirmation for creating, modifying, issuing, settling, emailing, or deleting. A vague 'continue' does not authorize any unrelated financial mutation.
-5. Use unique request IDs/idempotency keys wherever Daftra documents them; record a local operation ledger without secrets. On ambiguous network failure, search by unique ID before retry; no blind repeat.
-6. Enforce server-side method/path allowlist independently of Daftra's 'only allow' path rules. Those rules may not differentiate GET vs POST.
-7. No editing of Gateway, model, browser, existing tools or credentials. Never commit API keys or show them in chat. No production rollout until read/write tests in a safe environment and user approval.
-8. Audit record: actor, request, explicit approval, endpoint/method, idempotency ID, result record ID, timestamp, and sanitized error, excluding personal financial details from general logs.
+- `extractList` marks a single response complete only if: `total_results === rows`, `page_count ≤ 1`, `page ≤ 1`, and `next` is empty. A client-supplied `complete` field is ignored. Non-integer / negative / boolean / empty-string metadata throws. (An empty collection may report `page_count: 0`.)
+- `fetchAllRecords` additionally requires: pages arrive in order; `page_count`/`total_results` stay constant (else one restart, then block); every non-final page has `next`, the final one does not; ids unique across pages; rows collected `=== total_results`; limits `maxPages 500`, `maxRecords 50 000`. Anything unprovable **throws** — no partial result is ever labelled complete.
+- 429/502/503/504 on GET are retried (Retry-After honoured, max 3). Writes are never retried.
 
-## Acceptance gates
-- Unit tests for authentication, pagination, response contracts, exported file type, naming and CSV injection.
-- Read-only tenant smoke test with explicit expected IDs and permission failure tests.
-- Each write operation: schema validation, permission tests, duplicate prevention, approval gate tests, dry-run/preview tests, and production release approval.
-- PDF verified as a real openable file on the user's iPhone, original from Daftra when claimed.
-- Rollback plan and documented retention/cleanup before deploying.
+## 4. Export contract
 
-## Implementation sequence
-1. Harden GET and PDF pilot; verify API response shape, tenant and PDF URL.
-2. Add read-only customers, products, supplier, expense, payment list and pagination; local exports in CSV/JSON/XLSX/DOCX and generic PDF reports.
-3. Add draft quote/invoice workflows with deterministic validation and approval preview, and test in sandbox before release.
-4. Add expenses and payments with stronger approval and reconciliation.
-5. Add delivery to approved private channel (WhatsApp integration only after it is actually operational).
+- Destination: only `$OPENCLAW_WORKSPACE_DIR/exports/` (auto-created 0700), file mode 0600, `wx` (never overwrite), safe file names, symlink-escape checks.
+- PDF: **official Daftra PDF first** (`pdf`). Any `--format pdf` export is a generated summary labelled "not an official Daftra document" (EN + AR), rendered by headless Chromium from escaped HTML under a CSP, network blocked.
+- XLSX: pure-Node writer; numeric columns are real numbers (negatives intact), IDs stay text (leading zeros kept), RTL sheet, `Info` sheet with provenance. DOCX: bordered RTL-aware table. CSV: UTF-8 BOM, always quoted. JSON: `schema_version`, `record_count`, metadata (`complete`, `official:false`, filters, timestamp).
+- Spreadsheet injection: cells starting `= + - @`/control chars get an apostrophe, except strict numbers.
+- Sensitive keys (`password`, `token`, `secret`, `apikey`, `hash`, `*_url`) are stripped; requesting one explicitly is refused.
+
+## 5. Transaction safety (implemented in `daftra-proposal/write/ledger`)
+
+1. **Preview** (`propose`, GET only): references exist, tax ids exist & active in the tenant tax table, exact decimal totals (tax-exclusive/inclusive), API-key role can read the entity, remote duplicates (same party/date/total), payment ≤ invoice `summary_unpaid`, invoice not draft, local ledger duplicate.
+2. **Bound approval**: phrase `APPROVE <proposal-id> <hash8> <DRAFT|FINAL>`, bound to the SHA-256 of the exact request; 15-minute TTL; single use; stored request re-hashed (tamper → refuse).
+3. **Operator kill switch**: `DAFTRA_WRITES_ENABLED=1` must be set on the server (default off).
+4. **Route allowlist**: six POST endpoints (`?send=draft` only query). PUT/PATCH/DELETE do not exist in the code.
+5. **Pre-submit re-check**: balance/duplicates/permissions re-read immediately before sending.
+6. **No blind retry**: one attempt. Network error / 5xx / success-without-id ⇒ `ambiguous`; the identical request is blocked until a human runs `resolve`. 4xx ⇒ `rejected` (nothing created, may re-propose).
+7. **Idempotency**: expenses carry a deterministic `unique_id`; for the others the ledger + duplicate scan is the protection.
+8. **Rate limit**: `DAFTRA_MAX_WRITES_PER_HOUR` (default 20).
+9. **Read-back**: after creation the record is re-read and the total compared with the approved total; mismatch is reported.
+10. **Ledger** `daftra-ledger/ledger.jsonl` (0600): ts, state, proposal id, type, request hash, endpoint, actor, record id, HTTP status. No amounts, names or secrets.
+
+**Known limit:** the approval phrase proves the agent was given the phrase, not that a human typed it. The hard out-of-band control is the operator's `DAFTRA_WRITES_ENABLED` switch; keep it off except for supervised sessions.
+
+## 6. Not verified / needs the real tenant
+
+Live JSON shapes of each endpoint and report; whether the API key's role allows each entity; real `invoice_pdf_url` download; ZATCA/e-invoice side effects of final invoices; open/closed financial periods; tenant payment-method names; tax inclusive/exclusive rounding vs Daftra's own (the read-back catches differences); PDF Arabic fonts and Chromium inside the Railway image; delivery on iPhone.
+
+## 7. Acceptance gates before any production use
+
+1. Read-only smoke test on the tenant: `capabilities`, `list invoices --all`, `get`, `report trial_balance`, `pdf <id>` (compare with Daftra UI).
+2. Draft-only write test on a **non-production tenant or a disposable draft**, with `DAFTRA_WRITES_ENABLED=1` set by the operator for that session only.
+3. Skill placement in the OpenClaw persistent workspace (`<workspace>/skills/basht-daftra`) — requires explicit deployment approval. The Docker image currently copies only `src/`.
+4. Rollback: remove the skill directory; the ledger and exports live in the workspace volume and are untouched by a redeploy.

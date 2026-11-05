@@ -3,10 +3,10 @@
 // Usage: node daftra-export.mjs <entity> <col1,col2|-> <csv|json|xlsx|docx|pdf> <file-in-private-exports-dir>
 import { resolve } from 'node:path';
 import { ENTITIES } from './daftra-entities.mjs';
-import { fetchAllRecords, getReport } from './daftra-readonly.mjs';
+import { fetchAllRecords, getReport, isPartialReport, PAGED_REPORTS } from './daftra-readonly.mjs';
 import { isSensitiveKey, pickColumns, redactRecord } from './daftra-normalize.mjs';
 import { FORMATS, exportData } from './daftra-exports.mjs';
-import { safeOutputPath } from './daftra-paths.mjs';
+import { safeOutputPath, ensureExportsDir } from './daftra-paths.mjs';
 
 const SCALAR = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
 
@@ -33,6 +33,7 @@ export async function exportDaftraRecords({ entity, columns, format, output, que
   if (typeof entity !== 'string' || !Object.hasOwn(ENTITIES, entity)) throw Error('Unsupported entity');
   if (!FORMATS.includes(format)) throw Error('Unsupported format');
   // Validate the destination before spending any API calls.
+  await ensureExportsDir(env);
   const path = safeOutputPath(output, format, env);
   if (Array.isArray(columns) && columns.some(c => typeof c === 'string' && isSensitiveKey(c))) throw Error('Column is sensitive and cannot be exported');
   const result = await fetchAllRecords(entity, { query, pageSize, sleep: extra.sleep }, env, fetcher);
@@ -93,11 +94,16 @@ export function flattenReport(payload) {
 
 export async function exportReport(name, params, format, output, env = process.env, fetcher = fetch, extra = {}) {
   if (!FORMATS.includes(format)) throw Error('Unsupported format');
+  await ensureExportsDir(env);
   const path = safeOutputPath(output, format, env);
-  const payload = redactRecord(await getReport(name, params ?? {}, env, fetcher));
+  if (isPartialReport(name, params ?? {})) throw Error('Export blocked: a single report page is not a complete report; omit "page" so all pages are fetched');
+  const payload = redactRecord(await getReport(name, params ?? {}, env, fetcher, { sleep: extra.sleep }));
   const meta = {
     source: 'Daftra API', report: name, exported_at: new Date().toISOString(), filters: params ?? {}, complete: true,
-    completeness_basis: 'Daftra reports are not paginated; the API answers 400 above its size ceilings instead of truncating', official: false,
+    completeness_basis: PAGED_REPORTS.includes(name)
+      ? 'All pages walked; row count verified against pagination.total_rows'
+      : 'Daftra answers HTTP 400 above its size ceilings instead of truncating this report (per official docs)',
+    official: false,
   };
   const table = flattenReport(payload);
   if (format === 'json' || !table) {

@@ -175,14 +175,53 @@ async function walkPages(entity, query, pageSize, maxPages, maxRecords, env, fet
   });
 }
 
-// Reports: GET /api2/reports/<name>, no `.json` suffix, not paginated, 400 above server size ceilings.
-export async function getReport(name, params = {}, env, fetcher) {
+// Reports: GET /api2/reports/<name>, no `.json` suffix. All are single-response and "bounded" (HTTP 400
+// above the server's size ceilings instead of truncating) EXCEPT `financial_transactions`, which is paged
+// (300 rows/page, pagination { page, per_page, total_rows, total_pages }, per-page totals).
+export const PAGED_REPORTS = Object.freeze(['financial_transactions']);
+
+export function isPartialReport(name, params = {}) {
+  return PAGED_REPORTS.includes(name) && params.page !== undefined;
+}
+
+async function reportRequest(name, params, env, fetcher, sleep) {
+  const spec = REPORTS[name];
+  const payload = await apiGet('/api2/reports/' + name, { query: buildQuery(spec.params, params), env, fetcher, sleep });
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid Daftra report response');
+  return payload;
+}
+
+const posInt = (v) => Number.isSafeInteger(v) && v >= 0;
+
+async function walkReportPages(name, params, env, fetcher, sleep) {
+  const maxPages = 200;
+  const rows = [];
+  let first = null; let totalPages = null; let totalRows = null;
+  for (let page = 1; ; page++) {
+    if (page > maxPages) throw new Error('Report blocked: more than ' + maxPages + ' pages; narrow the date range');
+    const payload = await reportRequest(name, { ...params, page }, env, fetcher, sleep);
+    const pg = payload.pagination;
+    if (!pg || !posInt(pg.page) || !posInt(pg.total_pages) || !posInt(pg.total_rows) || !Array.isArray(payload.rows))
+      throw new Error('Report blocked: pagination metadata (page, total_pages, total_rows) missing; completeness cannot be proven');
+    if (pg.page !== page) throw new Error('Report blocked: server returned page ' + pg.page + ' for page ' + page);
+    if (first === null) { first = payload; totalPages = pg.total_pages; totalRows = pg.total_rows; }
+    else if (pg.total_pages !== totalPages || pg.total_rows !== totalRows) throw new Error('Report blocked: report changed while reading');
+    rows.push(...payload.rows);
+    if (page >= totalPages) break;
+  }
+  if (rows.length !== totalRows) throw new Error('Report blocked: collected ' + rows.length + ' of ' + totalRows + ' rows');
+  // Per-page totals/opening balance of later pages are meaningless when merged: keep the first page's
+  // opening balance only and drop `totals` so nobody mistakes page-1 totals for the whole report.
+  const { totals: _pageTotals, pagination: _pagination, ...rest } = first;
+  return { ...rest, rows, pagination: { pages: Math.max(totalPages, 1), total_rows: totalRows, complete: true }, totals_note: 'Per-page totals omitted when pages are merged' };
+}
+
+export async function getReport(name, params = {}, env, fetcher, { sleep = defaultSleep } = {}) {
   if (typeof name !== 'string' || !Object.hasOwn(REPORTS, name)) throw new Error('Report not authorized');
   const spec = REPORTS[name];
   for (const key of spec.required) if (params[key] === undefined || params[key] === '') throw new Error('Report parameter required: ' + key);
-  const payload = await apiGet('/api2/reports/' + name, { query: buildQuery(spec.params, params), env, fetcher });
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid Daftra report response');
-  return payload;
+  if (PAGED_REPORTS.includes(name) && params.page === undefined) return walkReportPages(name, params, env, fetcher, sleep);
+  return reportRequest(name, params, env, fetcher, sleep);
 }
 
 export function pdfUrl(invoice, env = process.env) {

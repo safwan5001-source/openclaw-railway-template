@@ -191,3 +191,25 @@ test('reports use /api2/reports/<name> without .json, require mandatory params, 
   await assert.rejects(getReport('../users', {}, env, fetcher), /not authorized/);
   await assert.rejects(getReport('revenue', { report_type: 'client', bogus: 1 }, env, fetcher), /not allowed/);
 });
+
+test('financial_transactions is the one paged report: every page is walked and the row count proven', async () => {
+  const total = 650; const calls = [];
+  const fetcher = async (url) => {
+    const page = Number(url.searchParams.get('page')); calls.push(page);
+    const rows = Array.from({ length: Math.min(300, total - (page - 1) * 300) }, (_, i) => ({ n: (page - 1) * 300 + i }));
+    return new Response(JSON.stringify({ report: 'financial_transactions', filters: {}, opening_balance: '0', rows, totals: { income: 'page-only' },
+      pagination: { page, per_page: 300, total_rows: total, total_pages: 3 } }), { status: 200 });
+  };
+  const merged = await getReport('financial_transactions', { date_range_from: '2025-01-01' }, env, fetcher, { sleep: noSleep });
+  assert.deepEqual(calls, [1, 2, 3]);
+  assert.equal(merged.rows.length, 650);
+  assert.equal(merged.pagination.complete, true);
+  assert.equal('totals' in merged, false);                 // per-page totals must not masquerade as report totals
+  const { isPartialReport } = await import('./daftra-readonly.mjs');
+  assert.equal(isPartialReport('financial_transactions', { page: 2 }), true);
+  assert.equal(isPartialReport('revenue', {}), false);
+  const short = async (url) => new Response(JSON.stringify({ rows: [{ n: 1 }], pagination: { page: Number(url.searchParams.get('page')), per_page: 300, total_rows: 5, total_pages: 1 } }), { status: 200 });
+  await assert.rejects(getReport('financial_transactions', {}, env, short, { sleep: noSleep }), /collected 1 of 5/);
+  const none = async () => new Response(JSON.stringify({ rows: [] }), { status: 200 });
+  await assert.rejects(getReport('financial_transactions', {}, env, none, { sleep: noSleep }), /completeness cannot be proven/);
+});
