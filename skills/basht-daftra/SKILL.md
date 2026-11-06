@@ -6,8 +6,7 @@ metadata:
     "openclaw":
       {
         "emoji": "🧾",
-        "requires": { "bins": ["node"], "env": ["DAFTRA_BASE_URL", "DAFTRA_API_KEY"] },
-        "primaryEnv": "DAFTRA_API_KEY",
+        "requires": { "bins": ["node"], "env": ["DAFTRA_BASE_URL"] },
       },
   }
 ---
@@ -95,9 +94,13 @@ Daftra documents **no** copy endpoint, so a duplicate is: read the source (GET) 
 - The preview (and the operator tool) show **original vs proposed**, header and line by line, plus what was not copied. Taxes/products/clients are re-validated; a source header discount/shipping/deposit that a copy cannot reproduce blocks the proposal until the user accepts the difference. Purchase-line tax values are mapped to a tax id only when exactly one active tax matches.
 - Drafts first (all three document types support draft). Copying with the original date/client/total is flagged as a likely duplicate of the original.
 
-## 6. Privilege separation (broker) — recommended for production
+## 6. Privilege separation — SERVICE MODE (recommended) and local broker
 
-When `DAFTRA_BROKER_SOCKET` is set, `propose`, `duplicate`, `show`, `execute`, `resolve` are forwarded to a separate privileged broker process (different OS user) that alone holds `DAFTRA_APPROVAL_SECRET` and the write-capable API key; they never run in your process. Your environment should contain only the read key and the socket path. If `capabilities` lists `env_warnings`, tell the operator. See `docs/DAFTRA_BROKER.md`.
+**Service mode** (`DAFTRA_BROKER_URL` + `DAFTRA_BROKER_TOKEN` set): the agent holds **no Daftra credential at all** (Daftra API-key roles are per *entity*, not per method, so any key that can read can also write). Every read (`list`, `get`, `report`, `statement`, exports, `pdf`) goes through the separate broker service (GET-only, allowlisted); `propose`, `duplicate`, `show` and `status <proposal-id>` also go to the broker. **There is no `execute` or `resolve` for you**: the operator approves in the broker's console from their own device (password + a fresh authenticator code per approval). After proposing, show the preview, tell the user to open the operator console and review/approve there, and poll `status <proposal-id>`; never try to obtain, derive or relay approvals. If `capabilities` reports `daftra_credentials_on_agent: true` or lists `env_warnings`, tell the operator to remove those variables.
+
+**Local broker mode** (`DAFTRA_BROKER_SOCKET`): `propose`, `duplicate`, `show`, `execute`, `resolve` are forwarded to a privileged local process (different OS user); you still cannot derive the phrase (section 3). See `docs/DAFTRA_BROKER.md`.
+
+Deployment (owner only, nothing deployed yet): `docs/DAFTRA_RAILWAY_ROLLOUT.md`.
 
 ## 7. Hard rules
 
@@ -109,4 +112,4 @@ When `DAFTRA_BROKER_SOCKET` is set, `propose`, `duplicate`, `show`, `execute`, `
 
 ## 8. Operator notes
 
-Environment (Railway): `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` tenant root), `DAFTRA_API_KEY`; optional `OPENCLAW_WORKSPACE_DIR` (default `/data/workspace`), `DAFTRA_WRITES_ENABLED` (default off), `DAFTRA_APPROVAL_SECRET` (≥32 random chars; required for any financial operation; keep it out of the agent's exec environment where possible), `DAFTRA_MAX_WRITES_PER_HOUR` (default 20), `CHROMIUM_PATH`; broker mode: `DAFTRA_BROKER_SOCKET` (agent side), `DAFTRA_APPROVAL_SECRET_FILE` and `DAFTRA_WRITE_API_KEY_FILE` (broker side only). The operation ledger lives in `$OPENCLAW_WORKSPACE_DIR/daftra-ledger/` (ids, hashes and states only — no amounts or secrets; HMAC-chained, tampering stops all writes). Full contract: `docs/DAFTRA_INTEGRATION_CONTRACT.md`.
+Environment (Railway): `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` tenant root; the only variable the skill gating requires, because in service mode the agent holds no key), `DAFTRA_API_KEY` (single-process mode only — avoid in production); optional `OPENCLAW_WORKSPACE_DIR` (default `/data/workspace`), `DAFTRA_WRITES_ENABLED` (default off), `DAFTRA_APPROVAL_SECRET` (≥32 random chars; required for any financial operation; keep it out of the agent's exec environment where possible), `DAFTRA_MAX_WRITES_PER_HOUR` (default 20), `CHROMIUM_PATH`; service mode: agent env = only `DAFTRA_BASE_URL`, `DAFTRA_BROKER_URL`, `DAFTRA_BROKER_TOKEN`; the broker service holds `DAFTRA_WRITE_API_KEY`, `DAFTRA_APPROVAL_SECRET`, `BROKER_AGENT_TOKEN`, `OPERATOR_PASSWORD`, `OPERATOR_TOTP_SEED` (see the notes doc). Local broker mode: `DAFTRA_BROKER_SOCKET` (agent side), `DAFTRA_APPROVAL_SECRET_FILE` and `DAFTRA_WRITE_API_KEY_FILE` (broker side only). The operation ledger lives in `$OPENCLAW_WORKSPACE_DIR/daftra-ledger/` (ids, hashes and states only — no amounts or secrets; HMAC-chained, tampering stops all writes). Full contract: `docs/DAFTRA_INTEGRATION_CONTRACT.md`.

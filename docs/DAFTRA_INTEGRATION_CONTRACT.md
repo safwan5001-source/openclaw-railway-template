@@ -1,4 +1,4 @@
-# BASHT × Daftra — Integration Contract v3
+# BASHT × Daftra — Integration Contract v4
 
 Status: **IMPLEMENTED & UNIT-TESTED AGAINST A FAKE — NOT LIVE-TESTED, NOT DEPLOYED.**
 Code: `skills/basht-daftra/` (self-contained OpenClaw skill: `SKILL.md` + `scripts/`). Zero runtime npm dependencies.
@@ -7,7 +7,7 @@ Code: `skills/basht-daftra/` (self-contained OpenClaw skill: `SKILL.md` + `scrip
 
 | Fact | Source page |
 | --- | --- |
-| Auth header `APIKEY` (API-key roles are **per entity, not per method**; 403 when blocked). Docs flag `apikey` as deprecated in favour of an OAuth Bearer token; this skill keeps `APIKEY` and never uses an OAuth client secret. | 933385m0, 15115241e0 |
+| Auth header `APIKEY` (API-key roles are **per entity, not per method** — Only Allow / Only Block lists of entities — so a key that can read an entity can also write it; there is no read-only key; 403 when blocked). Docs flag `apikey` as deprecated in favour of an OAuth Bearer token; this skill keeps `APIKEY` and never uses an OAuth client secret. | 933385m0, 15115241e0 |
 | List: `GET /api2/<resource>.json` → `{code,result,data:[{<Model>:{…}}],pagination}` | 15115241e0 and siblings |
 | **Pagination = `{prev,next,page,page_count,total_results}`; `total_results` counts ALL pages.** Default 20/page, `limit` has no server maximum. | every list page |
 | Model keys: `Invoice Estimate Client Supplier Product InvoicePayment ClientPayment Expense Tax Treasury`; purchase invoices use **`PurchaseOrder`** (not `PurchaseInvoice`). | 15115351e0 |
@@ -79,7 +79,9 @@ Threat model: the agent controls CLI arguments and can read/write the workspace,
 9. **No blind retry**: one attempt. Network error / 5xx / success-without-id ⇒ `ambiguous`; the identical request is blocked until a human obtains a resolve code from the operator tool. 4xx ⇒ `rejected` (nothing created, may re-propose).
 10. **Idempotency**: expenses carry a deterministic `unique_id`; others rely on the ledger + duplicate scan. **Rate limit** `DAFTRA_MAX_WRITES_PER_HOUR` (default 20). **Read-back** compares the created total with the approved total.
 
-11. **Privilege separation (broker).** With `DAFTRA_BROKER_SOCKET`, propose/duplicate/show/execute/resolve run only in a separate privileged process (different OS user) that alone holds the approval secret and the write-capable API key; the agent holds only the read key and the socket. Proven with a real unprivileged uid (65534): it cannot read the secret/key files, the broker's state, or `/proc/<pid>/environ`, cannot execute without the operator's phrase, and strict-schema requests reject any `env`/secret/path field. Recipe and limits: `docs/DAFTRA_BROKER.md`. **Not deployed**: it needs a Dockerfile/entrypoint/Railway change that awaits the owner's approval.
+11. **Privilege separation (broker) — two deployment options.** (a) *Separate Railway service* (recommended, `docs/DAFTRA_RAILWAY_SERVICE_NOTES.md`, `docs/DAFTRA_RAILWAY_ROLLOUT.md`): the agent holds **no Daftra credential**; reads go through a GET-only allowlisted proxy (`/v1/get`, `/v1/invoice_pdf`); proposals via `/v1/propose|propose_duplicate|show|status`; approval only in the operator console (password + fresh TOTP per approval, CSRF, lockout, HMAC audit) — the agent has no execute/approve route and no phrase exists; private API refuses public-edge/Host-mismatched requests; writes disabled unless the *service's own* `DAFTRA_WRITES_ENABLED=1`. (b) *Local Unix-socket broker* (below).
+
+   Local-broker detail: With `DAFTRA_BROKER_SOCKET`, propose/duplicate/show/execute/resolve run only in a separate privileged process (different OS user) that alone holds the approval secret and the write-capable API key; the agent holds only the read key and the socket. Proven with a real unprivileged uid (65534): it cannot read the secret/key files, the broker's state, or `/proc/<pid>/environ`, cannot execute without the operator's phrase, and strict-schema requests reject any `env`/secret/path field. Recipe and limits: `docs/DAFTRA_BROKER.md`. **Not deployed**: it needs a Dockerfile/entrypoint/Railway change that awaits the owner's approval.
 
 **If the separation cannot be enforced on Railway** (single container, one OS user, the volume owned by the agent's user, no second service): the agent and the secrets share a trust domain, so a hostile agent could read `DAFTRA_APPROVAL_SECRET`/the write key from its environment or tamper with the ledger directory, and customer/supplier/product/financial writes lose their independent gate. In that case keep `DAFTRA_WRITES_ENABLED` unset (all writes impossible) and use the skill read-only; enable writes only in short supervised sessions or after deploying the broker as a separate service/user with a root-owned (or separate-volume) ledger directory.
 

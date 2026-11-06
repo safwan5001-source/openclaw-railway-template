@@ -17,13 +17,14 @@ info() { "${OC[@]}" skills info basht-daftra --json 2>/dev/null; }
 field() { "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const v=process.argv[1].split(".").reduce((o,k)=>o?.[k],j);console.log(JSON.stringify(v))})' "$1"; }
 
 A="$(env -u DAFTRA_BASE_URL -u DAFTRA_API_KEY "${OC[@]}" skills info basht-daftra --json 2>/dev/null)"
-B="$(DAFTRA_BASE_URL=https://smoke.daftra.com DAFTRA_API_KEY=fake-key-for-eligibility-check "${OC[@]}" skills info basht-daftra --json 2>/dev/null)"
+# Service mode: the agent holds NO Daftra credential, only the tenant URL (+ broker vars), and the skill must be eligible.
+B="$(env -u DAFTRA_API_KEY DAFTRA_BASE_URL=https://smoke.daftra.com DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081 DAFTRA_BROKER_TOKEN=fake-token-for-eligibility-check "${OC[@]}" skills info basht-daftra --json 2>/dev/null)"
 fail=0
 chk() { if [ "$2" = "$3" ]; then echo "ok - $1"; else echo "not ok - $1 (got $2, want $3)"; fail=1; fi; }
 chk "skill is discovered from the workspace"            "$(echo "$A" | field source)"            '"openclaw-workspace"'
-chk "NOT eligible without DAFTRA_* (fail-safe gating)"   "$(echo "$A" | field eligible)"          'false'
-chk "missing env reported"                               "$(echo "$A" | field missing.env)"       '["DAFTRA_BASE_URL","DAFTRA_API_KEY"]'
-chk "eligible with the env present (fake values)"        "$(echo "$B" | field eligible)"          'true'
+chk "NOT eligible without DAFTRA_BASE_URL (fail-safe gating)"   "$(echo "$A" | field eligible)"          'false'
+chk "missing env reported"                               "$(echo "$A" | field missing.env)"       '["DAFTRA_BASE_URL"]'
+chk "eligible in service mode (no Daftra key on the agent)"        "$(echo "$B" | field eligible)"          'true'
 chk "no missing requirements when eligible"              "$(echo "$B" | field missing.env)"       '[]'
 chk "node binary requirement satisfied"                  "$(echo "$B" | field missing.bins)"      '[]'
 exit $fail
