@@ -30,7 +30,10 @@ export function parsePagination(payload, itemCount) {
     ? null : toUint(pagination.page, 'page');
   // An empty collection may legitimately report page_count 0; anything else must be >= 1.
   if (pageCount !== null && pageCount < 1 && !(pageCount === 0 && total === 0)) throw Error('Invalid page_count');
-  if (page !== null && page < 1) throw Error('Invalid page');
+  // An EMPTY collection (total 0, no rows) may report page 0 or page 1 / page_count 0 depending on the endpoint; that is not a malformed
+  // page. Every non-empty response still needs page >= 1.
+  const emptyCollection = total === 0 && itemCount === 0;
+  if (page !== null && page < 1 && !(page === 0 && emptyCollection)) throw Error('Invalid page');
   if (page !== null && pageCount !== null && pageCount >= 1 && page > pageCount) throw Error('Invalid page');
   const next = pagination?.next ?? null;
   if (next !== null && typeof next !== 'string') throw Error('Invalid pagination');
@@ -58,7 +61,7 @@ export function extractList(payload, entity) {
   const { records, total, pageCount, page, hasNext } = extractPage(payload, entity);
   const knownComplete = total !== null && total === records.length
     && (pageCount === null || pageCount === 1 || (pageCount === 0 && total === 0))
-    && (page === null || page === 1)
+    && (page === null || page === 1 || (page === 0 && total === 0))
     && !hasNext;
   return Object.freeze({
     records,

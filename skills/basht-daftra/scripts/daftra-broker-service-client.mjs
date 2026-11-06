@@ -74,7 +74,8 @@ export function createBrokerFetcher({ url, token, env = process.env, fetcher = f
     const headers = { 'content-type': 'application/json' };
     if (result.retry_after !== undefined) headers['retry-after'] = String(result.retry_after);
     const status = Number(result.status);
-    const body = status >= 200 && status < 300 ? JSON.stringify(result.body) : JSON.stringify({ message: result.message ?? null });
+    const body = status >= 200 && status < 300 ? JSON.stringify(result.body)
+      : JSON.stringify({ message: result.message ?? null, validation_errors: result.validation_errors ?? undefined, upstream_status: result.upstream_status ?? undefined });
     return new Response(body, { status, headers });
   };
 }

@@ -3,13 +3,15 @@
 // Errors print {"ok":false,"error":...} on stderr and exit 1. Secrets are never printed.
 //
 //   READ    capabilities | list <entity> | get <entity> <id> | report <name> | statement <client-id> | reconcile-payments <client-id>
+//           access-report [entity|report|entity:<name>|report:<name>]   (one minimal GET per endpoint, classified; read-only)
 //   FILES   pdf <invoice-id> <file.pdf> | export <entity> | export-report <name> | export-statement <client-id>
 //   WRITE   propose <type> | duplicate <source> <id> | show <proposal-id> | execute <proposal-id> | resolve <proposal-id>
 //           (propose/show are read-only; execute needs DAFTRA_WRITES_ENABLED=1 AND the exact approval phrase)
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { ENTITIES, REPORTS } from './daftra-entities.mjs';
-import { listPage, fetchAllRecords, getOne, getReport, isPartialReport, downloadInvoicePdf } from './daftra-readonly.mjs';
+import { ENTITIES, REPORTS, UNSUPPORTED_READS } from './daftra-entities.mjs';
+import { listPage, fetchAllRecords, getOneDetailed, getReport, isPartialReport, downloadInvoicePdf, DaftraError } from './daftra-readonly.mjs';
+import { accessReport } from './daftra-access-report.mjs';
 import { redactRecord, pickColumns } from './daftra-normalize.mjs';
 import { exportDaftraRecords, exportReport } from './daftra-export.mjs';
 import { exportData, FORMATS } from './daftra-exports.mjs';
@@ -111,7 +113,7 @@ async function forwardToService(command, a1, a2, flags, env) {
 const SERVICE_COMMANDS = new Set(['propose', 'duplicate', 'show', 'status', 'execute', 'resolve']);
 // Reads in service mode: the agent holds NO Daftra credential (Daftra roles are per entity, not per method, so a key that can
 // read can also write). Every GET goes through the broker's /v1/get; a real key that happens to be in the env is never used.
-const READ_COMMANDS = new Set(['list', 'get', 'report', 'statement', 'reconcile-payments', 'pdf', 'export', 'export-report', 'export-statement']);
+const READ_COMMANDS = new Set(['list', 'get', 'report', 'access-report', 'statement', 'reconcile-payments', 'pdf', 'export', 'export-report', 'export-statement']);
 const KEYLESS_PLACEHOLDER = 'keyless-service-mode-no-credential';
 const DAFTRA_CREDENTIAL_ENV = ['DAFTRA_API_KEY', 'DAFTRA_API_KEY_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'];
 const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
@@ -145,6 +147,7 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
       return {
         ok: true,
         read: Object.keys(ENTITIES), reports: Object.keys(REPORTS), formats: FORMATS,
+        not_available_in_daftra_api: UNSUPPORTED_READS,
         writes: Object.keys(ACTION_TYPES),
         writes_enabled: serviceMode ? false : env.DAFTRA_WRITES_ENABLED === '1',
         broker_mode: serviceMode ? 'service' : Boolean(env.DAFTRA_BROKER_SOCKET),
@@ -177,12 +180,16 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
     }
     case 'get': {
       if (!a1 || !a2) throw Error('Usage: get <entity> <id>');
-      return { ok: true, entity: a1, record: redactRecord(await getOne(a1, a2, env, fetcher)) };
+      const got = await getOneDetailed(a1, a2, env, fetcher, { sleep });
+      return { ok: true, entity: a1, record: redactRecord(got.record), source: got.source, ...(got.note ? { note: got.note } : {}) };
     }
     case 'report': {
       if (!a1) throw Error('Usage: report <name> [--param k=v]...');
       const payload = redactRecord(await getReport(a1, query, env, fetcher, { sleep }));
       return { ok: true, report: a1, complete: !isPartialReport(a1, query), official: false, payload };
+    }
+    case 'access-report': {
+      return { ok: true, ...(await accessReport(env, fetcher, { sleep, only: a1 })) };
     }
     case 'statement': {
       if (!a1 || !flags.from || !flags.to) throw Error('Usage: statement <client-id> --from YYYY-MM-DD --to YYYY-MM-DD');
@@ -248,6 +255,12 @@ if (process.argv[1] && import.meta.url === new URL('file://' + resolve(process.a
   } catch (error) {
     const body = { ok: false, error: error.message };
     if (error instanceof WriteRefused) body.refused = error.code;
+    // Daftra read failures say WHAT kind of failure it was (validation / forbidden / report_not_exposed / transient ...) and who can fix it.
+    if (error instanceof DaftraError && error.category) {
+      body.status = error.status; body.category = error.category; body.hint = error.hint;
+      if (error.owner_action) body.owner_action = error.owner_action;
+      if (error.validationErrors) body.validation_errors = error.validationErrors;
+    }
     console.error(JSON.stringify(body));
     process.exitCode = 1;
   }
