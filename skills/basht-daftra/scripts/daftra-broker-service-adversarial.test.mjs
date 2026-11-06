@@ -401,13 +401,13 @@ test('PROTOCOL ABUSE on the private API: oversize body, chunked flood, bad JSON,
       s.on('connect', () => { s.write(base + 'Transfer-Encoding: chunked\r\n\r\n'); const chunk = 'x'.repeat(65536); let sent = 0; const pump = () => { while (sent < 400_000 && s.writable) { s.write(chunk.length.toString(16) + '\r\n' + chunk + '\r\n'); sent += chunk.length; } }; pump(); }); });
     assert.doesNotMatch(flood, /^HTTP\/1\.1 200/);
     // slowloris: headers never completed, body never completed -> the server drops the connection quickly
-    const slow = await new Promise((res) => { const t0 = Date.now(); const s = net.createConnection(c.privatePort, '127.0.0.1'); s.on('connect', () => s.write('POST /v1/status HTTP/1.1\r\nHost: x\r\nX-A: ')); s.on('close', () => res(Date.now() - t0)); s.on('error', () => res(Date.now() - t0)); setTimeout(() => { s.destroy(); res(99999); }, 5000); });
+    const slow = await new Promise((res) => { const t0 = Date.now(); const s = net.createConnection(c.privatePort, '127.0.0.1'); s.on('data', () => {}); s.on('connect', () => s.write('POST /v1/status HTTP/1.1\r\nHost: x\r\nX-A: ')); s.on('close', () => res(Date.now() - t0)); s.on('error', () => res(Date.now() - t0)); setTimeout(() => { s.destroy(); res(99999); }, 5000); });
     assert.ok(slow < 4000, 'slow header client was dropped after ' + slow + 'ms');
-    const slowBody = await new Promise((res) => { const t0 = Date.now(); const s = net.createConnection(c.privatePort, '127.0.0.1'); s.on('connect', () => s.write(base + 'Content-Length: 100\r\n\r\n{"id"')); s.on('close', () => res(Date.now() - t0)); s.on('error', () => res(Date.now() - t0)); setTimeout(() => { s.destroy(); res(99999); }, 5000); });
+    const slowBody = await new Promise((res) => { const t0 = Date.now(); const s = net.createConnection(c.privatePort, '127.0.0.1'); s.on('data', () => {}); s.on('connect', () => s.write(base + 'Content-Length: 100\r\n\r\n{"id"')); s.on('close', () => res(Date.now() - t0)); s.on('error', () => res(Date.now() - t0)); setTimeout(() => { s.destroy(); res(99999); }, 5000); });
     assert.ok(slowBody < 4000, 'slow body client was dropped after ' + slowBody + 'ms');
     // the service is still healthy afterwards
     assert.equal((await c.agent('/v1/status', { id: 'prop_0123456789abcdef' })).status, 422);
-    assert.equal(c.fake.calls.length, 0);
+    assert.equal(c.fake.posts.length, 0);
   } finally { await c.stop(); }
 });
 
