@@ -28,6 +28,29 @@ export const WRITE_ROUTES = Object.freeze(Object.fromEntries(
 
 const DRAFT_QUERY_TYPES = new Set(['purchase_invoice', 'expense']);   // the only documented `?send=draft` endpoints
 
+// Extract only bounded, human-readable validation diagnostics for the operator.
+// Never log the raw Daftra body, echo submitted field values, or expose secrets.
+function rejectionDetail(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
+  const parts = [];
+  const clean = (value) => typeof value === 'string'
+    ? value.replace(/[\u0000-\u001f<>]/g, ' ').slice(0, 180).trim() : '';
+  if (typeof payload.message === 'string') parts.push(clean(payload.message));
+  const errors = payload.errors ?? payload.validation_errors;
+  if (errors && typeof errors === 'object' && !Array.isArray(errors)) {
+    for (const [key, val] of Object.entries(errors).slice(0, 6)) {
+      // Report only schema-like keys, never arbitrary server-provided values.
+      if (!/^[a-zA-Z][a-zA-Z0-9_.\[\]-]{0,80}$/.test(key)) continue;
+      const vals = Array.isArray(val) ? val.slice(0, 2) : [val];
+      for (const item of vals) {
+        const detail = clean(item);
+        if (detail) parts.push(key + ': ' + detail);
+      }
+    }
+  }
+  return parts.filter(Boolean).join('; ').slice(0, 650);
+}
+
 export class WriteRefused extends Error {
   constructor(code, message) { super(message); this.name = 'WriteRefused'; this.code = code; }
 }
@@ -164,7 +187,7 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     const bodyFailed = response.status >= 200 && response.status < 300 && payload && typeof payload === 'object'
       && ((Number.isInteger(payload.code) && (payload.code < 200 || payload.code >= 300)) || ['failed', 'error'].includes(String(payload.result ?? '').toLowerCase()));
     if (bodyFailed) {
-      const message = typeof payload.message === 'string' ? payload.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 300) : '';
+      const message = rejectionDetail(payload);
       await appendLedger({ ...entry, event: 'rejected_in_body', state: 'rejected', http_status: response.status, body_code: Number.isInteger(payload.code) ? payload.code : null }, env);
       await updateProposal(proposal.id, { status: 'REJECTED' }, env);
       keepHashLock = false;
@@ -188,7 +211,7 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
       return { ok: true, needs_review: verification.matched === false ? 'READ-BACK DOES NOT MATCH THE APPROVED VALUES: check the record in Daftra before relying on it' : undefined, status: duplicated ? 'duplicate_echoed' : 'submitted', record_id: recordId, http_status: response.status, verification };
     }
     if (response.status >= 400 && response.status < 500) {
-      const message = typeof payload?.message === 'string' ? payload.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 300) : '';
+      const message = rejectionDetail(payload);
       await appendLedger({ ...entry, event: 'rejected', state: 'rejected', http_status: response.status }, env);
       await updateProposal(proposal.id, { status: 'REJECTED' }, env);
       keepHashLock = false;                                // definitive: nothing was created, a corrected retry is allowed
