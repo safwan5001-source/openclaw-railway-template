@@ -47,7 +47,7 @@ test('validateGet accepts only registry paths and rebuilds the query through the
     '/api2/invoices.json\n', '/api2/invoices\\.json', '/api2/invoices/0.json', '/api2/invoices/01.json', '/api2/invoices/1/2.json', '/api2/invoices/1234567890123456.json',
     '/api2/invoices/-1.json', '/api2/invoices/1.5.json', '/api2/invoices/١٢٣.json', '/api2/reports/unknown', '/api2/reports/../users', '/api2/reports/revenue.json', '/api2/reports/',
     '/api2/reports', '/api2', '/api2/', '/', '', 'api2/invoices.json', 'https://evil.example/api2/invoices.json', '/v2/api/entity/invoice/list/1', '/site_payment_gateway/list/1',
-    '/api2/invoices.json/', '/api2/invoices.jsonx', '/api2/site_info.json', '/api2/journals.json', '/api2/staff.json', '/api2/invoices/3/pdf.json'])
+    '/api2/invoices.json/', '/api2/invoices.jsonx', '/api2/site_info.json', '/api2/journal_entries.json', '/api2/deposits.json', '/api2/advances.json', '/api2/expense_categories.json', '/api2/bank_accounts.json', '/api2/staff.json', '/api2/invoices/3/pdf.json'])
     bad({ path });
   for (const path of [undefined, null, 5, {}, [], ['/api2/invoices.json'], true]) bad({ path });
   for (const query of [[], 'a=b', { page: [1] }, { page: { a: 1 } }, { page: null }, { page: true }, { foo: 1 }, { page: 0 }, { limit: '1e3' }, { client_id: '1;2' }, { keywords: 'a\nb' },

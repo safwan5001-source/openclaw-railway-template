@@ -2,18 +2,30 @@
 // (Approval-gated writes live in daftra-write.mjs behind a separate allowlist.)
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { ENTITIES, REPORTS, buildQuery } from './daftra-entities.mjs';
+import { ENTITIES, REPORTS, buildQuery, buildReportQuery, normalizeReportParams } from './daftra-entities.mjs';
 import { extractList, extractOne, extractPage, extractUnpaged } from './daftra-normalize.mjs';
+import { classifyFailure, summariseValidationErrors } from './daftra-errors.mjs';
 
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_JSON_BYTES = 50 * 1024 * 1024;
 const RETRYABLE = new Set([429, 502, 503, 504]);
 
+// `category` / `hint` / `owner_action` come from classifyFailure() (daftra-errors.mjs); `validationErrors` is Daftra's own
+// `validation_errors` summarised for 400 responses. They let a caller tell a bad parameter from a missing permission from a
+// report that this deployment does not expose from a temporary outage, instead of guessing from a bare status code.
 export class DaftraError extends Error {
-  constructor(message, status) {
+  constructor(message, status, info = {}) {
     super(message);
     this.name = 'DaftraError';
     this.status = status;
+    if (info.category) {
+      this.category = info.category;
+      this.hint = info.hint;
+      this.owner_action = info.owner_action ?? null;
+      this.retryable = Boolean(info.retryable);
+    }
+    if (info.validationErrors) this.validationErrors = info.validationErrors;
+    if (info.upstreamStatus) this.upstreamStatus = info.upstreamStatus;
   }
 }
 
@@ -53,20 +65,33 @@ async function apiGet(path, { query, env = process.env, fetcher = fetch, sleep =
       await sleep(retryDelayMs(response, attempt));
       continue;
     }
-    return readResponse(response);
+    return readResponse(response, url.pathname.startsWith('/api2/reports/'));
   }
 }
 
-async function readResponse(response) {
+async function readResponse(response, isReport = false) {
   if (!response.ok) {
     let detail = '';
-    if (response.status >= 400 && response.status < 500) {
+    let message = '';
+    let validationErrors = '';
+    let upstreamStatus;
+    // 4xx carries Daftra's own explanation; the broker shim also forwards `upstream_status` for a masked 5xx.
+    if (response.status >= 400) {
       try {
         const body = await response.json();
-        if (typeof body?.message === 'string') detail = ': ' + body.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 200);
+        if (typeof body?.message === 'string') {
+          message = body.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 200);
+          if (response.status < 500) detail = ': ' + message;
+        }
+        if (response.status === 400) validationErrors = summariseValidationErrors(body?.validation_errors ?? body?.errors);
+        if (Number.isSafeInteger(body?.upstream_status) && body.upstream_status >= 500 && body.upstream_status < 600) upstreamStatus = body.upstream_status;
       } catch { /* body is not JSON; status alone is enough */ }
     }
-    throw new DaftraError('Daftra request failed (HTTP ' + response.status + ')' + detail, response.status);
+    if (validationErrors) detail += ' [validation_errors: ' + validationErrors + ']';
+    // A broker-masked upstream 500 arrives as 502; classify by what Daftra really answered.
+    const effective = upstreamStatus === 500 && response.status === 502 ? 500 : response.status;
+    const info = classifyFailure(effective, { isReport, message });
+    throw new DaftraError('Daftra request failed (HTTP ' + effective + ')' + detail, effective, { ...info, validationErrors, upstreamStatus });
   }
   const text = await response.text();
   if (text.length > MAX_JSON_BYTES) throw new DaftraError('Daftra response too large', response.status);
@@ -90,7 +115,10 @@ function entitySpec(entity) {
 // One page, raw payload.
 export async function listRecords(entity, env, fetcher, query = {}, extra = {}) {
   const spec = entitySpec(entity);
-  return apiGet('/api2/' + spec.path + '.json', { query: buildQuery(spec.params, query), env, fetcher, ...extra });
+  const search = buildQuery(spec.params, query);
+  // Documented per-endpoint ceiling (e.g. journals: 100). Larger page sizes are clamped, never forwarded.
+  if (spec.maxLimit && search.has('limit') && Number(search.get('limit')) > spec.maxLimit) search.set('limit', String(spec.maxLimit));
+  return apiGet('/api2/' + spec.path + '.json', { query: search, env, fetcher, ...extra });
 }
 
 export async function getRecord(entity, id, env, fetcher) {
@@ -115,6 +143,26 @@ export async function getOne(entity, id, env, fetcher) {
   return extractOne(await getRecord(entity, id, env, fetcher), entity);
 }
 
+// Small reference collections whose single-record GET may fail on Daftra's side while the documented list endpoint (same model, same
+// permission) still answers. For these, a 5xx on `GET /<entity>/<id>.json` falls back to the COMPLETE list (proven complete by
+// fetchAllRecords) and picks the row by id. The caller is told which source answered; nothing is invented when the row is absent.
+const SINGLE_FALLBACK_TO_LIST = new Set(['treasuries', 'product_categories', 'journal_cats', 'journal_accounts']);
+
+export async function getOneDetailed(entity, id, env, fetcher, { sleep } = {}) {
+  try {
+    return { record: await getOne(entity, id, env, fetcher), source: 'single' };
+  } catch (error) {
+    const recoverable = error instanceof DaftraError && (error.category === 'transient' || error.category === 'upstream_error');
+    if (!recoverable || !SINGLE_FALLBACK_TO_LIST.has(entity)) throw error;
+    const wanted = invoiceId(id);
+    let all;
+    try { all = await fetchAllRecords(entity, { sleep }, env, fetcher); } catch { throw error; }   // list failed too: report the original failure
+    const hit = all.records.find((r) => String(r?.id) === wanted);
+    if (!hit) throw new DaftraError('Daftra request failed (HTTP 404): ' + entity + ' id ' + wanted + ' is not in the complete list', 404, classifyFailure(404));
+    return { record: hit, source: 'list_fallback', note: 'The single-record endpoint failed (' + error.category + '); this row comes from the complete ' + entity + ' list (' + all.count + ' rows) and may omit single-record-only fields.' };
+  }
+}
+
 // Walk every page and prove the result is the whole collection, or throw.
 // Completeness means ALL of: page numbers arrive in order, page_count and total_results stay
 // stable, every non-final page links to `next`, the final page does not, ids are unique,
@@ -130,10 +178,11 @@ export async function fetchAllRecords(entity, options = {}, env = process.env, f
     return Object.freeze({ records: page.records, entity, complete: true, count: page.count, total: page.total, pages: 1, warning: null, fetched_at: new Date().toISOString() });
   }
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500) throw new Error('pageSize must be 1-500');
+  if (spec.maxLimit && pageSize > spec.maxLimit) options = { ...options, pageSize: spec.maxLimit };
   let lastError;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await walkPages(entity, query, pageSize, maxPages, maxRecords, env, fetcher, sleep);
+      return await walkPages(entity, query, options.pageSize ?? pageSize, maxPages, maxRecords, env, fetcher, sleep);
     } catch (error) {
       if (!(error instanceof PaginationChanged)) throw error;
       lastError = error; // data changed while reading: restart once from page 1
@@ -149,13 +198,23 @@ async function walkPages(entity, query, pageSize, maxPages, maxRecords, env, fet
   const seen = new Set();
   let total = null;
   let pageCount = null;
+  let sizeParam = true;
   for (let page = 1; ; page++) {
     if (page > maxPages) throw new Error('Export blocked: more than ' + maxPages + ' pages; narrow the date range or filters');
-    const payload = await listRecords(entity, env, fetcher, { ...query, limit: pageSize, page }, { sleep });
+    let payload;
+    try {
+      payload = await listRecords(entity, env, fetcher, { ...query, ...(sizeParam ? { limit: pageSize } : {}), page }, { sleep });
+    } catch (error) {
+      // Daftra answered the FIRST page with "Invalid page". Pagination is not a permission problem, so retry the bare request
+      // (server-default page size, no page number) once; completeness is still proven below from the returned metadata.
+      if (!(page === 1 && error instanceof DaftraError && error.category === 'invalid_page')) throw error;
+      sizeParam = false;
+      try { payload = await listRecords(entity, env, fetcher, { ...query }, { sleep }); } catch { throw error; }
+    }
     const p = extractPage(payload, entity);
     if (p.total === null || p.pageCount === null || p.page === null)
       throw new Error('Export blocked: pagination metadata (page, page_count, total_results) missing; completeness cannot be proven');
-    if (p.page !== page) throw new PaginationChanged('server returned page ' + p.page + ' for page ' + page);
+    if (p.page !== page && !(p.total === 0 && p.records.length === 0)) throw new PaginationChanged('server returned page ' + p.page + ' for page ' + page);
     if (total === null) { total = p.total; pageCount = p.pageCount; }
     else if (p.total !== total || p.pageCount !== pageCount) throw new PaginationChanged('collection changed while reading');
     if (total > maxRecords) throw new Error('Export blocked: ' + total + ' records exceeds limit of ' + maxRecords);
@@ -192,8 +251,7 @@ export function isPartialReport(name, params = {}) {
 }
 
 async function reportRequest(name, params, env, fetcher, sleep) {
-  const spec = REPORTS[name];
-  const payload = await apiGet('/api2/reports/' + name, { query: buildQuery(spec.params, params), env, fetcher, sleep });
+  const payload = await apiGet('/api2/reports/' + name, { query: buildReportQuery(name, params), env, fetcher, sleep });
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid Daftra report response');
   return payload;
 }
@@ -223,9 +281,11 @@ async function walkReportPages(name, params, env, fetcher, sleep) {
   return { ...rest, rows, pagination: { pages: Math.max(totalPages, 1), total_rows: totalRows, complete: true }, totals_note: 'Per-page totals omitted when pages are merged' };
 }
 
-export async function getReport(name, params = {}, env, fetcher, { sleep = defaultSleep } = {}) {
+export async function getReport(name, rawParams = {}, env, fetcher, { sleep = defaultSleep } = {}) {
   if (typeof name !== 'string' || !Object.hasOwn(REPORTS, name)) throw new Error('Report not authorized');
   const spec = REPORTS[name];
+  // Documented spellings/enumerations/cross-parameter rules are applied (and violations explained) BEFORE any request is made.
+  const params = normalizeReportParams(name, rawParams);
   for (const key of spec.required) if (params[key] === undefined || params[key] === '') throw new Error('Report parameter required: ' + key);
   if (PAGED_REPORTS.includes(name) && params.page === undefined) return walkReportPages(name, params, env, fetcher, sleep);
   return reportRequest(name, params, env, fetcher, sleep);

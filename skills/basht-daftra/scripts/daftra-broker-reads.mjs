@@ -8,8 +8,9 @@
 // Nothing the agent sends is forwarded verbatim: not headers, not a URL, not a method, not a host. The path must match a
 // strict regex built from the registry in daftra-entities.mjs and the query is rebuilt with buildQuery() (allowlist + per-key
 // validation), exactly as the in-process reader does.
-import { ENTITIES, REPORTS, buildQuery } from './daftra-entities.mjs';
+import { ENTITIES, REPORTS, buildQuery, buildReportQuery } from './daftra-entities.mjs';
 import { config, pdfUrl, assertPdfBytes } from './daftra-readonly.mjs';
+import { summariseValidationErrors } from './daftra-errors.mjs';
 
 // Response caps: list/single-record reads 6 MiB (a page is <= 500 rows), reports 16 MiB (single response, no pagination).
 export const MAX_LIST_RESPONSE = 6 * 1024 * 1024;
@@ -49,7 +50,8 @@ export function validateGet(body) {
   if ((m = LIST_RE.exec(path))) {
     const spec = ENTITY_BY_PATH.get(m[1]);
     const search = guardedQuery(spec.params, rawQuery);
-    if (search.has('limit') && Number(search.get('limit')) > MAX_LIMIT) search.set('limit', String(MAX_LIMIT));   // clamp (fetchAll's pageSize is <= 500)
+    const ceiling = Math.min(spec.maxLimit ?? MAX_LIMIT, MAX_LIMIT);                  // documented per-endpoint ceiling (journals: 100)
+    if (search.has('limit') && Number(search.get('limit')) > ceiling) search.set('limit', String(ceiling));   // clamp (fetchAll's pageSize is <= 500)
     return { path, kind: 'list', name: m[1], search };
   }
   if ((m = ONE_RE.exec(path))) {
@@ -57,8 +59,10 @@ export function validateGet(body) {
     return { path, kind: 'one', name: m[1], search: new URLSearchParams() };
   }
   if ((m = REPORT_RE.exec(path))) {
-    const spec = REPORTS[m[1]];
-    return { path, kind: 'report', name: m[1], search: guardedQuery(spec.params, rawQuery) };
+    // Same documented contract as the in-process reader (spelling aliases, enumerations, cross-parameter rules, special branch/cost-centre values).
+    let search;
+    try { search = buildReportQuery(m[1], rawQuery); } catch (e) { throw new BadRead(String(e.message).slice(0, 300)); }
+    return { path, kind: 'report', name: m[1], search };
   }
   throw new BadRead('Path not allowed');
 }
@@ -86,6 +90,7 @@ async function readCapped(response, cap) {
 }
 
 const clean = (s, n = 200) => String(s).replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, n);
+const validationDigest = (errors) => summariseValidationErrors(errors);
 
 // The ONLY upstream primitive of the read proxy: GET, pinned tenant origin, /api2 path (validated above), redirect:'manual'.
 // Returns what the agent-side reader needs to behave exactly as if it had called Daftra itself:
@@ -101,7 +106,7 @@ export async function performGet(validated, { env, fetcher = fetch }) {
   if (status === 429 || status === 502 || status === 503 || status === 504) {
     const ra = Number(response.headers?.get?.('retry-after'));
     try { await response.body?.cancel?.(); } catch { /* ignore */ }
-    return { status, body: null, retry_after: Number.isFinite(ra) && ra >= 0 ? Math.min(ra, 10) : undefined };
+    return { status, body: null, retry_after: Number.isFinite(ra) && ra >= 0 ? Math.min(ra, 10) : undefined, ...(status !== 429 ? { upstream_status: status } : {}) };
   }
   const raw = await readCapped(response, validated.kind === 'report' ? MAX_REPORT_RESPONSE : MAX_LIST_RESPONSE);   // size guard BEFORE JSON.parse
   let json = null; try { json = JSON.parse(raw.toString('utf8')); } catch { /* not JSON */ }
@@ -109,8 +114,11 @@ export async function performGet(validated, { env, fetcher = fetch }) {
     if (json === null) return { status: 502, body: null, message: 'Upstream returned non-JSON content' };
     return { status, body: json };
   }
-  if (status >= 400 && status < 500) return { status, body: null, message: typeof json?.message === 'string' ? clean(json.message) : undefined };
-  return { status: 502, body: null, message: 'Upstream error' };
+  // 4xx: Daftra's own message and (for 400) the named invalid parameters, so the agent can tell a bad parameter from a missing permission.
+  if (status >= 400 && status < 500) return { status, body: null, message: typeof json?.message === 'string' ? clean(json.message) : undefined, ...(status === 400 && json?.validation_errors ? { validation_errors: validationDigest(json.validation_errors) } : {}) };
+  // Any other 5xx stays a 502 toward the agent (never forwarded verbatim) but now says what Daftra really answered, so a Daftra 500 is not
+  // mistaken for a transient gateway fault.
+  return { status: 502, body: null, message: 'Upstream error', upstream_status: status };
 }
 
 export function validateInvoicePdfRequest(body) {

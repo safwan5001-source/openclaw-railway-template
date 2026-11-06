@@ -6,7 +6,7 @@
 //     sum(invoice totals) - sum(invoice payments)  !=  sum(summary_unpaid)
 // the statement says so (`reconciles: false`) instead of presenting a confident balance.
 import { fetchAllRecords } from './daftra-readonly.mjs';
-import { isCalendarDate } from './daftra-entities.mjs';
+import { isCalendarDate, UNSUPPORTED_READS } from './daftra-entities.mjs';
 import { parseDecimal, format, ZERO } from './daftra-money.mjs';
 
 export const money = (v, field) => {
@@ -69,5 +69,5 @@ export async function clientStatement({ clientId, from, to }, env, fetcher, opti
     fetchAllRecords('client_payments', { ...opts, query: { ...q, status: '1' } }, env, fetcher),
   ]);
   const statement = buildClientStatement({ clientId, from, to, invoices: invoices.records, invoicePayments: invoicePayments.records, clientPayments: clientPayments.records });
-  return { ...statement, provenance: { source: 'Daftra API', complete: true, counts: { invoices: invoices.count, invoice_payments: invoicePayments.count, client_payments: clientPayments.count }, fetched_at: new Date().toISOString() } };
+  return { ...statement, official_statement: { available: false, reason: UNSUPPORTED_READS.client_statement_official }, provenance: { source: 'Daftra API', complete: true, counts: { invoices: invoices.count, invoice_payments: invoicePayments.count, client_payments: clientPayments.count }, fetched_at: new Date().toISOString() } };
 }
