@@ -1,0 +1,14 @@
+# Shared by Dockerfile (OpenClaw service) and Dockerfile.broker. Keep images small and free of dev-only files.
+.git
+.github
+.tmpdata
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.pyc
+# tests/fixtures never ship in either image (the skill is copied from skills/basht-daftra/scripts)
+skills/**/*.test.mjs
+skills/**/*.test-helper.mjs

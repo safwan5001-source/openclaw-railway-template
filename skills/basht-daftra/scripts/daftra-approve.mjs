@@ -9,9 +9,8 @@ import { loadProposal } from './daftra-ledger.mjs';
 import { formatMeta, safeText } from './daftra-public.mjs';
 import { approvalPhrase, resolveCode, approvalSecret } from './daftra-auth.mjs';
 
-export async function review(id, env = process.env, now = Date.now()) {
-  approvalSecret(env);
-  const p = await loadProposal(id, env);
+// The human-readable review (no approval phrase). Shared by this tool and the service console.
+export function reviewLines(p) {
   const okCount = (p.checks ?? []).filter((c) => c.ok).length;
   const lines = [
     '=== Proposal ' + p.id + ' (' + p.type + ', ' + p.mode.toUpperCase() + ') ===',
@@ -30,6 +29,13 @@ export async function review(id, env = process.env, now = Date.now()) {
   else if (p.duplicates?.length) lines.push('Duplicates found: ' + safeText(p.duplicates.map((d) => d.entity + '#' + d.id).join(', ')));
   if (p.blocking?.length) lines.push('BLOCKED : ' + safeText(p.blocking.join(' | ')));
   if (p.warnings?.length) lines.push('Warnings: ' + safeText(p.warnings.join(' | ')));
+  return lines;
+}
+
+export async function review(id, env = process.env, now = Date.now()) {
+  approvalSecret(env);
+  const p = await loadProposal(id, env);
+  const lines = reviewLines(p);
   const live = p.ready === true && Date.parse(p.expires_at) >= now;
   lines.push(live ? '\nIf (and only if) this is exactly what you want, send the agent this message:\n\n' + approvalPhrase(env, p)
     : '\nNo approval phrase: the proposal is ' + (p.ready ? 'expired' : 'blocked') + '.');

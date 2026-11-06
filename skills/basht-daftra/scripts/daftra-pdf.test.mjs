@@ -71,6 +71,6 @@ test('integration: real Chromium renders an Arabic PDF', async (t) => {
     let text;
     try { text = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }); } catch { return; }
     assert.ok(text.includes('Generated summary report'));
-    assert.ok(text.replace(/[‪-‮‎‏]/g, '').includes('كشف'));
+    assert.ok(text.replace(/[\u202a-\u202e\u200e\u200f]/g, '').includes('كشف'));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

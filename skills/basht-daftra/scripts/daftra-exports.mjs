@@ -26,7 +26,7 @@ export function toCsv(records, columns, opts = {}) {
   if (!Array.isArray(records) || records.length > rowLimit(opts)) throw Error('Invalid record count');
   checkColumns(columns);
   function field(v) { return '"' + safeCell(v).replaceAll('"', '""') + '"'; }
-  return '﻿' + columns.map(field).join(',') + '\r\n' +
+  return '\ufeff' + columns.map(field).join(',') + '\r\n' +
     records.map(record => columns.map(col => field(record?.[col])).join(',')).join('\r\n') +
     (records.length ? '\r\n' : '');
 }

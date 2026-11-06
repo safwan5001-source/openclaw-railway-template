@@ -1,5 +1,5 @@
 // What an agent is allowed to see about a proposal. NEVER includes the approval phrase/code or auth MAC.
-export function publicProposal(p) {
+export function publicProposal(p, { service = false } = {}) {
   return {
     ok: true, proposal_id: p.id, status: p.status, type: p.type, mode: p.mode, expires_at: p.expires_at,
     party: p.party, totals: p.totals, effects: p.effects, reversible: p.reversible,
@@ -8,7 +8,10 @@ export function publicProposal(p) {
     request_hash: p.request_hash,
     meta: p.meta ?? null,
     review: formatMeta(p.meta),
-    next: p.status === 'READY_FOR_APPROVAL'
+    next: service ? (p.status === 'READY_FOR_APPROVAL'
+      ? 'NOTHING HAS BEEN SENT. Only the operator can approve this proposal, in the approval console on a separate device. You cannot approve or execute it and there is no phrase to relay. Poll `status <proposal-id>` for the outcome.'
+      : 'BLOCKED: nothing can be executed. Fix the blocking items and propose again.')
+    : p.status === 'READY_FOR_APPROVAL'
       ? 'NOTHING HAS BEEN SENT. Show this preview to the user and ask them to review and obtain the approval phrase from the operator tool: `node daftra-approve.mjs show ' + p.id + '` (run in a trusted shell). You cannot derive the phrase. Run execute only with the phrase the user sends you.'
       : 'BLOCKED: nothing can be executed. Fix the blocking items and propose again.',
   };

@@ -2,7 +2,7 @@
 export const STRICT_NUMBER = /^-?\d+(\.\d+)?$/;
 // Plain decimals that survive a float round-trip: no leading zeros (ids like "007"), <= 15 digits.
 const SAFE_DECIMAL = /^-?(0|[1-9]\d*)(\.\d+)?$/;
-const FORMULA_START = /^[\s\u0000-\u001f\u007f ﻿]*[=+@-]/u;
+const FORMULA_START = /^[\s\u0000-\u001f\u007f \ufeff]*[=+@-]/u;
 
 export function cellString(value) {
   if (value === null || value === undefined) return '';
@@ -29,7 +29,7 @@ export function numericLiteral(value) {
 }
 
 export function hasArabic(text) {
-  return /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/.test(text);
+  return /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-\ufeff]/.test(text);
 }
 
 export function detectRtl(title, columns, records) {

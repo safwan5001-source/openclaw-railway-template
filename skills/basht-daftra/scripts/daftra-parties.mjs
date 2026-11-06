@@ -42,12 +42,12 @@ const EXCLUDED = new Map([
 const ID = /^[1-9]\d{0,14}$/;
 // Control characters (incl. ANSI escapes, newlines) and bidi-override characters are rejected everywhere: they can
 // hide or reorder text in the approval preview.
-const BAD_CHARS = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/u;
+const BAD_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u;
 function text(v, f, max, { multiline = false } = {}) {
   if (typeof v !== 'string') throw Error(f + ' must be text');
   const s = v.normalize('NFC').trim();
   if (!s || s.length > max) throw Error('Invalid ' + f + ' (1-' + max + ' characters)');
-  if (multiline ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/u.test(s) : BAD_CHARS.test(s)) throw Error('Invalid characters in ' + f);
+  if (multiline ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u.test(s) : BAD_CHARS.test(s)) throw Error('Invalid characters in ' + f);
   return s;
 }
 const intIn = (v, f, set) => { if (!set.includes(Number(v)) || String(v).trim() === '') throw Error(f + ' must be one of ' + set.join('/')); return Number(v); };

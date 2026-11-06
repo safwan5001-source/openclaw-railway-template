@@ -6,7 +6,7 @@
 import { mkdir, readFile, writeFile, rename, appendFile, unlink, stat } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { mac, macEqual, proposalAuth } from './daftra-auth.mjs';
+import { mac, macEqual, proposalAuth, tenantOf } from './daftra-auth.mjs';
 
 const PROPOSAL_ID = /^prop_[0-9a-f]{16}$/;
 const HASH = /^[0-9a-f]{64}$/;
@@ -79,6 +79,9 @@ export async function loadProposal(id, env = process.env) {
     const err = Error('Stored proposal failed authentication (modified or created without the operator secret)');
     err.code = 'TAMPERED'; throw err;
   }
+  // Cross-tenant / replayed state from another deployment: signed for a different Daftra tenant than this one.
+  const here = tenantOf(env);
+  if (here && raw.tenant !== here) { const err = Error('Proposal belongs to a different Daftra tenant'); err.code = 'CROSS_TENANT'; throw err; }
   return raw;
 }
 // Only the informational `status` may change after creation (it is not part of the signature).

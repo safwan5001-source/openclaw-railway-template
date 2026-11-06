@@ -32,7 +32,7 @@ test('party preflight: documented fields only; credentials/notify/opening balanc
   bad('client_create', {}, /business_name is required/);
   bad('client_create', { business_name: 'x'.repeat(101) }, /business_name/);
   bad('client_create', { business_name: 'x', nonsense: 1 }, /Unknown client field/);
-  bad('client_create', { business_name: 'x‮drowssap' }, /Invalid characters/);                    // bidi override
+  bad('client_create', { business_name: 'x\u202edrowssap' }, /Invalid characters/);                    // bidi override
   bad('client_create', { business_name: 'x\u001b[31mred' }, /Invalid characters/);                     // ANSI escape
   bad('client_create', { business_name: 'line1\nline2' }, /Invalid characters/);
   bad('client_create', { business_name: 'x', notes: 'ok\u0000nul' }, /Invalid characters/);

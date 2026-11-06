@@ -3,7 +3,7 @@
 // human must approve by hash. It never creates anything in Daftra.
 import { ACTION_TYPES, prepareFinancialAction, hashRequest } from './daftra-finance-preflight.mjs';
 import { DaftraError, getOne, listPage, listRecords, fetchAllRecords } from './daftra-readonly.mjs';
-import { approvalSecret } from './daftra-auth.mjs';
+import { approvalSecret, tenantOf } from './daftra-auth.mjs';
 import { canonicalJson } from './daftra-canonical.mjs';
 import { normName, normEmail, digitsOnly, normTax } from './daftra-parties.mjs';
 import { newProposalId, saveProposal, readLedger, isBlockedByLedger } from './daftra-ledger.mjs';
@@ -250,6 +250,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     warnings: [...preview.warnings, ...extraWarnings, ...collected.warnings],
     duplicates: collected.duplicates,
     acknowledged_duplicates: [...acknowledged],
+    tenant: tenantOf(env),
     meta: { ...(meta ?? {}), ...(snapshot ? { snapshot } : {}), ...(preview.changes ? { changes: preview.changes, price_changes: preview.price_changes, highlights: preview.highlights, carried_fields: preview.carried_fields } : {}) },
   };
   if (hashRequest(proposal.request) !== proposal.request_hash) throw Error('Internal hash mismatch');

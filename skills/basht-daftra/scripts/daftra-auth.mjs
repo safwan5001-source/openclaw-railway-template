@@ -53,6 +53,11 @@ export function approvalSecret(env = process.env) {
   return s;
 }
 
+// The Daftra tenant (host of DAFTRA_BASE_URL) a deployment is pinned to; proposals are signed for exactly one.
+export function tenantOf(env) {
+  try { const u = new URL(env.DAFTRA_BASE_URL || ''); return u.protocol === 'https:' ? u.host : null; } catch { return null; }
+}
+
 export function mac(env, label, value) {
   return createHmac('sha256', approvalSecret(env)).update(label + '\n' + canonicalJson(value)).digest('hex');
 }
@@ -69,6 +74,7 @@ export function signedFields(p) {
     id: p.id, type: p.type, created_at: p.created_at, expires_at: p.expires_at, actor: p.actor, mode: p.mode,
     effects: p.effects, totals: p.totals, party: p.party, request: p.request, request_hash: p.request_hash,
     acknowledged_duplicates: p.acknowledged_duplicates ?? [], ready: p.ready === true, meta: p.meta ?? null,
+    tenant: p.tenant ?? null,
   };
 }
 export const proposalAuth = (env, proposal) => mac(env, 'proposal', signedFields(proposal));

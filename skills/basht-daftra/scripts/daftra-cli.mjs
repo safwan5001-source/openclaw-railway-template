@@ -22,6 +22,7 @@ import { executeProposal, resolveProposal, WriteRefused } from './daftra-write.m
 import { loadProposal } from './daftra-ledger.mjs';
 import { publicProposal } from './daftra-public.mjs';
 import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
+import { callBrokerService } from './daftra-broker-service-client.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -84,10 +85,43 @@ async function forwardToBroker(command, a1, a2, flags, env) {
   }
 }
 
+// SERVICE MODE (separate Railway service broker). The agent can propose / duplicate / show / status. It can NOT approve:
+// execute and resolve do not exist for it, because approval happens in the operator console on another device.
+async function forwardToService(command, a1, a2, flags, env) {
+  const actor = flags.actor || 'unknown';
+  const call = (cmd, body) => callBrokerService({ url: env.DAFTRA_BROKER_URL, token: env.DAFTRA_BROKER_TOKEN, cmd, body, env });
+  try {
+    if (command === 'execute' || command === 'resolve') throw new WriteRefused('AGENT_CANNOT_APPROVE', 'Approval is performed by the operator in the approval console (separate device); there is no agent execute/resolve. Ask the operator to open the console and poll `status <proposal-id>`.');
+    if (command === 'propose') {
+      if (!a1) throw Error('Usage: propose <' + Object.keys(ACTION_TYPES).join('|') + '> --input \'{...}\' [--actor name]');
+      return await call('propose', { type: a1, input: await readInput(flags), actor });
+    }
+    if (command === 'duplicate') {
+      if (!a1 || !a2) throw Error('Usage: duplicate <invoices|estimates|purchase_invoices> <document-id> --input \'{"date":"YYYY-MM-DD",...overrides}\'');
+      return await call('propose_duplicate', { source: a1, docId: a2, overrides: await readInput(flags), actor });
+    }
+    if (!a1) throw Error('Usage: ' + command + ' <proposal-id>');
+    return await call(command, { id: a1 });
+  } catch (e) {
+    if (e instanceof BrokerRefused) throw new WriteRefused(e.code, e.message);
+    throw e;
+  }
+}
+const SERVICE_COMMANDS = new Set(['propose', 'duplicate', 'show', 'status', 'execute', 'resolve']);
+const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
+  'OPERATOR_PASSWORD', 'OPERATOR_TOTP_SEED', 'BROKER_AGENT_TOKEN', 'BROKER_AGENT_TOKEN_PREVIOUS', 'BROKER_STATE_DIR', 'RAILWAY_API_TOKEN', 'RAILWAY_TOKEN'];
+
 export async function run(argv, { env = process.env, fetcher = fetch, sleep } = {}) {
   const { positional, flags, query } = parseArgs(argv);
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
+  const serviceMode = Boolean(env.DAFTRA_BROKER_URL || env.DAFTRA_BROKER_TOKEN);
+  if (serviceMode && env.DAFTRA_BROKER_SOCKET) throw Error('Set only one of DAFTRA_BROKER_SOCKET (local broker) and DAFTRA_BROKER_URL (separate service)');
+  if (serviceMode && SERVICE_COMMANDS.has(command)) {
+    if (!env.DAFTRA_BROKER_URL || !env.DAFTRA_BROKER_TOKEN) throw Error('Service mode needs both DAFTRA_BROKER_URL and DAFTRA_BROKER_TOKEN');
+    return forwardToService(command, a1, a2, flags, env);
+  }
+  if (!serviceMode && command === 'status') throw Error('status is only available in service mode (DAFTRA_BROKER_URL); use show');
   if (env.DAFTRA_BROKER_SOCKET && BROKERED.has(command)) return forwardToBroker(command, a1, a2, flags, env);
   switch (command) {
     case 'capabilities':
@@ -95,9 +129,10 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
         ok: true,
         read: Object.keys(ENTITIES), reports: Object.keys(REPORTS), formats: FORMATS,
         writes: Object.keys(ACTION_TYPES),
-        writes_enabled: env.DAFTRA_WRITES_ENABLED === '1',
-        broker_mode: Boolean(env.DAFTRA_BROKER_SOCKET),
-        env_warnings: env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
+        writes_enabled: serviceMode ? false : env.DAFTRA_WRITES_ENABLED === '1',
+        broker_mode: serviceMode ? 'service' : Boolean(env.DAFTRA_BROKER_SOCKET),
+        writes_note: serviceMode ? 'writes are controlled by the broker service and approved by the operator in its console; the agent cannot execute' : undefined,
+        env_warnings: serviceMode ? OPERATOR_ONLY_ENV.filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator/broker secrets must only be held by the broker service') : env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
         duplicate_sources: Object.keys(DUP_SOURCES),
         not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'delete/deactivate/suspend or bulk operations on customers and suppliers', 'customer/supplier portal passwords, notifications, opening balances, custom fields', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],

@@ -228,7 +228,7 @@ test('REVIEW#6 purchase tax mapping: inclusive-only and duplicated mappings are 
 });
 
 test('REVIEW#3/#4 the operator review shows overridden duplicates and cannot be spoofed by control characters in source data', async () => {
-  const evil = 'Diesel\u001b[2J\u001b[H FAKE‮\u009b';
+  const evil = 'Diesel\u001b[2J\u001b[H FAKE\u202e\u009b';
   const c = await setup({ items: [{ item: evil, quantity: 1, unit_price: 5, tax1: 0 }, srcItems[0]], seed: { lists: { invoices: [{ id: 3, summary_total: '207.00' }] } }, invoice: { summary_total: '207.00' } });
   try {
     // the hostile line is REMOVED from the copy, so it only ever appears in the comparison shown to the operator
