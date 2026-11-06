@@ -6,6 +6,7 @@
 //   node daftra-approve.mjs resolve <proposal-id> true|false     (after checking Daftra for an ambiguous outcome)
 import { resolve } from 'node:path';
 import { loadProposal } from './daftra-ledger.mjs';
+import { formatMeta } from './daftra-public.mjs';
 import { approvalPhrase, resolveCode, approvalSecret } from './daftra-auth.mjs';
 
 export async function review(id, env = process.env, now = Date.now()) {
@@ -15,6 +16,7 @@ export async function review(id, env = process.env, now = Date.now()) {
     '=== Proposal ' + p.id + ' (' + p.type + ', ' + p.mode.toUpperCase() + ') ===',
     'Party   : ' + JSON.stringify(p.party),
     'Totals  : ' + JSON.stringify(p.totals),
+    ...formatMeta(p.meta),
     'Effects : ' + p.effects.join(', ') + ' | reversible: ' + p.reversible,
     'Sends   : ' + p.request.method + ' ' + p.request.path + (p.request.query ? '?' + p.request.query : ''),
     'Body    : ' + JSON.stringify(p.request.body),

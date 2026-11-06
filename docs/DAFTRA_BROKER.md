@@ -13,7 +13,7 @@ Without a broker, the agent process holds `DAFTRA_API_KEY` and (to run `propose`
  │      DAFTRA_API_KEY  (READ key) │  broker.sock      │   approval.secret   write-api.key        │
  │      DAFTRA_BROKER_SOCKET       │ ───────────────►  │ state dir (0700): proposals + ledger     │
  │ reads, exports, PDF: local      │  1 JSON line in,  │ ping | propose | show | execute | resolve │
- │ propose/show/execute/resolve:   │  1 JSON line out  │ HMAC-signed proposals + chained ledger   │
+ │ propose/duplicate/show/execute/resolve:   │  1 JSON line out  │ HMAC-signed proposals + chained ledger   │
  │   forwarded, never run locally  │                   │ only process that can POST to Daftra     │
  └─────────────────────────────────┘                   └──────────────────────────────────────────┘
         human (trusted shell as the broker user): node daftra-approve.mjs show <id>  → approval phrase
@@ -28,7 +28,7 @@ Without a broker, the agent process holds `DAFTRA_API_KEY` and (to run `propose`
 | `daftra-public.mjs` | `publicProposal()` — the only view of a proposal the agent receives (never a phrase/code/MAC). |
 | `daftra-auth.mjs` | `readSecretFile`, `readSecret(env, NAME)`: `NAME_FILE` wins over `NAME`. |
 | `daftra-approve.mjs` | Operator/human tool: shows the stored request and prints the approval phrase. Works with the secret file. |
-| `daftra-cli.mjs` | With `DAFTRA_BROKER_SOCKET` set, `propose|show|execute|resolve` are **only** forwarded; they never run in-process, even if a secret is present in the env (fail closed). `capabilities` reports `broker_mode` and warns if operator secrets are in the agent env. |
+| `daftra-cli.mjs` | With `DAFTRA_BROKER_SOCKET` set, `propose|duplicate|show|execute|resolve` are **only** forwarded; they never run in-process, even if a secret is present in the env (fail closed). `capabilities` reports `broker_mode` and warns if operator secrets are in the agent env. |
 
 ## 3. Broker configuration (broker's own environment only)
 

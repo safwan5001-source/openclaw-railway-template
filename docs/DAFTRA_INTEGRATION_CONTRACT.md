@@ -1,4 +1,4 @@
-# BASHT × Daftra — Integration Contract v2
+# BASHT × Daftra — Integration Contract v3
 
 Status: **IMPLEMENTED & UNIT-TESTED AGAINST A FAKE — NOT LIVE-TESTED, NOT DEPLOYED.**
 Code: `skills/basht-daftra/` (self-contained OpenClaw skill: `SKILL.md` + `scripts/`). Zero runtime npm dependencies.
@@ -18,6 +18,10 @@ Code: `skills/basht-daftra/` (self-contained OpenClaw skill: `SKILL.md` + `scrip
 | Write shapes: `Invoice`+`InvoiceItem[]` (draft = `Invoice.draft` 0/1), estimates same shape, `PurchaseOrder`+`PurchaseOrderItem[]` (`?send=draft`), `Expense` (`?send=draft` **and** `status:"draft"`; real idempotency via `unique_id`), `InvoicePayment`, `ClientPayment`. Success = HTTP 202 + `id`. | 15115242e0, 15115247e0, 15115352e0, 40881052e0, 15115307e0, 15115312e0 |
 | Invoice `unique_id` is *not* idempotency (server recalculates offers/discounts when present) → never sent for invoices. Payments have no idempotency key. | 15115242e0 |
 | Omitting `tax1` makes Daftra inherit the product's tax → every line must send `tax1` explicitly (`0` = no tax). | 15115242e0 |
+| **No copy/clone endpoint exists** for invoices, estimates or purchase invoices (the only "clone" is the audit field `clone_id` on expenses). Duplication = GET source + normal create. All three create endpoints accept draft (`Invoice.draft` for invoices/estimates, `?send=draft` for purchase invoices). | llms.txt index; 15115242e0, 15115247e0, 15115352e0 |
+| Single invoice/purchase responses carry lines as a sibling of the header (`data.InvoiceItem[]`, `data.PurchaseOrderItem[]`); the estimate response only says lines are "nested" (location unspecified → read defensively, fail closed). Invoice line `tax1/tax2` are tax **ids**; purchase line `tax1/tax2` are tax **values**. | 15115238e0, 15115348e0, 15115243e0 |
+| Products: `POST /api2/products.json` (only `name` required; 202 `{id}`; 400 `DUPLICATED` with the existing id), `PUT /api2/products/{id}.json` is a **partial** update (200 confirmation, no echo; some changes blocked after stock movements), `DELETE` exists (not used). `initial_stock_level`+`store_id` create stock; `brand`/`category` names auto-create records; omitted taxes default silently. | 15115317e0, 15115314e0, 15115315e0 |
+| Categories: `POST /api2/product_categories.json` `{Category:{name,category_type:1,parent_id,…}}` and `PUT …/{id}.json` answer HTTP 200 with body `code 202`; list rows use `ProductCategory`, single uses `Category`. | 39121469e0, 39121470e0, 15115374e0 |
 | `GET /site_payment_gateway/list/1` (payment methods) is a v2 endpoint on **Bearer** auth → payment-method validity cannot be verified with an API key; Daftra rejects unknown methods. | 40952350e0 |
 
 Tenant is pinned to `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` root); redirects are never followed.
@@ -34,7 +38,12 @@ Tenant is pinned to `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` root); redirects are
 | Official invoice PDF | `pdf <invoice-id> <file>` | ✔ | ✘ | none |
 | Exports PDF/XLSX/CSV/DOCX/JSON | `export`, `export-report`, `export-statement` | ✔ (opened with openpyxl / python-docx / LibreOffice / Chromium) | n/a | none |
 | Create sales invoice · estimate · purchase invoice · expense · invoice payment · client payment | `propose` → `execute` (draft by default; payments are final) | ✔ (fake) | ✘ | **explicit, per operation** |
-| Edit / delete / refund / e-invoice submission / create clients, suppliers, products | **Not implemented** (no PUT/PATCH/DELETE code exists) | — | — | — |
+| **Duplicate** sales invoice / purchase invoice / estimate into a new draft | `duplicate <source> <id>` → proposal with original-vs-proposed diff | ✔ (fake) | ✘ | **explicit, per operation** |
+| **Products & categories**: search/read | `list/get products`, `list product_categories` | ✔ | ✘ | none |
+| **Product create / update (price, tax, supplier, categories, code, barcode, status…)**, category create / update | `propose product_create|product_update|category_create|category_update` | ✔ (fake) | ✘ | **explicit, per operation** (price changes highlighted) |
+| Edit / delete / refund / e-invoice submission of documents or payments; **delete** of any record; clients/suppliers create/modify | **Not implemented** (no DELETE/PATCH code exists; PUT only for products & categories) | — | — | — |
+| Stock/inventory changes, product bundles, units, brand creation | **Not implemented** (stock endpoints and financial/inventory effects not verified) | — | — | — |
+| Product import / export, bulk product operations | **DEFERRED by the owner** (general PDF/XLSX/CSV/DOCX/JSON exports of invoices, statements and reports are unaffected) | — | — | — |
 
 ## 3. Pagination contract
 
@@ -58,15 +67,17 @@ Threat model: the agent controls CLI arguments and can read/write the workspace,
 2. **Authenticated proposals**: every field that affects what is sent or checked (type, request, hash, totals, party, expiry, mode, acknowledged duplicates, `ready`) is covered by an HMAC `auth`. Any edit without the secret ⇒ `TAMPERED`. Expiry fails closed.
 3. **Out-of-band human approval**: phrase `APPROVE <id> <hash8> <DRAFT|FINAL> <code>`; `<code>` is an HMAC the agent cannot compute and no agent-facing command prints. The human runs the operator tool `daftra-approve.mjs show <id>` in a trusted shell, reviews the stored request, and sends the phrase. Bound to the proposal, 15-minute TTL.
 4. **Operator switches**: `DAFTRA_WRITES_ENABLED=1` (default off) and `DAFTRA_APPROVAL_SECRET` (required).
-5. **Route + body allowlist**: six POST endpoints (`?send=draft` only query) and a per-type body key allowlist. PUT/PATCH/DELETE do not exist in the code.
+5. **Route + body allowlist**: six POST create endpoints for documents/payments, `POST /api2/products.json`, `POST /api2/product_categories.json`, and `PUT` only to `/api2/products/<id>.json` and `/api2/product_categories/<id>.json` (id pinned to the signed target). `?send=draft` only on the two endpoints that document it. A per-type body-key allowlist makes stock/bundle/identity fields unsendable. PATCH/DELETE do not exist in the code.
 6. **Atomic claims**: O_EXCL locks per proposal and per request hash ⇒ parallel `execute` calls send at most once. A proposal is single-use even when it is refused before sending.
 7. **HMAC-chained ledger** (`daftra-ledger/ledger.jsonl`): edits or mid-file truncation ⇒ `LEDGER_TAMPERED`, all writes stop. Records ids, hashes, states, actor, record id — no amounts, names or secrets.
 8. **Pre-submit re-check**: balance/duplicates/permissions re-read immediately before sending, derived from the authenticated request body only.
 9. **No blind retry**: one attempt. Network error / 5xx / success-without-id ⇒ `ambiguous`; the identical request is blocked until a human obtains a resolve code from the operator tool. 4xx ⇒ `rejected` (nothing created, may re-propose).
 10. **Idempotency**: expenses carry a deterministic `unique_id`; others rely on the ledger + duplicate scan. **Rate limit** `DAFTRA_MAX_WRITES_PER_HOUR` (default 20). **Read-back** compares the created total with the approved total.
 
+11. **Privilege separation (broker).** With `DAFTRA_BROKER_SOCKET`, propose/duplicate/show/execute/resolve run only in a separate privileged process (different OS user) that alone holds the approval secret and the write-capable API key; the agent holds only the read key and the socket. Proven with a real unprivileged uid (65534): it cannot read the secret/key files, the broker's state, or `/proc/<pid>/environ`, cannot execute without the operator's phrase, and strict-schema requests reject any `env`/secret/path field. Recipe and limits: `docs/DAFTRA_BROKER.md`. **Not deployed**: it needs a Dockerfile/entrypoint/Railway change that awaits the owner's approval.
+
 **Residual limits (honest):**
-- If the agent's process can read the server environment, it can read `DAFTRA_APPROVAL_SECRET` **and `DAFTRA_API_KEY`** and bypass everything (including calling Daftra directly with the key). Software in the same trust domain cannot prevent that. Mitigations: keep writes off (`DAFTRA_WRITES_ENABLED` unset) except in supervised sessions; keep the approval secret only in the operator's shell/secret store rather than the gateway service where the platform allows; use OpenClaw exec allow-lists/sandboxing; restrict the Daftra API key's roles.
+- Without the broker (single-process mode), if the agent's process can read the server environment, it can read `DAFTRA_APPROVAL_SECRET` **and `DAFTRA_API_KEY`** and bypass everything (including calling Daftra directly with the key). Software in the same trust domain cannot prevent that. Mitigations: keep writes off (`DAFTRA_WRITES_ENABLED` unset) except in supervised sessions; keep the approval secret only in the operator's shell/secret store rather than the gateway service where the platform allows; use OpenClaw exec allow-lists/sandboxing; restrict the Daftra API key's roles.
 - Truncating the **tail** of the ledger cannot be detected by a chain alone; replay is limited by the 15-minute proposal expiry and the proposal claim lock.
 - Review findings fixed in this revision: self-approval, forged proposals/ledger, parallel double-send, unsigned side fields, ungated `resolve`, page-1-only duplicate scan, export-path TOCTOU, key-name-only redaction, unbounded totals.
 

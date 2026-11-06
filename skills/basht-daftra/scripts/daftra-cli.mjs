@@ -4,7 +4,7 @@
 //
 //   READ    capabilities | list <entity> | get <entity> <id> | report <name> | statement <client-id>
 //   FILES   pdf <invoice-id> <file.pdf> | export <entity> | export-report <name> | export-statement <client-id>
-//   WRITE   propose <type> | show <proposal-id> | execute <proposal-id> | resolve <proposal-id>
+//   WRITE   propose <type> | duplicate <source> <id> | show <proposal-id> | execute <proposal-id> | resolve <proposal-id>
 //           (propose/show are read-only; execute needs DAFTRA_WRITES_ENABLED=1 AND the exact approval phrase)
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -17,6 +17,7 @@ import { safeOutputPath, ensureExportsDir } from './daftra-paths.mjs';
 import { clientStatement } from './daftra-statements.mjs';
 import { ACTION_TYPES } from './daftra-finance-preflight.mjs';
 import { createProposal } from './daftra-proposal.mjs';
+import { proposeDuplicate, DUP_SOURCES } from './daftra-duplicate.mjs';
 import { executeProposal, resolveProposal, WriteRefused } from './daftra-write.mjs';
 import { loadProposal } from './daftra-ledger.mjs';
 import { publicProposal } from './daftra-public.mjs';
@@ -51,15 +52,19 @@ const columnsOf = (flags) => flags.columns && flags.columns !== '-' ? flags.colu
 
 // Commands that need the operator secret / write key. With DAFTRA_BROKER_SOCKET set they are ONLY ever forwarded
 // to the privileged broker (a different OS user) and never run in this process, even if secrets are in the env.
-const BROKERED = new Set(['propose', 'show', 'execute', 'resolve']);
+const BROKERED = new Set(['propose', 'duplicate', 'show', 'execute', 'resolve']);
 
-async function forwardToBroker(command, a1, flags, env) {
+async function forwardToBroker(command, a1, a2, flags, env) {
   const actor = flags.actor || 'unknown';
   const socket = env.DAFTRA_BROKER_SOCKET;
   try {
     if (command === 'propose') {
       if (!a1) throw Error('Usage: propose <' + Object.keys(ACTION_TYPES).join('|') + '> --input \'{...}\' [--actor name]');
       return await callBroker(socket, { cmd: 'propose', type: a1, input: await readInput(flags), actor });
+    }
+    if (command === 'duplicate') {
+      if (!a1 || !a2) throw Error('Usage: duplicate <invoices|estimates|purchase_invoices> <document-id> --input \'{"date":"YYYY-MM-DD",...overrides}\'');
+      return await callBroker(socket, { cmd: 'propose_duplicate', source: a1, docId: a2, overrides: await readInput(flags), actor });
     }
     if (command === 'show') {
       if (!a1) throw Error('Usage: show <proposal-id>');
@@ -83,7 +88,7 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
   const { positional, flags, query } = parseArgs(argv);
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
-  if (env.DAFTRA_BROKER_SOCKET && BROKERED.has(command)) return forwardToBroker(command, a1, flags, env);
+  if (env.DAFTRA_BROKER_SOCKET && BROKERED.has(command)) return forwardToBroker(command, a1, a2, flags, env);
   switch (command) {
     case 'capabilities':
       return {
@@ -94,7 +99,8 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
         broker_mode: Boolean(env.DAFTRA_BROKER_SOCKET),
         env_warnings: env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
-        not_implemented: ['edit', 'delete', 'cancel', 'e-invoice (ZATCA) submission', 'create/modify clients, suppliers, products', 'supplier statements'],
+        duplicate_sources: Object.keys(DUP_SOURCES),
+        not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'create/modify clients or suppliers', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],
       };
     case 'list': {
       if (!a1) throw Error('Usage: list <entity> [--query k=v]... [--all] [--columns a,b]');
@@ -148,6 +154,10 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
     case 'propose': {
       if (!a1) throw Error('Usage: propose <' + Object.keys(ACTION_TYPES).join('|') + '> --input \'{...}\' [--actor name]');
       return publicProposal(await createProposal(a1, await readInput(flags), { env, fetcher, actor }));
+    }
+    case 'duplicate': {
+      if (!a1 || !a2) throw Error('Usage: duplicate <invoices|estimates|purchase_invoices> <document-id> --input \'{"date":"YYYY-MM-DD",...overrides}\'');
+      return publicProposal(await proposeDuplicate({ source: a1, id: a2, overrides: await readInput(flags) }, { env, fetcher, actor }));
     }
     case 'show': {
       if (!a1) throw Error('Usage: show <proposal-id>');

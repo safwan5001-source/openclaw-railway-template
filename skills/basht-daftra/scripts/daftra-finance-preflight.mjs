@@ -85,13 +85,15 @@ function buildItems(rawItems, kind, index, warnings) {
     const tax1 = String(item.tax1 ?? 0);
     const tax2 = String(item.tax2 ?? 0);
     for (const [k, v] of [['tax1', tax1], ['tax2', tax2]]) if (v !== '0' && !ID.test(v)) throw Error(label + ': ' + k + ' invalid');
-    let discountPct = ZERO;
-    if (item.discount !== undefined && item.discount !== null) {
-      discountPct = parseDecimal(item.discount, label + ' discount', { maxDecimals: 2 });
-      if (discountPct > 100n * ONE) throw Error(label + ': discount cannot exceed 100%');
-    }
+    // Discount: type 1 = percentage (default), type 2 = absolute amount (per Daftra docs: discount_type 1/2).
+    const dtype = item.discount_type === undefined || item.discount_type === null ? 1 : Number(item.discount_type);
+    if (![1, 2].includes(dtype)) throw Error(label + ': discount_type must be 1 (percentage) or 2 (absolute)');
+    let discountVal = ZERO;
+    if (item.discount !== undefined && item.discount !== null) discountVal = parseDecimal(item.discount, label + ' discount', { maxDecimals: 2 });
+    if (dtype === 1 && discountVal > 100n * ONE) throw Error(label + ': discount cannot exceed 100%');
     const gross = mul(quantity, unitPrice);
-    const afterDiscount = roundTo(mul(gross, ONE - div(discountPct, 100n * ONE)), 2);
+    if (dtype === 2 && discountVal > gross) throw Error(label + ': absolute discount exceeds the line amount');
+    const afterDiscount = dtype === 1 ? roundTo(mul(gross, ONE - div(discountVal, 100n * ONE)), 2) : roundTo(gross - discountVal, 2);
     const t1 = lineTax(tax1, afterDiscount, afterDiscount, index, warnings, label + ' tax1');
     if (tax2 !== '0' && index?.get(tax2) && Number(index.get(tax2).included) === 1) throw Error(label + ': tax-inclusive tax2 is not supported; use tax1 for the inclusive tax');
     const t2 = lineTax(tax2, afterDiscount, afterDiscount, index, warnings, label + ' tax2');
@@ -102,7 +104,7 @@ function buildItems(rawItems, kind, index, warnings) {
       unit_price: format(unitPrice, 4).replace(/\.?0+$/, '') || '0',
       tax1: Number(tax1), tax2: Number(tax2),
     };
-    if (discountPct > ZERO) { body.discount = Number(format(discountPct, 2)); body.discount_type = 1; }
+    if (discountVal > ZERO) { body.discount = Number(format(discountVal, 2)); body.discount_type = dtype; }
     if (item.product_id !== undefined) body.product_id = Number(id(item.product_id, label + ' product_id'));
     if (kind === 'docs' && item.description !== undefined) body.description = text(item.description, 'description', 2000);
     return body;

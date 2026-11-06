@@ -186,3 +186,19 @@ test('write allowlist: PUT only to /api2/products/<id>.json and /api2/product_ca
   assert.throws(() => assertWriteAllowed('product_delete', upd), WriteRefused);
   assert.throws(() => assertWriteAllowed('category_update', { ...upd, path: '/api2/products/9.json' }), WriteRefused);
 });
+
+test('defence in depth: a SIGNED product update whose path id disagrees with its approved target is refused', async () => {
+  const { env, fake, done } = await setup();
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const { ledgerDir } = await import('./daftra-ledger.mjs');
+    const { proposalAuth } = await import('./daftra-auth.mjs');
+    const { hashRequest } = await import('./daftra-canonical.mjs');
+    const base = await createProposal('product_update', { product_id: 9, changes: { unit_price: '21.5' } }, run(env, fake));
+    const p = { ...base, id: 'prop_' + 'e'.repeat(16), request: { ...base.request, path: '/api2/products/10.json' } };
+    p.request_hash = hashRequest(p.request);
+    await writeFile(join(ledgerDir(env), 'proposals', p.id + '.json'), JSON.stringify({ ...p, auth: proposalAuth(env, p) }));
+    await assert.rejects(executeProposal({ id: p.id, phrase: approvalPhrase(env, p) }, run(env, fake)), (e) => e.code === 'TAMPERED' && /Target id/.test(e.message));
+    assert.equal(fake.posts.length, 0);
+  } finally { await done(); }
+});

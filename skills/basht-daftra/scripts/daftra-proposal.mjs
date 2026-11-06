@@ -153,7 +153,7 @@ export async function collectChecks(type, preview, env, fetcher, acknowledged = 
   return { checks, blocking, warnings, duplicates, counterparty };
 }
 
-export async function createProposal(type, input, { env = process.env, fetcher = fetch, actor = 'unknown', now = Date.now(), meta = null } = {}) {
+export async function createProposal(type, input, { env = process.env, fetcher = fetch, actor = 'unknown', now = Date.now(), meta = null, extraBlocking = [], extraWarnings = [] } = {}) {
   if (!Object.hasOwn(ACTION_TYPES, type)) throw Error('Unsupported financial action');
   approvalSecret(env); // proposals are authenticated; refuse early when the operator secret is not configured
   // Tax table: required for invoice-like documents so every tax id is verified against this tenant.
@@ -177,7 +177,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
   }
   const acknowledged = new Set((input.acknowledge_duplicates ?? []).map(String));
   const collected = await collectChecks(type, preview, env, fetcher, acknowledged, { snapshot });
-  const effective = [...preBlocking, ...collected.blocking];
+  const effective = [...preBlocking, ...extraBlocking, ...collected.blocking];
   const ledger = await readLedger(env);
   const ledgerState = isBlockedByLedger(ledger, preview.request_hash);
   if (ledgerState) effective.push('The identical request was already ' + ledgerState + ' (see ledger); resolve it before proposing again');
@@ -199,7 +199,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     request_hash: preview.request_hash,
     checks: collected.checks,
     blocking: effective,
-    warnings: [...preview.warnings, ...collected.warnings],
+    warnings: [...preview.warnings, ...extraWarnings, ...collected.warnings],
     duplicates: collected.duplicates,
     acknowledged_duplicates: [...acknowledged],
     meta: { ...(meta ?? {}), ...(snapshot ? { snapshot } : {}), ...(preview.changes ? { changes: preview.changes, price_changes: preview.price_changes } : {}) },

@@ -1,6 +1,6 @@
 ---
 name: basht-daftra
-description: "BASHT accounting assistant for the Daftra tenant: read and search sales/purchase invoices, quotes, expenses, payments, clients, suppliers, products, statements and official reports; export PDF/XLSX/CSV/DOCX/JSON; prepare financial operations that execute only after explicit per-operation approval."
+description: "BASHT accounting assistant for the Daftra tenant: read/search invoices, quotes, expenses, payments, clients, suppliers, products and reports; export PDF/XLSX/CSV/DOCX/JSON; duplicate existing documents into new drafts; create/update products and categories; every write executes only after explicit per-operation human approval."
 metadata:
   {
     "openclaw":
@@ -45,7 +45,7 @@ Files are written only inside the private `$OPENCLAW_WORKSPACE_DIR/exports/` fol
 
 ## 3. Financial operations — approval protocol (MANDATORY)
 
-Supported: `sales_invoice`, `estimate`, `purchase_invoice`, `expense`, `invoice_payment`, `client_payment`. **Not supported: edit, delete, cancel, refund, e-invoice submission, creating clients/suppliers/products.** Say so; do not improvise another route.
+Supported: `sales_invoice`, `estimate`, `purchase_invoice`, `expense`, `invoice_payment`, `client_payment`, plus catalog operations `product_create`, `product_update`, `category_create`, `category_update` (section 4) and document duplication (section 5). **Not supported: edit/delete/cancel/refund of documents or payments, deleting any record, e-invoice submission, creating/modifying clients or suppliers, stock/inventory changes, product bundles, and any product import/export or bulk product operation (deferred by the owner).** Say so; do not improvise another route.
 
 1. `propose <type> --input '<json>' --actor <user>` (or `--input-file`). Read-only: it validates clients/suppliers/products, **tax ids against the tenant's tax table**, API-key permission, duplicates already in Daftra (all pages), overpayment, and computes exact totals. Every invoice line needs an explicit `tax1` (a tax id, or `0` for no tax) and every document an explicit `date`. Documents default to **draft**; add `"finalize": true` only if the user explicitly asks to post it. Payments cannot be drafts.
 2. Show the user the preview in their language: operation, party, date, lines, subtotal/tax/total, mode (draft/final), effects, warnings, duplicates. State clearly that **nothing has been sent**.
@@ -62,7 +62,31 @@ Examples of `--input`:
 - `invoice_payment`: `{"invoice_id":3,"amount":"115.00","payment_method":"cash","date":"2025-03-01"}`
 - `client_payment`: `{"client_id":4,"amount":"500","payment_method":"bank","date":"2025-03-01"}`
 
-## 4. Hard rules
+## 4. Products and categories
+
+Read/search (no approval): `list products --query keywords=<text>` (also `category`, `supplier_id`, `brand_id`, `status`, `barcode`, `product_code`; add `--all` for a complete list), `get products <id>`, `list product_categories`. Product links/images are stripped from output.
+
+Writes use the same `propose` → human approval → `execute` protocol:
+- `propose product_create --input '{"name":"…","unit_price":"2.18","tax1":1,"barcode":"…","product_code":"…","categories_id":[12],"status":0}'` — `name`, `unit_price` and an **explicit** `tax1` are required (otherwise Daftra silently applies the account default tax).
+- `propose product_update --input '{"product_id":9,"changes":{"unit_price":"21.5"}}'` — partial update: only fields that really change are sent; the preview shows `current => new` for each and a **PRICE CHANGE** line with the percentage. A product edited in Daftra after the preview is blocked at approval time.
+- `propose category_create --input '{"name":"…","parent_id":0}'`, `propose category_update --input '{"category_id":12,"changes":{"name":"…"}}'`.
+- Writable product fields (documented): `name type(1 product|2 service) product_code barcode(≥5 chars, unique) description notes unit_price buy_price minimum_price profit_margin discount discount_type tax1 tax2 supplier_id categories_id tags status availabe_online duration_minutes`. Category fields: `name parent_id description display_order`.
+- **Refused on purpose:** stock fields (`track_stock`, `tracking_type`, `initial_stock_level`, `store_id`, `low_stock_thershold`), bundles (`type 3`, `ProductBundle`), `brand` and `category` by name (they auto-create records), unit, deleting, bulk operations. Never claim stock can be changed.
+- Checks run before any approval: tax ids exist and are active, supplier/category/parent exist, duplicate barcode/code/name, price 0 needs `allow_zero_price:true`.
+
+## 5. Duplicating a document
+
+Daftra documents **no** copy endpoint, so a duplicate is: read the source (GET) → a normal create proposal. `duplicate <invoices|estimates|purchase_invoices> <document-id> --input '{"date":"2025-03-01", …}'`.
+- `date` is mandatory (a copy never inherits the original date). Optional overrides: `client_id`/`supplier_id`, `currency_code`, `notes`, `finalize`, `line_overrides` (`{"1":{"unit_price":"2.5"}}`, 1-based), `remove_lines`, `add_lines`, `accept_total_difference`, `acknowledge_duplicates`.
+- Copied: party, currency, notes, lines (item, description, quantity, price, discount, taxes, product). **Never copied:** id, number, payments/receipts, paid/unpaid/settlement, e-invoice (ZATCA) state, created/issue timestamps, links, source links. Daftra assigns the new id/number.
+- The preview (and the operator tool) show **original vs proposed**, header and line by line, plus what was not copied. Taxes/products/clients are re-validated; a source header discount/shipping/deposit that a copy cannot reproduce blocks the proposal until the user accepts the difference. Purchase-line tax values are mapped to a tax id only when exactly one active tax matches.
+- Drafts first (all three document types support draft). Copying with the original date/client/total is flagged as a likely duplicate of the original.
+
+## 6. Privilege separation (broker) — recommended for production
+
+When `DAFTRA_BROKER_SOCKET` is set, `propose`, `duplicate`, `show`, `execute`, `resolve` are forwarded to a separate privileged broker process (different OS user) that alone holds `DAFTRA_APPROVAL_SECRET` and the write-capable API key; they never run in your process. Your environment should contain only the read key and the socket path. If `capabilities` lists `env_warnings`, tell the operator. See `docs/DAFTRA_BROKER.md`.
+
+## 7. Hard rules
 
 - Never expose `DAFTRA_API_KEY`, the proposal/ledger contents beyond the preview, or Daftra document links. Do not echo environment variables.
 - On 401/403 do not ask for broader key scopes or use an OAuth client secret; report that the key's role does not allow the entity.
@@ -70,6 +94,6 @@ Examples of `--input`:
 - Daftra's API-key roles are per entity, not per method — read access and write access are the same grant. Write safety therefore comes from this skill's approval protocol and the operator switch, not from Daftra roles.
 - Do not modify Gateway, model, browser, or security settings, and do not delete data.
 
-## 5. Operator notes
+## 8. Operator notes
 
-Environment (Railway): `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` tenant root), `DAFTRA_API_KEY`; optional `OPENCLAW_WORKSPACE_DIR` (default `/data/workspace`), `DAFTRA_WRITES_ENABLED` (default off), `DAFTRA_APPROVAL_SECRET` (≥32 random chars; required for any financial operation; keep it out of the agent's exec environment where possible), `DAFTRA_MAX_WRITES_PER_HOUR` (default 20), `CHROMIUM_PATH`. The operation ledger lives in `$OPENCLAW_WORKSPACE_DIR/daftra-ledger/` (ids, hashes and states only — no amounts or secrets; HMAC-chained, tampering stops all writes). Full contract: `docs/DAFTRA_INTEGRATION_CONTRACT.md`.
+Environment (Railway): `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` tenant root), `DAFTRA_API_KEY`; optional `OPENCLAW_WORKSPACE_DIR` (default `/data/workspace`), `DAFTRA_WRITES_ENABLED` (default off), `DAFTRA_APPROVAL_SECRET` (≥32 random chars; required for any financial operation; keep it out of the agent's exec environment where possible), `DAFTRA_MAX_WRITES_PER_HOUR` (default 20), `CHROMIUM_PATH`; broker mode: `DAFTRA_BROKER_SOCKET` (agent side), `DAFTRA_APPROVAL_SECRET_FILE` and `DAFTRA_WRITE_API_KEY_FILE` (broker side only). The operation ledger lives in `$OPENCLAW_WORKSPACE_DIR/daftra-ledger/` (ids, hashes and states only — no amounts or secrets; HMAC-chained, tampering stops all writes). Full contract: `docs/DAFTRA_INTEGRATION_CONTRACT.md`.

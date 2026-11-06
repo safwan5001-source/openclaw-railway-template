@@ -6,7 +6,7 @@
 //   DAFTRA_WRITE_API_KEY_FILE=/etc/basht/daftra-write.key  (or DAFTRA_WRITE_API_KEY)
 //   DAFTRA_BASE_URL, DAFTRA_WRITES_ENABLED=1, OPENCLAW_WORKSPACE_DIR=<broker-private state dir>
 // Wire protocol: newline-delimited JSON, ONE request -> ONE reply -> close. 256 KiB max, 30 s timeout.
-//   {cmd:'ping'} | {cmd:'propose',type,input,actor?} | {cmd:'show',id} | {cmd:'execute',id,phrase,actor?}
+//   {cmd:'ping'} | {cmd:'propose',type,input,actor?} | {cmd:'propose_duplicate',source,docId,overrides,actor?} | {cmd:'show',id} | {cmd:'execute',id,phrase,actor?}
 //   | {cmd:'resolve',id,created,recordId?,code,actor?}
 // Reply: {ok:true,result} or {ok:false,error,refused?}. Anything else (unknown command, unknown field, wrong type,
 // env/secret/path fields) is rejected. Approval phrases and codes are NEVER returned.
@@ -17,12 +17,14 @@ import { approvalSecret, readSecret } from './daftra-auth.mjs';
 import { createProposal } from './daftra-proposal.mjs';
 import { executeProposal, resolveProposal, WriteRefused } from './daftra-write.mjs';
 import { loadProposal } from './daftra-ledger.mjs';
+import { proposeDuplicate } from './daftra-duplicate.mjs';
 import { publicProposal } from './daftra-public.mjs';
 import { MAX_MESSAGE_BYTES } from './daftra-broker-client.mjs';
 
 const SCHEMAS = Object.freeze({
   ping: { required: [], optional: [] },
   propose: { required: ['type', 'input'], optional: ['actor'] },
+  propose_duplicate: { required: ['source', 'docId', 'overrides'], optional: ['actor'] },
   show: { required: ['id'], optional: [] },
   execute: { required: ['id', 'phrase'], optional: ['actor'] },
   resolve: { required: ['id', 'created', 'code'], optional: ['recordId', 'actor'] },
@@ -45,6 +47,10 @@ export function validateRequest(msg) {
   if (cmd === 'propose') {
     if (typeof msg.type !== 'string' || !/^[a-z_]{1,40}$/.test(msg.type)) throw new BadRequest('Invalid type');
     if (!msg.input || typeof msg.input !== 'object' || Array.isArray(msg.input)) throw new BadRequest('input must be an object');
+  } else if (cmd === 'propose_duplicate') {
+    if (typeof msg.source !== 'string' || !/^[a-z_]{1,40}$/.test(msg.source)) throw new BadRequest('Invalid source');
+    if (typeof msg.docId !== 'string' || !/^[1-9]\d{0,14}$/.test(msg.docId)) throw new BadRequest('Invalid docId');
+    if (!msg.overrides || typeof msg.overrides !== 'object' || Array.isArray(msg.overrides)) throw new BadRequest('overrides must be an object');
   } else if (cmd === 'show' || cmd === 'execute' || cmd === 'resolve') {
     if (typeof msg.id !== 'string' || !ID_LIKE.test(msg.id)) throw new BadRequest('Invalid id');
   }
@@ -80,6 +86,7 @@ export async function handle(msg, { env, fetcher }) {
   switch (msg.cmd) {
     case 'ping': return { broker: 'basht-daftra', writes_enabled: env.DAFTRA_WRITES_ENABLED === '1' };
     case 'propose': return publicProposal(await createProposal(msg.type, msg.input, { env, fetcher, actor: msg.actor ?? 'unknown' }));
+    case 'propose_duplicate': return publicProposal(await proposeDuplicate({ source: msg.source, id: msg.docId, overrides: msg.overrides }, { env, fetcher, actor: msg.actor ?? 'unknown' }));
     case 'show': return publicProposal(await loadProposal(msg.id, env));
     case 'execute': return executeProposal({ id: msg.id, phrase: msg.phrase, actor: msg.actor ?? 'unknown' }, { env, fetcher });
     case 'resolve': return resolveProposal({ id: msg.id, created: msg.created, recordId: msg.recordId, code: msg.code, actor: msg.actor ?? 'unknown' }, { env });
