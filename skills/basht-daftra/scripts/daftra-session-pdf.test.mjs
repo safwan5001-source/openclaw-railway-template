@@ -45,7 +45,8 @@ test('GET only, tenant host only, cookie sent, and NO api key / Authorization / 
 });
 
 test('a redirect to a login route ends the attempt WITHOUT requesting it and reports an expired session', async () => {
-  for (const loc of ['/users/login', '/login?next=/owner/invoices/view/97900', 'https://nepras.daftra.com/owner/login', '/sign-in']) {
+  // '/' and the absolute root are what the live tenant answers when no valid session is sent (observed on both PDF routes)
+  for (const loc of ['/', 'https://nepras.daftra.com/', '/users/login', '/login?next=/owner/invoices/view/97900', 'https://nepras.daftra.com/owner/login', '/sign-in']) {
     const s = scripted(redirect(loc), pdf());
     const r = await run('97900', s);
     assert.equal(r.kind, 'problem'); assert.equal(r.expired, true);

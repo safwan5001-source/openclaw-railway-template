@@ -57,7 +57,9 @@ export async function fetchSessionPdf(id, { cookieHeader, env = process.env, fet
       const diag = { http_status: response.status, content_type: 'none', redirects: hops + 1 };
       if (!next || next.protocol !== 'https:' || next.hostname.toLowerCase() !== host || next.port !== '' || next.username || next.password)
         return problem('Daftra redirected the PDF request to an unexpected destination [HTTP ' + response.status + ', ' + (hops + 1) + ' redirect(s)]', { ...diag, page: 'unknown' });
-      if (LOGIN_PATH_RE.test(next.pathname))                    // not requested: the session is simply not accepted
+      // Not requested: the session is simply not accepted. Observed on the live tenant: without a valid session BOTH PDF routes answer
+      // `302 Location: https://<tenant>.daftra.com/` (the site root, which serves a login form), so the root counts as a login redirect.
+      if (LOGIN_PATH_RE.test(next.pathname) || next.pathname === '/')
         return problem('Daftra session expired or rejected [HTTP ' + response.status + ', ' + (hops + 1) + ' redirect(s), page=login]: reconnect it in the operator console', { ...diag, page: 'login' }, { expired: true });
       if (!allowedRedirect.test(next.pathname))
         return problem('Daftra redirected the PDF request to an unexpected page [HTTP ' + response.status + ', ' + (hops + 1) + ' redirect(s)]', { ...diag, page: 'unknown' });

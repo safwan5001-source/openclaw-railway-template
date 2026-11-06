@@ -25,7 +25,7 @@ function sessionFake() {
     const cookie = options.headers?.Cookie ?? '';
     const m = /^\/owner\/invoices\/view\/(\d+)\.pdf$/.exec(url.pathname);
     if (m && cookie.includes('OISystem=' + fake.validCookie)) return new Response(PDF, { status: 200, headers: { 'content-type': 'application/pdf' } });
-    return new Response('', { status: 302, headers: { location: '/users/login' } });
+    return new Response('', { status: 302, headers: { location: 'https://nepras.daftra.com/' } });   // what the live tenant answers without a valid session
   };
   return fake;
 }
