@@ -625,6 +625,27 @@ test('ENROLLMENT: 404 unless OPERATOR_ENROLLMENT=1; requires the password; shows
   } finally { await c.stop(); }
 });
 
+test('SAFARI: Origin-less same-origin form POST requires Fetch Metadata, exact public Host and single-use HMAC token', async () => {
+  const c = await startService({ env: { OPERATOR_ENROLLMENT: '1', BROKER_PUBLIC_ORIGIN: 'https://' + PUBLIC_HOST } });
+  try {
+    const op = c.operator();
+    const getPre = async () => /name="pre" value="([^"]+)"/.exec((await op.request('GET', '/enroll', { host: PUBLIC_HOST })).text)[1];
+    const rejectedPre = await getPre();
+    const cross = await op.request('POST', '/enroll', { host: PUBLIC_HOST, origin: null,
+      headers: { 'Sec-Fetch-Site': 'cross-site' }, form: { pre: rejectedPre, password: OPERATOR_PASSWORD } });
+    assert.equal(cross.status, 403, 'cross-site request must not reach password check');
+    const wrongHostPre = await getPre();
+    const wrongHost = await op.request('POST', '/enroll', { host: 'evil.example', origin: null,
+      headers: { 'Sec-Fetch-Site': 'same-origin' }, form: { pre: wrongHostPre, password: OPERATOR_PASSWORD } });
+    assert.equal(wrongHost.status, 403, 'claimed same-origin with wrong Host must be rejected');
+    const goodPre = await getPre();
+    const good = await op.request('POST', '/enroll', { host: PUBLIC_HOST, origin: null,
+      headers: { 'Sec-Fetch-Site': 'same-origin' }, form: { pre: goodPre, password: OPERATOR_PASSWORD } });
+    assert.equal(good.status, 200, 'Safari same-origin form submission should succeed');
+    assert.match(good.text, /Setup key/);
+  } finally { await c.stop(); }
+});
+
 // ===== K. no secrets anywhere ===================================================================================================
 test('SECRETS never appear in any HTTP response, header, log line, ledger, proposal or audit record (full interaction sweep)', async () => {
   const c = await startService({ fake: new FakeDaftra({ post: () => ({ status: 422, json: { message: 'bad key ' + WRITE_KEY + ' and secret ' + OP_SECRET } }) }) });
