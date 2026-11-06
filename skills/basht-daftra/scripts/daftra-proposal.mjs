@@ -61,20 +61,24 @@ async function findDuplicates(type, preview, env, fetcher) {
 export const snap = (v) => (v === undefined ? '__absent__' : canonicalJson(v));
 const norm = (s) => String(s ?? '').trim().toLowerCase();
 
+// Complete, unfiltered read of a catalog/party collection for LOCAL duplicate comparison.
+// Daftra's server-side search filters (keywords, barcode, product_code, parent_id) are not reliable: `keywords` on
+// /products is rejected with "Invalid page", and a filter that is silently ignored would hide or fake matches.
+// So no filter is sent: fetchAllRecords() walks every page and throws unless the whole collection is PROVEN
+// complete (page order, stable page_count/total_results, next links, unique ids, rows == total_results) or the
+// collection exceeds maxPages/maxRecords. Any throw here makes the duplicate check FAIL CLOSED (blocking).
+export const DUPLICATE_SCAN_LIMITS = Object.freeze({ pageSize: 100, maxPages: 500, maxRecords: 20000 });
+export async function readCompleteCollection(entity, env, fetcher) {
+  const page = await fetchAllRecords(entity, { ...DUPLICATE_SCAN_LIMITS }, env, fetcher);
+  if (page.complete !== true || !Array.isArray(page.records)) throw new Error('Duplicate scan blocked: the ' + entity + ' list is not proven complete');
+  return page.records;
+}
+
 // Customer/supplier duplicate scan. Daftra enforces unique e-mail only; tax number, phone and name duplicates are NOT
-// prevented server-side, so compare locally over ALL records (falls back to a keyword search for very large books).
-async function findPartyDuplicates(resource, values, excludeId, env, fetcher, warnings) {
-  let rows; let scope = 'all';
-  try { rows = (await fetchAllRecords(resource, { pageSize: 200, maxRecords: 3000 }, env, fetcher)).records; }
-  catch (e) {
-    if (!/exceeds limit|more than/.test(e.message)) throw e;
-    scope = 'keyword';
-    const seen = new Map();
-    for (const v of [values.bn1, values.email, values.business_name].filter(Boolean))
-      for (const r of (await fetchAllRecords(resource, { query: { keywords: String(v).slice(0, 100) } }, env, fetcher)).records) seen.set(String(r.id), r);
-    rows = [...seen.values()];
-    warnings.push('The ' + resource + ' book is large: duplicates were searched by keyword only (tax number match depends on Daftra search); verify manually');
-  }
+// prevented server-side, so compare locally over ALL records. If the book cannot be read completely the scan throws
+// (blocking) instead of degrading to an unreliable keyword search.
+async function findPartyDuplicates(resource, values, excludeId, env, fetcher) {
+  const rows = await readCompleteCollection(resource, env, fetcher);
   const out = [];
   for (const r of rows) {
     if (excludeId !== undefined && String(r.id) === String(excludeId)) continue;
@@ -88,8 +92,20 @@ async function findPartyDuplicates(resource, values, excludeId, env, fetcher, wa
     if (values.business_name && r.business_name && normName(r.business_name) === normName(values.business_name)) reasons.push('same name');
     if (reasons.length) out.push({ entity: resource, id: String(r.id), reasons });
   }
-  void scope;
   return out;
+}
+
+// Local product duplicate matching over the COMPLETE list. Same normalisation as before (trim + lower-case):
+// a record only matches when it HAS the field and the normalised values are equal (a missing field never matches).
+// create: barcode, product_code and name; update: only the fields being changed, never the target itself.
+function findProductDuplicates(rows, body, excludeId, fields = ['barcode', 'product_code', 'name']) {
+  const hits = new Map();
+  for (const r of rows) {
+    if (excludeId !== undefined && String(r.id) === String(excludeId)) continue;
+    const reasons = fields.filter((f) => body[f] && r[f] && norm(r[f]) === norm(body[f]));
+    if (reasons.length) hits.set(String(r.id), { entity: 'products', id: String(r.id), reasons });
+  }
+  return [...hits.values()];
 }
 
 // Product / category checks (GET only). `snapshot` = the current values seen when the preview was built;
@@ -118,22 +134,15 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
   const q = (o) => ({ query: o });
   try {
     if (preview.party_values) {
-      duplicates = await findPartyDuplicates(spec.resource, preview.party_values, type.endsWith('_update') ? preview.target_id : undefined, env, fetcher, warnings);
+      duplicates = await findPartyDuplicates(spec.resource, preview.party_values, type.endsWith('_update') ? preview.target_id : undefined, env, fetcher);
       if (type.endsWith('_update')) counterparty = await exists(spec.resource, preview.target_id, env, fetcher, check, spec.resource === 'clients' ? 'client' : 'supplier');
     } else if (type === 'product_create') {
-      const hits = new Map();
-      if (body.barcode) for (const r of (await fetchAllRecords('products', q({ barcode: body.barcode }), env, fetcher)).records) if (!r.barcode || String(r.barcode) === String(body.barcode)) hits.set(String(r.id), r);
-      if (body.product_code) for (const r of (await fetchAllRecords('products', q({ product_code: body.product_code }), env, fetcher)).records) if (!r.product_code || norm(r.product_code) === norm(body.product_code)) hits.set(String(r.id), r);
-      for (const r of (await fetchAllRecords('products', q({ keywords: String(body.name).slice(0, 100) }), env, fetcher)).records) if (norm(r.name) === norm(body.name)) hits.set(String(r.id), r);
-      duplicates = [...hits.keys()].map((id) => ({ entity: 'products', id }));
+      duplicates = findProductDuplicates(await readCompleteCollection('products', env, fetcher), body);
     } else if (type === 'product_update') {
       counterparty = await exists('products', preview.target_id, env, fetcher, check, 'product');
-      for (const f of ['barcode', 'product_code']) if (body[f]) {
-        const rows = (await fetchAllRecords('products', q({ [f]: body[f] }), env, fetcher)).records;
-        for (const r of rows) if (String(r.id) !== String(preview.target_id) && (!r[f] || norm(r[f]) === norm(body[f]))) duplicates.push({ entity: 'products', id: String(r.id) });
-      }
+      duplicates = findProductDuplicates(await readCompleteCollection('products', env, fetcher), body, preview.target_id, ['barcode', 'product_code']);
     } else if (type === 'category_create') {
-      const rows = (await fetchAllRecords('product_categories', q(body.parent_id ? { parent_id: String(body.parent_id) } : {}), env, fetcher)).records;
+      const rows = await readCompleteCollection('product_categories', env, fetcher);
       duplicates = rows.filter((r) => norm(r.name) === norm(body.name) && String(r.parent_id ?? 0) === String(body.parent_id ?? 0)).map((r) => ({ entity: 'product_categories', id: String(r.id) }));
     } else if (type === 'category_update') {
       counterparty = await exists('product_categories', preview.target_id, env, fetcher, check, 'category');
