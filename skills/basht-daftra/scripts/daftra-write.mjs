@@ -46,7 +46,8 @@ const VERIFY = {
   expense: ['expenses', 'amount'], invoice_payment: ['invoice_payments', 'amount'], client_payment: ['client_payments', 'amount'],
 };
 const sameDecimal = (a, b) => parseDecimal(String(a), 'a', { maxDecimals: 6 }) === parseDecimal(String(b), 'b', { maxDecimals: 6 });
-const looseEqual = (a, b) => { try { return sameDecimal(a, b); } catch { return String(a ?? '').trim() === String(b ?? '').trim(); } };
+const flag = (v) => (v === true ? '1' : v === false ? '0' : v);
+const looseEqual = (a, b) => { a = flag(a); b = flag(b); try { return sameDecimal(a, b); } catch { return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase(); } };
 
 async function verifyCreated(proposal, recordId, env, fetcher) {
   try {
@@ -74,13 +75,14 @@ function previewFromRequest(proposal) {
   const spec = ACTION_TYPES[proposal.type];
   const str = (v) => (v === undefined || v === null ? undefined : String(v));
   if (spec.catalog) {
-    const body = b.Product ?? b.Category;
+    const body = b.Product ?? b.Category ?? b.Client ?? b.Supplier;
     const targetId = spec.pathFor ? proposal.request.path.match(/\/(\d+)\.json$/)[1] : undefined;
     if (targetId !== undefined && String(proposal.party?.target_id) !== targetId) throw new WriteRefused('TAMPERED', 'Target id does not match the approved party');
     return {
       type: proposal.type, target_id: targetId, request: proposal.request,
       tax_ids: [body.tax1, body.tax2].filter((x) => x !== undefined), supplier_id: str(body.supplier_id),
       categories_id: body.categories_id, parent_id: body.parent_id,
+      party_values: (b.Client || b.Supplier) ? { business_name: body.business_name, email: body.email, bn1: body.bn1, phone1: body.phone1, phone2: body.phone2 } : undefined,
     };
   }
   const head = b.Invoice ?? b.PurchaseOrder ?? b.Expense ?? b.InvoicePayment ?? b.ClientPayment;

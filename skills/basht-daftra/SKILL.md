@@ -45,7 +45,7 @@ Files are written only inside the private `$OPENCLAW_WORKSPACE_DIR/exports/` fol
 
 ## 3. Financial operations — approval protocol (MANDATORY)
 
-Supported: `sales_invoice`, `estimate`, `purchase_invoice`, `expense`, `invoice_payment`, `client_payment`, plus catalog operations `product_create`, `product_update`, `category_create`, `category_update` (section 4) and document duplication (section 5). **Not supported: edit/delete/cancel/refund of documents or payments, deleting any record, e-invoice submission, creating/modifying clients or suppliers, stock/inventory changes, product bundles, and any product import/export or bulk product operation (deferred by the owner).** Say so; do not improvise another route.
+Supported: `sales_invoice`, `estimate`, `purchase_invoice`, `expense`, `invoice_payment`, `client_payment`, plus catalog operations `product_create`, `product_update`, `category_create`, `category_update` (section 4), customer/supplier operations `client_create`, `client_update`, `supplier_create`, `supplier_update` (section 4b) and document duplication (section 5). **Not supported: edit/delete/cancel/refund of documents or payments, deleting any record, e-invoice submission, deleting/deactivating/suspending/bulk-changing customers or suppliers, customer/supplier portal passwords, notifications or opening balances, stock/inventory changes, product bundles, and any product import/export or bulk product operation (deferred by the owner).** Say so; do not improvise another route.
 
 1. `propose <type> --input '<json>' --actor <user>` (or `--input-file`). Read-only: it validates clients/suppliers/products, **tax ids against the tenant's tax table**, API-key permission, duplicates already in Daftra (all pages), overpayment, and computes exact totals. Every invoice line needs an explicit `tax1` (a tax id, or `0` for no tax) and every document an explicit `date`. Documents default to **draft**; add `"finalize": true` only if the user explicitly asks to post it. Payments cannot be drafts.
 2. Show the user the preview in their language: operation, party, date, lines, subtotal/tax/total, mode (draft/final), effects, warnings, duplicates. State clearly that **nothing has been sent**.
@@ -73,6 +73,19 @@ Writes use the same `propose` → human approval → `execute` protocol:
 - Writable product fields (documented): `name type(1 product|2 service) product_code barcode(≥5 chars, unique) description notes unit_price buy_price minimum_price profit_margin discount discount_type tax1 tax2 supplier_id categories_id tags status availabe_online duration_minutes`. Category fields: `name parent_id description display_order`.
 - **Refused on purpose:** stock fields (`track_stock`, `tracking_type`, `initial_stock_level`, `store_id`, `low_stock_thershold`), bundles (`type 3`, `ProductBundle`), `brand` and `category` by name (they auto-create records), unit, deleting, bulk operations. Never claim stock can be changed.
 - Checks run before any approval: tax ids exist and are active, supplier/category/parent exist, duplicate barcode/code/name, price 0 needs `allow_zero_price:true`.
+
+## 4b. Customers and suppliers
+
+Read/search (no approval): `list clients|suppliers --query keywords=<text>` (add `--all` for the complete book), `get clients <id>`, `get suppliers <id>`. Passwords and links are stripped from output.
+
+Writes use the same `propose` → human approval → `execute` protocol:
+- `propose client_create --input '{"business_name":"…","email":"…","phone1":"…","country_code":"SA","bn1":"<VAT number>","bn1_label":"VAT number","type":3}'`; `propose supplier_create` (needs `email` or `"is_offline":1`).
+- `propose client_update --input '{"client_id":4,"changes":{"email":"…"}}'` — only fields that really change are sent (documented partial update). `propose supplier_update --input '{"supplier_id":7,"changes":{…}}'` — Daftra does not document partial supplier updates, so the **full current record** is sent with the changes (to avoid blanking anything) and a read-back reports any carried field that changed. Say this to the user.
+- Fields: names, `email`, `phone1/2`, addresses (+ secondary), `country_code` (ISO alpha-2), `default_currency_code`, `language_code`, `notes`, `bn1/bn1_label/bn2/bn2_label` (tax/VAT number), and for customers also `type 2|3`, `national_id`, `category/category_id`, `group_price_id`, `credit_limit`, `credit_period`, `birth_date`, `gender`, `link`. Credit-terms, e-mail, tax-number, name and currency changes are shown as **KEY FIELD CHANGE**.
+- **Refused on purpose:** `password`/`confirm_password` (portal login), `send_notify` (e-mails the party), `starting_balance` (creates an accounting entry), `suspend`, attachments, custom/extended data, branch, numbering, deleting/deactivating, bulk operations. Empty values never clear a field (rejected).
+- **Duplicate guard** (Daftra enforces unique e-mail only): all records are compared by normalised tax number, e-mail, phone digits and name; a match blocks the proposal and names the reason. Only re-propose with `acknowledge_duplicates:["clients#12"]` if the user has seen that exact record and still wants a new one. A record edited in Daftra after the preview is blocked at approval time.
+- Free text is validated: control characters, newlines and bidi-override characters are rejected (they can disguise the approval preview).
+- Supplier statements are **not** implemented (the purchase-invoice list exposes no totals). For supplier balances use the **official** `report ledger --param journal_account_id=<id>` / `trial_balance`; never present anything computed locally as an official statement.
 
 ## 5. Duplicating a document
 

@@ -32,6 +32,8 @@ export function formatMeta(meta) {
     if (d?.not_copied?.length) out.push('  NOT copied: ' + d.not_copied.join(', '));
   }
   for (const c of meta.changes ?? []) out.push('  change ' + c.field + ': ' + money(typeof c.from === 'object' ? JSON.stringify(c.from) : c.from) + '  =>  ' + (typeof c.to === 'object' ? JSON.stringify(c.to) : money(c.to)));
+  for (const h of meta.highlights ?? []) out.push('  *** KEY FIELD CHANGE ' + h.field + ': ' + money(h.from) + ' => ' + money(h.to) + ' ***');
+  if (meta.carried_fields?.length) out.push('  (full record is sent; unchanged fields carried over: ' + meta.carried_fields.join(', ') + ')');
   for (const c of meta.price_changes ?? []) out.push('  *** PRICE CHANGE ' + c.field + ': ' + money(c.from) + ' => ' + c.to + (c.change_percent === null ? '' : ' (' + (c.change_percent > 0 ? '+' : '') + c.change_percent + '%)') + ' ***');
   return out;
 }

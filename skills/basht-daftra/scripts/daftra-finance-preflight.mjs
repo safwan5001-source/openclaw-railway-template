@@ -10,6 +10,7 @@
 import { parseDecimal, roundTo, mul, div, format, ONE, ZERO } from './daftra-money.mjs';
 import { isCalendarDate } from './daftra-entities.mjs';
 import { CATALOG_TYPES, prepareCatalogAction } from './daftra-catalog.mjs';
+import { PARTY_TYPES, prepareCrmAction, CLIENT_FIELDS, SUPPLIER_FIELDS } from './daftra-parties.mjs';
 
 const FINANCE_TYPES = {
   sales_invoice:     { resource: 'invoices',          endpoint: '/api2/invoices.json',          draftable: true,  verb: 'create sales invoice' },
@@ -20,7 +21,7 @@ const FINANCE_TYPES = {
   client_payment:    { resource: 'client_payments',   endpoint: '/api2/client_payments.json',   draftable: false, verb: 'record client payment' },
 };
 for (const spec of Object.values(FINANCE_TYPES)) spec.method = 'POST';
-export const ACTION_TYPES = Object.freeze({ ...FINANCE_TYPES, ...Object.fromEntries(Object.entries(CATALOG_TYPES).map(([k, v]) => [k, { ...v, draftable: false, catalog: true }])) });
+export const ACTION_TYPES = Object.freeze({ ...FINANCE_TYPES, ...Object.fromEntries(Object.entries({ ...CATALOG_TYPES, ...PARTY_TYPES }).map(([k, v]) => [k, { ...v, draftable: false, catalog: true }])) });
 // Backwards-compatible alias used by earlier tests/docs.
 const TYPES = ACTION_TYPES;
 
@@ -122,6 +123,7 @@ import { hashRequest as _hashRequest } from './daftra-canonical.mjs';
 // send it (documented `unique_id`); invoices must NOT, because Daftra then recalculates offers/discounts.
 export function prepareFinancialAction(type, input, options = {}) {
   if (Object.hasOwn(CATALOG_TYPES, type)) return prepareCatalogAction(type, input, options);
+  if (Object.hasOwn(PARTY_TYPES, type)) return prepareCrmAction(type, input, options);
   if (!Object.hasOwn(TYPES, type)) throw Error('Unsupported financial action');
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('Invalid input');
   const spec = TYPES[type];
@@ -237,6 +239,10 @@ export const BODY_SHAPES = Object.freeze({
   product_create:   { Product: PRODUCT_KEYS },
   product_update:   { Product: PRODUCT_KEYS },
   category_create:  { Category: ['name', 'category_type', 'parent_id', 'description', 'display_order'] },
+  client_create:    { Client: CLIENT_FIELDS },
+  client_update:    { Client: CLIENT_FIELDS },
+  supplier_create:  { Supplier: SUPPLIER_FIELDS },
+  supplier_update:  { Supplier: SUPPLIER_FIELDS },
   category_update:  { Category: ['name', 'parent_id', 'description', 'display_order'] },
   client_payment:   { ClientPayment: ['client_id', 'amount', 'payment_method', 'date', 'transaction_id', 'treasury_id', 'notes'] },
 });

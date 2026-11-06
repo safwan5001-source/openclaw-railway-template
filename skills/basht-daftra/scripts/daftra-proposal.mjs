@@ -4,6 +4,7 @@
 import { ACTION_TYPES, prepareFinancialAction, hashRequest } from './daftra-finance-preflight.mjs';
 import { DaftraError, getOne, listPage, listRecords, fetchAllRecords } from './daftra-readonly.mjs';
 import { approvalSecret } from './daftra-auth.mjs';
+import { normName, normEmail, digitsOnly, normTax } from './daftra-parties.mjs';
 import { newProposalId, saveProposal, readLedger, isBlockedByLedger } from './daftra-ledger.mjs';
 import { parseDecimal, format } from './daftra-money.mjs';
 
@@ -58,6 +59,37 @@ async function findDuplicates(type, preview, env, fetcher) {
 const norm = (s) => String(s ?? '').trim().toLowerCase();
 const sameValue = (a, b) => { const x = num(a); const y = num(b); return x !== null && y !== null ? x === y : String(a ?? '') === String(b ?? ''); };
 
+// Customer/supplier duplicate scan. Daftra enforces unique e-mail only; tax number, phone and name duplicates are NOT
+// prevented server-side, so compare locally over ALL records (falls back to a keyword search for very large books).
+async function findPartyDuplicates(resource, values, excludeId, env, fetcher, warnings) {
+  let rows; let scope = 'all';
+  try { rows = (await fetchAllRecords(resource, { pageSize: 200, maxRecords: 3000 }, env, fetcher)).records; }
+  catch (e) {
+    if (!/exceeds limit|more than/.test(e.message)) throw e;
+    scope = 'keyword';
+    const seen = new Map();
+    for (const v of [values.bn1, values.email, values.business_name].filter(Boolean))
+      for (const r of (await fetchAllRecords(resource, { query: { keywords: String(v).slice(0, 100) } }, env, fetcher)).records) seen.set(String(r.id), r);
+    rows = [...seen.values()];
+    warnings.push('The ' + resource + ' book is large: duplicates were searched by keyword only (tax number match depends on Daftra search); verify manually');
+  }
+  const out = [];
+  for (const r of rows) {
+    if (excludeId !== undefined && String(r.id) === String(excludeId)) continue;
+    const reasons = [];
+    if (values.bn1 && r.bn1 && normTax(r.bn1) === normTax(values.bn1)) reasons.push('same tax number');
+    if (values.email && r.email && normEmail(r.email) === normEmail(values.email)) reasons.push('same email');
+    for (const f of ['phone1', 'phone2']) for (const g of ['phone1', 'phone2']) {
+      const a = digitsOnly(values[f]); const b = digitsOnly(r[g]);
+      if (a.length >= 7 && a === b && !reasons.includes('same phone')) reasons.push('same phone');
+    }
+    if (values.business_name && r.business_name && normName(r.business_name) === normName(values.business_name)) reasons.push('same name');
+    if (reasons.length) out.push({ entity: resource, id: String(r.id), reasons });
+  }
+  void scope;
+  return out;
+}
+
 // Product / category checks (GET only). `snapshot` = the current values seen when the preview was built;
 // if the live record differs at approval time the change is blocked (someone edited it meanwhile).
 async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, snapshot) {
@@ -83,7 +115,10 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
   if (preview.parent_id) await exists('product_categories', preview.parent_id, env, fetcher, check, 'parent category');
   const q = (o) => ({ query: o });
   try {
-    if (type === 'product_create') {
+    if (preview.party_values) {
+      duplicates = await findPartyDuplicates(spec.resource, preview.party_values, type.endsWith('_update') ? preview.target_id : undefined, env, fetcher, warnings);
+      if (type.endsWith('_update')) counterparty = await exists(spec.resource, preview.target_id, env, fetcher, check, spec.resource === 'clients' ? 'client' : 'supplier');
+    } else if (type === 'product_create') {
       const hits = new Map();
       if (body.barcode) for (const r of (await fetchAllRecords('products', q({ barcode: body.barcode }), env, fetcher)).records) if (!r.barcode || String(r.barcode) === String(body.barcode)) hits.set(String(r.id), r);
       if (body.product_code) for (const r of (await fetchAllRecords('products', q({ product_code: body.product_code }), env, fetcher)).records) if (!r.product_code || norm(r.product_code) === norm(body.product_code)) hits.set(String(r.id), r);
@@ -103,7 +138,7 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
     }
     const open = duplicates.filter((d) => !acknowledged.has(d.entity + '#' + d.id));
     check(open.length === 0, 'no_remote_duplicate', open.length
-      ? 'Possible duplicates already in Daftra: ' + open.map((d) => d.entity + '#' + d.id).join(', ') + ' (re-propose with acknowledge_duplicates to override)'
+      ? 'Possible duplicates already in Daftra: ' + open.map((d) => d.entity + '#' + d.id + (d.reasons ? ' (' + d.reasons.join(', ') + ')' : '')).join(', ') + ' (re-propose with acknowledge_duplicates to override)'
       : (duplicates.length ? 'Possible duplicates acknowledged by the requester' : 'No duplicate found'), true);
   } catch (e) { check(false, 'no_remote_duplicate', 'Duplicate scan failed (' + e.message + ')', true); }
   if (snapshot && counterparty) {
@@ -165,12 +200,15 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     } catch (e) { preBlocking.push('Tax table unavailable: ' + e.message); }
   }
   let current; let snapshot = null;
-  if (type === 'product_update' || type === 'category_update') {
-    const entity = ACTION_TYPES[type].resource; const key = type === 'product_update' ? input.product_id : input.category_id;
+  if (type.endsWith('_update') && ACTION_TYPES[type].catalog) {
+    const entity = ACTION_TYPES[type].resource; const key = input.product_id ?? input.category_id ?? input.client_id ?? input.supplier_id;
     try { current = await getOne(entity, key, env, fetcher); } catch (e) { preBlocking.push('Target record not accessible (' + e.message + ')'); }
   }
   let preview = prepareFinancialAction(type, input, { taxes, requireDate: true, current });
-  if (current && preview.changes) snapshot = Object.fromEntries(preview.changes.filter((c) => typeof c.from !== 'object' && !String(c.from).startsWith('(')).map((c) => [c.field, c.from]));
+  if (current && preview.changes) {
+    snapshot = Object.fromEntries(preview.changes.filter((c) => typeof c.from !== 'object' && !String(c.from).startsWith('(')).map((c) => [c.field, c.from]));
+    for (const f of preview.carried_fields ?? []) if (current[f] !== undefined) snapshot[f] = current[f];   // supplier: every carried field must also be unchanged
+  }
   if (type === 'expense') {
     // Expenses support a real server-side idempotency key; derive it from the request itself.
     preview = prepareFinancialAction(type, input, { taxes, requireDate: true, idempotencyKey: 'basht-' + preview.request_hash.slice(0, 40) });
@@ -202,7 +240,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     warnings: [...preview.warnings, ...extraWarnings, ...collected.warnings],
     duplicates: collected.duplicates,
     acknowledged_duplicates: [...acknowledged],
-    meta: { ...(meta ?? {}), ...(snapshot ? { snapshot } : {}), ...(preview.changes ? { changes: preview.changes, price_changes: preview.price_changes } : {}) },
+    meta: { ...(meta ?? {}), ...(snapshot ? { snapshot } : {}), ...(preview.changes ? { changes: preview.changes, price_changes: preview.price_changes, highlights: preview.highlights, carried_fields: preview.carried_fields } : {}) },
   };
   if (hashRequest(proposal.request) !== proposal.request_hash) throw Error('Internal hash mismatch');
   await saveProposal(proposal, env);

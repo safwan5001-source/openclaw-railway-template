@@ -268,8 +268,8 @@ test('rate limit stops runaway writes', async () => {
   } finally { await done(); }
 });
 
-test('route allowlist: POST create endpoints + PUT for products/categories only; PATCH/DELETE and foreign paths are impossible', () => {
-  assert.deepEqual(Object.entries(WRITE_ROUTES).filter(([, r]) => r.method !== 'POST').map(([k]) => k).sort(), ['category_update', 'product_update']);
+test('route allowlist: POST create endpoints + PUT for products/categories/clients/suppliers only; PATCH/DELETE and foreign paths are impossible', () => {
+  assert.deepEqual(Object.entries(WRITE_ROUTES).filter(([, r]) => r.method !== 'POST').map(([k]) => k).sort(), ['category_update', 'client_update', 'product_update', 'supplier_update']);
   assert.ok(Object.values(WRITE_ROUTES).every((r) => ['POST', 'PUT'].includes(r.method)));
   const inv = { Invoice: { client_id: 4, draft: 1, date: '2025-03-01' }, InvoiceItem: [{ item: 'x', quantity: '1', unit_price: '1', tax1: 0, tax2: 0 }] };
   const ok = { method: 'POST', path: '/api2/invoices.json', query: '', body: inv };

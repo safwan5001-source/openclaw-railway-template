@@ -92,3 +92,25 @@ test('CLI duplicate refuses to run locally in broker mode, and a hostile source/
     assert.equal(c.fake.posts.length, 0);
   } finally { await c.done(); }
 });
+
+test('customer creation and supplier update through the broker: agent has no secret, operator phrase required, one write with the WRITE key', async () => {
+  const c = await setup();
+  c.fake.records.suppliers = { 7: { id: 7, business_name: 'Fuel', email: 's@f.com', city: 'Jeddah' } };
+  c.fake.created.clients = { 512: { id: 512, business_name: 'Gulf Fuel Co', email: 'a@g.com' } };
+  try {
+    c.fake.post = () => ({ status: 202, json: { result: 'successful', code: 202, id: 512, client_number: '0000715' } });
+    const p = await run(['propose', 'client_create', '--input', JSON.stringify({ business_name: 'Gulf Fuel Co', email: 'a@g.com' })], { env: c.clientEnv });
+    assert.equal(p.status, 'READY_FOR_APPROVAL');
+    await assert.rejects(run(['execute', p.proposal_id, '--phrase', 'APPROVE ' + p.proposal_id + ' ' + p.request_hash.slice(0, 8) + ' FINAL'], { env: c.clientEnv }), (e) => e.code === 'PHRASE_MISMATCH');
+    assert.equal(c.fake.posts.length, 0);
+    const r = await run(['execute', p.proposal_id, '--phrase', await phraseFrom(p.proposal_id, c.brokerEnv)], { env: c.clientEnv });
+    assert.equal(r.status, 'submitted');
+    assert.equal(c.fake.posts.length, 1);
+    assert.equal(c.fake.posts[0].path, '/api2/clients.json');
+    assert.equal(c.fake.posts[0].headers.APIKEY, WRITE);
+    const s = await run(['propose', 'supplier_update', '--input', JSON.stringify({ supplier_id: 7, changes: { city: 'Dammam' } })], { env: c.clientEnv });
+    assert.equal(s.status, 'READY_FOR_APPROVAL');
+    assert.ok(s.review.some((l) => /full record is sent/.test(l)));
+    assert.equal(JSON.stringify(s).includes('password'), false);
+  } finally { await c.done(); }
+});

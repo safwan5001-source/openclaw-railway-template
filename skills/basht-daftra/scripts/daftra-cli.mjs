@@ -100,7 +100,7 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
         env_warnings: env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
         duplicate_sources: Object.keys(DUP_SOURCES),
-        not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'create/modify clients or suppliers', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],
+        not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'delete/deactivate/suspend or bulk operations on customers and suppliers', 'customer/supplier portal passwords, notifications, opening balances, custom fields', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],
       };
     case 'list': {
       if (!a1) throw Error('Usage: list <entity> [--query k=v]... [--all] [--columns a,b]');
