@@ -141,6 +141,9 @@ export function prepareFinancialAction(type, input, options = {}) {
     const built = buildItems(input.items, 'docs', index, warnings);
     common.items = built.items; totals = built.totals;
     const invoice = { client_id: Number(common.client_id), draft: isDraft ? 1 : 0 };
+    // Sales-invoice drafts are created offline (documented `Invoice.is_offline: 1`) so Daftra sends no email.
+    // Final invoices and estimates keep their existing body.
+    if (type === 'sales_invoice' && isDraft) invoice.is_offline = 1;
     if (common.date) invoice.date = common.date;
     const notes = text(input.notes, 'notes', 2000); if (notes) invoice.notes = notes;
     const currency = text(input.currency_code, 'currency_code', 10); if (currency) invoice.currency_code = currency.toUpperCase();
@@ -231,7 +234,7 @@ import { PRODUCT_FIELDS } from './daftra-catalog.mjs';
 const PRODUCT_KEYS = PRODUCT_FIELDS;
 const LINE_KEYS = ['item', 'quantity', 'unit_price', 'tax1', 'tax2', 'discount', 'discount_type', 'product_id', 'description'];
 export const BODY_SHAPES = Object.freeze({
-  sales_invoice:    { Invoice: ['client_id', 'draft', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
+  sales_invoice:    { Invoice: ['client_id', 'draft', 'is_offline', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
   estimate:         { Invoice: ['client_id', 'draft', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
   purchase_invoice: { PurchaseOrder: ['supplier_id', 'date', 'currency_code'], PurchaseOrderItem: LINE_KEYS },
   expense:          { Expense: ['amount', 'date', 'note', 'expense_category_id', 'supplier_id', 'treasury_id', 'vendor', 'unique_id', 'status'] },
@@ -258,5 +261,11 @@ export function assertBodyShape(type, body) {
     const rows = Array.isArray(value) ? value : [value];
     if (!rows.length || rows.some((r) => !r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).some((k) => !keys.includes(k))))
       throw Error('Request body has unexpected fields in ' + section);
+  }
+  if (type === 'sales_invoice') {
+    // `is_offline` is only ever the integer 1, only on a draft (draft === 1); a final invoice must not carry it.
+    const inv = body.Invoice;
+    if (inv.draft !== 0 && inv.draft !== 1) throw Error('Invoice.draft must be 0 or 1');
+    if (Object.hasOwn(inv, 'is_offline') && (inv.is_offline !== 1 || inv.draft !== 1)) throw Error('Invoice.is_offline must be 1 and only on a draft');
   }
 }

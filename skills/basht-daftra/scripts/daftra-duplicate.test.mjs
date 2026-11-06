@@ -53,7 +53,7 @@ test('duplicating an invoice copies business data, never identity/payments/ZATCA
     assert.equal(p.mode, 'draft');
     assert.equal(c.fake.posts.length, 0);                                   // preview only
     const body = p.request.body;
-    assert.deepEqual(body.Invoice, { client_id: 4, draft: 1, date: '2025-03-01', notes: 'ملاحظات', currency_code: 'SAR' });
+    assert.deepEqual(body.Invoice, { client_id: 4, draft: 1, is_offline: 1, date: '2025-03-01', notes: 'ملاحظات', currency_code: 'SAR' });
     assert.deepEqual(body.InvoiceItem[0], { item: 'Diesel', description: 'bulk', quantity: '100', unit_price: '2.5', tax1: 1, tax2: 0, discount: 10, discount_type: 1, product_id: 9 });
     const wire = JSON.stringify(body);
     for (const leaked of ['INV-000123', '"id"', 'payment', 'S3CRET', 'hash=', 'REPORTED', 'summary_', '2025-01-10', 'store_id', 'col_3'])

@@ -68,7 +68,7 @@ test('the copy keeps lines, quantity, price, tax and total, and carries NO ident
     assert.equal(p.status, 'READY_FOR_APPROVAL');
     assert.equal(p.totals.total, '18100.00');
     assert.deepEqual(p.request.body.InvoiceItem, [{ item: 'Diesel', quantity: '10000', unit_price: '1.81', tax1: 1, tax2: 0, product_id: 4 }]);
-    assert.deepEqual(p.request.body.Invoice, { client_id: 48, draft: 1, date: '2026-05-20', currency_code: 'SAR' });
+    assert.deepEqual(p.request.body.Invoice, { client_id: 48, draft: 1, is_offline: 1, date: '2026-05-20', currency_code: 'SAR' });
     const wire = JSON.stringify(p.request);
     for (const leaked of ['97407', '007472', 'payment', 'S3CRET', 'hash=zzz', 'REPORTED', 'summary_', 'einvoice', '2026-05-01', 'store_id'])
       assert.equal(wire.includes(leaked), false, leaked);
