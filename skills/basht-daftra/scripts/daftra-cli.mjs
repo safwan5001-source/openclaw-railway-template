@@ -28,6 +28,7 @@ import { publicProposal } from './daftra-public.mjs';
 import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
 import { callBrokerService, createBrokerFetcher, downloadInvoicePdfViaBroker } from './daftra-broker-service-client.mjs';
 import { renderCliResult, formatFailure, LANGS, VIEWS } from './daftra-format.mjs';
+import { renderWhatsAppCliResult, formatWhatsAppFailure } from './daftra-format-whatsapp.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -121,16 +122,21 @@ const DAFTRA_CREDENTIAL_ENV = ['DAFTRA_API_KEY', 'DAFTRA_API_KEY_FILE', 'DAFTRA_
 const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
   'OPERATOR_PASSWORD', 'OPERATOR_TOTP_SEED', 'BROKER_AGENT_TOKEN', 'BROKER_AGENT_TOKEN_PREVIOUS', 'BROKER_STATE_DIR', 'RAILWAY_API_TOKEN', 'RAILWAY_TOKEN'];
 
-// `--render ar|en [--view summary|detail]` turns a read result into chat-ready Markdown (daftra-format.mjs). Presentation only: the
-// data is fetched exactly as without the flag, and no write/approval command accepts it.
+// `--render ar|en [--view summary|detail]` turns a read result into chat-ready Markdown (daftra-format.mjs).
+// `--render whatsapp [--lang ar|en] [--view summary|detail]` does the same for a WhatsApp reply (daftra-format-whatsapp.mjs: *bold*, no tables,
+// last 5 records). Presentation only: the data is fetched exactly as without the flag, nothing is ever sent from here, and no
+// write/approval command accepts it.
 const RENDERABLE = new Set(['list', 'get', 'report', 'statement']);
 export function renderOptions(argv) {
   const { positional, flags } = parseArgs(argv);
-  if (flags.render === undefined && flags.view === undefined) return null;
-  if (!LANGS.includes(flags.render)) throw Error('--render must be one of: ' + LANGS.join(', '));
+  if (flags.render === undefined && flags.view === undefined && flags.lang === undefined) return null;
+  const whatsapp = flags.render === 'whatsapp';
+  if (!whatsapp && !LANGS.includes(flags.render)) throw Error('--render must be one of: ' + [...LANGS, 'whatsapp'].join(', '));
+  if (flags.lang !== undefined && !whatsapp) throw Error('--lang is only valid with --render whatsapp (use --render ar|en otherwise)');
+  if (whatsapp && flags.lang !== undefined && !LANGS.includes(flags.lang)) throw Error('--lang must be one of: ' + LANGS.join(', '));
   if (flags.view !== undefined && !VIEWS.includes(flags.view)) throw Error('--view must be one of: ' + VIEWS.join(', '));
   if (!RENDERABLE.has(positional[0])) throw Error('--render supports only: ' + [...RENDERABLE].join(', '));
-  return { lang: flags.render, view: flags.view ?? 'summary' };
+  return whatsapp ? { channel: 'whatsapp', lang: flags.lang ?? 'ar', view: flags.view ?? 'summary' } : { lang: flags.render, view: flags.view ?? 'summary' };
 }
 
 export async function run(argv, options = {}) {
@@ -138,7 +144,7 @@ export async function run(argv, options = {}) {
   const result = await runCommand(argv, options);
   if (!render) return result;
   const { positional } = parseArgs(argv);
-  return renderCliResult(positional[0], positional[1], result, render);
+  return (render.channel === 'whatsapp' ? renderWhatsAppCliResult : renderCliResult)(positional[0], positional[1], result, render);
 }
 
 async function runCommand(argv, { env = process.env, fetcher = fetch, sleep, brokerFetcher = fetch } = {}) {
@@ -290,7 +296,7 @@ if (process.argv[1] && import.meta.url === new URL('file://' + resolve(process.a
       if (error.validationErrors) body.validation_errors = error.validationErrors;
     }
     // With --render the failure also carries a ready-to-relay message saying what happened (never raw JSON for the user).
-    try { const r = renderOptions(process.argv.slice(2)); if (r) body.markdown = formatFailure(body, { lang: r.lang }); } catch { /* bad --render flags: plain error */ }
+    try { const r = renderOptions(process.argv.slice(2)); if (r) body.markdown = (r.channel === 'whatsapp' ? formatWhatsAppFailure : formatFailure)(body, { lang: r.lang }); if (r?.channel === 'whatsapp') body.preview = formatWhatsAppFailure(body, { lang: r.lang, wire: 'native' }); } catch { /* bad --render flags: plain error */ }
     console.error(JSON.stringify(body));
     process.exitCode = 1;
   }
