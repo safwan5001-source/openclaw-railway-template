@@ -247,6 +247,15 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
   if (!isCalendarDate(from) || !isCalendarDate(to) || from > to) throw Error('from/to must be valid YYYY-MM-DD dates with from <= to');
   const opts = { sleep: options.sleep ?? sleepless };
   const invoicesPage = await fetchAllRecords('invoices', { ...opts, query: { client_id: String(clientId), date_from: from, date_to: to } }, env, fetcher);
+  // Daftra may silently ignore client/date filters. Never compute a client report from out-of-scope or
+  // unidentifiable list rows. Reject the entire result instead of dropping rows and claiming completeness.
+  for (const inv of invoicesPage.records) {
+    const id = idOf(inv.id);
+    const party = idOf(inv.client_id);
+    const date = str(inv.date)?.slice(0, 10);
+    if (!id || party !== String(clientId) || !date || !isCalendarDate(date) || date < from || date > to)
+      throw Error('Invoice list scope mismatch: unexpected/missing invoice id, client_id or date (invoice ' + String(inv.id ?? 'unknown') + '); Daftra may have ignored its filters; reconciliation blocked');
+  }
   if (invoicesPage.records.length > MAX_INVOICES) throw Error('Too many invoices (' + invoicesPage.records.length + ' > ' + MAX_INVOICES + '); narrow the period');
   // No status filter and no date filter on the payments list: cancelled/failed payments and payments dated after the period must stay visible.
   const paymentsPage = await fetchAllRecords('invoice_payments', { ...opts, query: { client_id: String(clientId) } }, env, fetcher);
@@ -261,6 +270,8 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
         const payload = await getRecord('invoices', id, env, fetcher);
         const header = payload?.data?.Invoice;
         if (!header || typeof header !== 'object' || String(header.id) !== id) throw Error('detail has no Invoice with id ' + id);
+        if (idOf(header.client_id) !== String(clientId) || str(header.date)?.slice(0, 10) !== str(inv.date)?.slice(0, 10))
+          throw Error('detail scope mismatch for invoice ' + id + ': client/date differs from the list');
         details.set(id, { payload, header });
       } catch (e) { details.set(id, { error: String(e.message).slice(0, 120) }); }
     }));
