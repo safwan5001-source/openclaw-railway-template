@@ -170,7 +170,7 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
         const rows = r.records.map(redactRecord);
         return { ok: true, entity: a1, complete: true, count: r.count, total: r.total, pages: r.pages, records: columns ? pickColumns(rows, columns) : rows };
       }
-      const page = await listPage(a1, { limit: 20, ...query }, env, fetcher, { sleep });
+      const page = await listPage(a1, ENTITIES[a1]?.unpaginated ? { ...query } : { limit: 20, ...query }, env, fetcher, { sleep });
       const rows = page.records.map(redactRecord);
       return { ok: true, entity: a1, complete: page.complete, count: page.count, total: page.total, warning: page.warning, records: columns ? pickColumns(rows, columns) : rows };
     }
