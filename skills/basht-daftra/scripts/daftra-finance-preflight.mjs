@@ -7,18 +7,20 @@
 //   POST /api2/expenses.json          { Expense:{amount,date,unique_id,status} }                        (?send=draft)
 //   POST /api2/invoice_payments.json  { InvoicePayment:{invoice_id,amount,payment_method,date} }
 //   POST /api2/client_payments.json   { ClientPayment:{client_id,amount,payment_method,date} }
-import { createHash } from 'node:crypto';
 import { parseDecimal, roundTo, mul, div, format, ONE, ZERO } from './daftra-money.mjs';
 import { isCalendarDate } from './daftra-entities.mjs';
+import { CATALOG_TYPES, prepareCatalogAction } from './daftra-catalog.mjs';
 
-export const ACTION_TYPES = Object.freeze({
+const FINANCE_TYPES = {
   sales_invoice:     { resource: 'invoices',          endpoint: '/api2/invoices.json',          draftable: true,  verb: 'create sales invoice' },
   estimate:          { resource: 'estimates',         endpoint: '/api2/estimates.json',         draftable: true,  verb: 'create estimate' },
   purchase_invoice:  { resource: 'purchase_invoices', endpoint: '/api2/purchase_invoices.json', draftable: true,  verb: 'create purchase invoice' },
   expense:           { resource: 'expenses',          endpoint: '/api2/expenses.json',          draftable: true,  verb: 'create expense' },
   invoice_payment:   { resource: 'invoice_payments',  endpoint: '/api2/invoice_payments.json',  draftable: false, verb: 'record invoice payment' },
   client_payment:    { resource: 'client_payments',   endpoint: '/api2/client_payments.json',   draftable: false, verb: 'record client payment' },
-});
+};
+for (const spec of Object.values(FINANCE_TYPES)) spec.method = 'POST';
+export const ACTION_TYPES = Object.freeze({ ...FINANCE_TYPES, ...Object.fromEntries(Object.entries(CATALOG_TYPES).map(([k, v]) => [k, { ...v, draftable: false, catalog: true }])) });
 // Backwards-compatible alias used by earlier tests/docs.
 const TYPES = ACTION_TYPES;
 
@@ -110,21 +112,14 @@ function buildItems(rawItems, kind, index, warnings) {
   return { items, totals: { subtotal: format(subtotal), tax1: format(tax1Total), tax2: format(tax2Total), total: format(total), estimated: true } };
 }
 
-// ---- canonical JSON + hash -----------------------------------------------------------------
-export function canonicalJson(value) {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
-  return '{' + Object.keys(value).filter((k) => value[k] !== undefined).sort()
-    .map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
-}
-export function hashRequest(request) {
-  return createHash('sha256').update(canonicalJson(request)).digest('hex');
-}
+export { canonicalJson, hashRequest } from './daftra-canonical.mjs';
+import { hashRequest as _hashRequest } from './daftra-canonical.mjs';
 
 // ---- main ----------------------------------------------------------------------------------
 // options.taxes: tenant tax table (enables tax verification). options.idempotencyKey: only expenses
 // send it (documented `unique_id`); invoices must NOT, because Daftra then recalculates offers/discounts.
 export function prepareFinancialAction(type, input, options = {}) {
+  if (Object.hasOwn(CATALOG_TYPES, type)) return prepareCatalogAction(type, input, options);
   if (!Object.hasOwn(TYPES, type)) throw Error('Unsupported financial action');
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('Invalid input');
   const spec = TYPES[type];
@@ -216,7 +211,7 @@ export function prepareFinancialAction(type, input, options = {}) {
     ...common,
     totals,
     request,
-    request_hash: hashRequest(request),
+    request_hash: _hashRequest(request),
     mode: isDraft ? 'draft' : 'final',
     effects,
     reversible: isDraft ? 'draft can be deleted in Daftra' : 'no: posted/recorded entries need a reversing document in Daftra',
@@ -228,6 +223,8 @@ export function prepareFinancialAction(type, input, options = {}) {
 }
 
 // ---- strict body shape (defence in depth: execute rebuilds nothing, it only sends what fits this) ------
+import { PRODUCT_FIELDS } from './daftra-catalog.mjs';
+const PRODUCT_KEYS = PRODUCT_FIELDS;
 const LINE_KEYS = ['item', 'quantity', 'unit_price', 'tax1', 'tax2', 'discount', 'discount_type', 'product_id', 'description'];
 export const BODY_SHAPES = Object.freeze({
   sales_invoice:    { Invoice: ['client_id', 'draft', 'date', 'notes', 'currency_code'], InvoiceItem: LINE_KEYS },
@@ -235,6 +232,10 @@ export const BODY_SHAPES = Object.freeze({
   purchase_invoice: { PurchaseOrder: ['supplier_id', 'date', 'currency_code'], PurchaseOrderItem: LINE_KEYS },
   expense:          { Expense: ['amount', 'date', 'note', 'expense_category_id', 'supplier_id', 'treasury_id', 'vendor', 'unique_id', 'status'] },
   invoice_payment:  { InvoicePayment: ['invoice_id', 'amount', 'payment_method', 'date', 'transaction_id', 'treasury_id'] },
+  product_create:   { Product: PRODUCT_KEYS },
+  product_update:   { Product: PRODUCT_KEYS },
+  category_create:  { Category: ['name', 'category_type', 'parent_id', 'description', 'display_order'] },
+  category_update:  { Category: ['name', 'parent_id', 'description', 'display_order'] },
   client_payment:   { ClientPayment: ['client_id', 'amount', 'payment_method', 'date', 'transaction_id', 'treasury_id', 'notes'] },
 });
 export function assertBodyShape(type, body) {

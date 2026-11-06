@@ -19,6 +19,8 @@ import { ACTION_TYPES } from './daftra-finance-preflight.mjs';
 import { createProposal } from './daftra-proposal.mjs';
 import { executeProposal, resolveProposal, WriteRefused } from './daftra-write.mjs';
 import { loadProposal } from './daftra-ledger.mjs';
+import { publicProposal } from './daftra-public.mjs';
+import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -47,23 +49,41 @@ async function readInput(flags) {
 
 const columnsOf = (flags) => flags.columns && flags.columns !== '-' ? flags.columns.split(',').map((c) => c.trim()) : undefined;
 
-function publicProposal(p) {
-  return {
-    ok: true, proposal_id: p.id, status: p.status, type: p.type, mode: p.mode, expires_at: p.expires_at,
-    party: p.party, totals: p.totals, effects: p.effects, reversible: p.reversible,
-    request: { method: p.request.method, path: p.request.path, query: p.request.query, body: p.request.body },
-    checks: p.checks, blocking: p.blocking, warnings: p.warnings, duplicates: p.duplicates,
-    request_hash: p.request_hash,
-    next: p.status === 'READY_FOR_APPROVAL'
-      ? 'NOTHING HAS BEEN SENT. Show this preview to the user and ask them to review and obtain the approval phrase from the operator tool: `node daftra-approve.mjs show ' + p.id + '` (run in a trusted shell). You cannot derive the phrase. Run execute only with the phrase the user sends you.'
-      : 'BLOCKED: nothing can be executed. Fix the blocking items and propose again.',
-  };
+// Commands that need the operator secret / write key. With DAFTRA_BROKER_SOCKET set they are ONLY ever forwarded
+// to the privileged broker (a different OS user) and never run in this process, even if secrets are in the env.
+const BROKERED = new Set(['propose', 'show', 'execute', 'resolve']);
+
+async function forwardToBroker(command, a1, flags, env) {
+  const actor = flags.actor || 'unknown';
+  const socket = env.DAFTRA_BROKER_SOCKET;
+  try {
+    if (command === 'propose') {
+      if (!a1) throw Error('Usage: propose <' + Object.keys(ACTION_TYPES).join('|') + '> --input \'{...}\' [--actor name]');
+      return await callBroker(socket, { cmd: 'propose', type: a1, input: await readInput(flags), actor });
+    }
+    if (command === 'show') {
+      if (!a1) throw Error('Usage: show <proposal-id>');
+      return await callBroker(socket, { cmd: 'show', id: a1 });
+    }
+    if (command === 'execute') {
+      if (!a1 || flags.phrase === undefined) throw Error('Usage: execute <proposal-id> --phrase "APPROVE ..." [--actor name]');
+      return await callBroker(socket, { cmd: 'execute', id: a1, phrase: flags.phrase, actor });
+    }
+    if (!a1 || !['true', 'false'].includes(flags.created) || !flags.code) throw Error('Usage: resolve <proposal-id> --created true|false --code <code> [--record-id N]');
+    const msg = { cmd: 'resolve', id: a1, created: flags.created === 'true', code: flags.code, actor };
+    if (flags['record-id'] !== undefined) msg.recordId = flags['record-id'];
+    return await callBroker(socket, msg);
+  } catch (e) {
+    if (e instanceof BrokerRefused) throw new WriteRefused(e.code, e.message);
+    throw e;
+  }
 }
 
 export async function run(argv, { env = process.env, fetcher = fetch, sleep } = {}) {
   const { positional, flags, query } = parseArgs(argv);
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
+  if (env.DAFTRA_BROKER_SOCKET && BROKERED.has(command)) return forwardToBroker(command, a1, flags, env);
   switch (command) {
     case 'capabilities':
       return {
@@ -71,6 +91,8 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
         read: Object.keys(ENTITIES), reports: Object.keys(REPORTS), formats: FORMATS,
         writes: Object.keys(ACTION_TYPES),
         writes_enabled: env.DAFTRA_WRITES_ENABLED === '1',
+        broker_mode: Boolean(env.DAFTRA_BROKER_SOCKET),
+        env_warnings: env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
         not_implemented: ['edit', 'delete', 'cancel', 'e-invoice (ZATCA) submission', 'create/modify clients, suppliers, products', 'supplier statements'],
       };

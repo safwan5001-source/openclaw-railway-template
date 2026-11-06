@@ -20,10 +20,13 @@ import { approvalSecret, approvalPhrase, resolveCode, macEqual } from './daftra-
 import { acquireLock, forceUnlock, appendLedger, readLedger, loadProposal, updateProposal, isBlockedByLedger, proposalWasUsed, stateForHash, writesInLastHour } from './daftra-ledger.mjs';
 import { parseDecimal } from './daftra-money.mjs';
 
+// Static create endpoints, and id-bearing update endpoints (PUT) for products and product categories only.
 export const WRITE_ROUTES = Object.freeze(Object.fromEntries(
-  Object.entries(ACTION_TYPES).map(([type, spec]) => [type, Object.freeze({ method: 'POST', path: spec.endpoint })])));
+  Object.entries(ACTION_TYPES).map(([type, spec]) => [type, Object.freeze(spec.pathFor
+    ? { method: spec.method, pattern: new RegExp('^' + spec.pathFor('@').replace('@', '[1-9][0-9]{0,14}').replaceAll('.', '\\.') + '$') }
+    : { method: spec.method, path: spec.endpoint })])));
 
-const ALLOWED_QUERIES = new Set(['', 'send=draft']);
+const DRAFT_QUERY_TYPES = new Set(['purchase_invoice', 'expense']);   // the only documented `?send=draft` endpoints
 
 export class WriteRefused extends Error {
   constructor(code, message) { super(message); this.name = 'WriteRefused'; this.code = code; }
@@ -32,7 +35,8 @@ export class WriteRefused extends Error {
 export function assertWriteAllowed(type, request) {
   const route = Object.hasOwn(WRITE_ROUTES, type) ? WRITE_ROUTES[type] : null;
   if (!route) throw new WriteRefused('ROUTE_DENIED', 'Unknown financial operation');
-  if (request?.method !== route.method || request?.path !== route.path || !ALLOWED_QUERIES.has(request?.query ?? ''))
+  const pathOk = route.pattern ? typeof request?.path === 'string' && route.pattern.test(request.path) : request?.path === route.path;
+  if (request?.method !== route.method || !pathOk || !((request?.query ?? '') === '' || (request.query === 'send=draft' && DRAFT_QUERY_TYPES.has(type))))
     throw new WriteRefused('ROUTE_DENIED', 'Method/path not on the write allowlist');
   try { assertBodyShape(type, request.body); } catch (e) { throw new WriteRefused('BODY_DENIED', e.message); }
 }
@@ -41,15 +45,24 @@ const VERIFY = {
   sales_invoice: ['invoices', 'summary_total'], estimate: ['estimates', 'summary_total'],
   expense: ['expenses', 'amount'], invoice_payment: ['invoice_payments', 'amount'], client_payment: ['client_payments', 'amount'],
 };
+const sameDecimal = (a, b) => parseDecimal(String(a), 'a', { maxDecimals: 6 }) === parseDecimal(String(b), 'b', { maxDecimals: 6 });
+const looseEqual = (a, b) => { try { return sameDecimal(a, b); } catch { return String(a ?? '').trim() === String(b ?? '').trim(); } };
 
 async function verifyCreated(proposal, recordId, env, fetcher) {
-  const spec = VERIFY[proposal.type];
-  if (!spec) return { checked: false, reason: 'no documented read-back field for this operation' };
   try {
+    if (ACTION_TYPES[proposal.type]?.catalog) {
+      const spec = ACTION_TYPES[proposal.type];
+      const record = await getOne(spec.resource, recordId, env, fetcher);
+      const body = Object.values(proposal.request.body)[0];
+      const mismatches = Object.entries(body).filter(([f, v]) => record[f] !== undefined && !Array.isArray(v) && f !== 'category_type' && !looseEqual(record[f], v)).map(([f, v]) => ({ field: f, expected: v, actual: String(record[f]) }));
+      const compared = Object.keys(body).filter((f) => record[f] !== undefined && !Array.isArray(body[f]) && f !== 'category_type');
+      return { checked: compared.length > 0, matched: compared.length > 0 ? mismatches.length === 0 : undefined, compared, mismatches };
+    }
+    const spec = VERIFY[proposal.type];
+    if (!spec) return { checked: false, reason: 'no documented read-back field for this operation' };
     const record = await getOne(spec[0], recordId, env, fetcher);
     const expected = proposal.totals.total; const actual = record[spec[1]];
-    const same = parseDecimal(String(actual), 'actual', { maxDecimals: 6 }) === parseDecimal(String(expected), 'expected', { maxDecimals: 6 });
-    return { checked: true, matched: same, expected, actual: String(actual) };
+    return { checked: true, matched: sameDecimal(actual, expected), expected, actual: String(actual) };
   } catch (e) {
     return { checked: false, reason: 'read-back failed: ' + e.message };
   }
@@ -58,8 +71,19 @@ async function verifyCreated(proposal, recordId, env, fetcher) {
 // Everything the pre-submit checks need is derived from the authenticated request body, never from side fields.
 function previewFromRequest(proposal) {
   const b = proposal.request.body;
-  const head = b.Invoice ?? b.PurchaseOrder ?? b.Expense ?? b.InvoicePayment ?? b.ClientPayment;
+  const spec = ACTION_TYPES[proposal.type];
   const str = (v) => (v === undefined || v === null ? undefined : String(v));
+  if (spec.catalog) {
+    const body = b.Product ?? b.Category;
+    const targetId = spec.pathFor ? proposal.request.path.match(/\/(\d+)\.json$/)[1] : undefined;
+    if (targetId !== undefined && String(proposal.party?.target_id) !== targetId) throw new WriteRefused('TAMPERED', 'Target id does not match the approved party');
+    return {
+      type: proposal.type, target_id: targetId, request: proposal.request,
+      tax_ids: [body.tax1, body.tax2].filter((x) => x !== undefined), supplier_id: str(body.supplier_id),
+      categories_id: body.categories_id, parent_id: body.parent_id,
+    };
+  }
+  const head = b.Invoice ?? b.PurchaseOrder ?? b.Expense ?? b.InvoicePayment ?? b.ClientPayment;
   const amount = str(b.Expense?.amount ?? b.InvoicePayment?.amount ?? b.ClientPayment?.amount);
   return {
     type: proposal.type, date: head.date,
@@ -101,16 +125,17 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     const limit = Number.isInteger(configured) && configured >= 1 ? configured : 20;
     if (writesInLastHour(ledger, now) >= limit) throw new WriteRefused('RATE_LIMIT', 'Write rate limit reached (' + limit + '/hour)');
     // fresh checks right before submitting (balance, duplicates, permissions may have changed)
-    const recheck = await collectChecks(proposal.type, previewFromRequest(proposal), env, fetcher, new Set(proposal.acknowledged_duplicates ?? []));
+    const recheck = await collectChecks(proposal.type, previewFromRequest(proposal), env, fetcher, new Set(proposal.acknowledged_duplicates ?? []), { snapshot: proposal.meta?.snapshot });
     if (recheck.blocking.length) throw new WriteRefused('RECHECK_FAILED', 'Pre-submit re-check failed: ' + recheck.blocking.join('; '));
 
-    const { base, apiKey } = config(env);
+    const { base, apiKey: readKey } = config(env);
+    const apiKey = env.DAFTRA_WRITE_API_KEY || readKey;   // a separate write-capable key can be held by the broker only
     const url = new URL(proposal.request.path, base);
     if (proposal.request.query) url.search = proposal.request.query;
     if (url.origin !== base.origin || !url.pathname.startsWith('/api2/')) throw new WriteRefused('ROUTE_DENIED', 'Target outside tenant');
 
     // Record intent BEFORE sending, so a crash can never lose the fact that a send may have happened.
-    const entry = { proposal_id: proposal.id, type: proposal.type, request_hash: proposal.request_hash, endpoint: 'POST ' + proposal.request.path + (proposal.request.query ? '?' + proposal.request.query : ''), actor };
+    const entry = { proposal_id: proposal.id, type: proposal.type, request_hash: proposal.request_hash, endpoint: proposal.request.method + ' ' + proposal.request.path + (proposal.request.query ? '?' + proposal.request.query : ''), actor };
     await appendLedger({ ...entry, event: 'approved', state: 'submitting' }, env);
     keepHashLock = true;                                   // from here on a send may have happened
     await updateProposal(proposal.id, { status: 'SUBMITTING', approved_by: actor, approved_at: new Date(now).toISOString() }, env);
@@ -118,7 +143,7 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     let response;
     try {
       response = await fetcher(url, {
-        method: 'POST', redirect: 'manual',
+        method: proposal.request.method, redirect: 'manual',   // POST or PUT: already pinned by assertWriteAllowed
         headers: { APIKEY: apiKey, Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify(proposal.request.body),
         signal: AbortSignal.timeout(20000),
@@ -133,7 +158,10 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     try { payload = await response.json(); } catch { /* non-JSON body */ }
 
     if (response.status >= 200 && response.status < 300) {
-      const recordId = payload?.id !== undefined && payload?.id !== null ? String(payload.id) : null;
+      const spec = ACTION_TYPES[proposal.type];
+      const idFromBody = payload?.id ?? payload?.Category?.id;
+      const targetId = spec.pathFor ? proposal.request.path.match(/\/(\d+)\.json$/)?.[1] : undefined;   // updates answer with a confirmation only
+      const recordId = targetId ?? (idFromBody !== undefined && idFromBody !== null ? String(idFromBody) : null);
       if (!recordId) {
         await appendLedger({ ...entry, event: 'no_id_in_response', state: 'ambiguous', http_status: response.status }, env);
         await updateProposal(proposal.id, { status: 'AMBIGUOUS' }, env);

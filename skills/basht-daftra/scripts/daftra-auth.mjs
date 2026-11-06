@@ -11,16 +11,45 @@
 // Limit: if the agent can read the server's environment it can compute these itself. Keep the secret out of
 // the agent's exec environment (operator shell / separate service) where the platform allows it.
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { canonicalJson } from './daftra-finance-preflight.mjs';
+import { lstatSync, readFileSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
+import { canonicalJson } from './daftra-canonical.mjs';
 
 export class ApprovalConfigError extends Error {
   constructor(message) { super(message); this.name = 'ApprovalConfigError'; this.code = 'APPROVAL_NOT_CONFIGURED'; }
 }
 
+// Load a secret either from NAME (environment) or from NAME_FILE (a path). The file form is what the privileged
+// broker uses so that the secret never sits in any process environment an agent could read.
+// File rules (fail closed): absolute path, a REGULAR file reached WITHOUT following a symlink, and not accessible
+// by group/others (mode & 0o077 === 0) unless DAFTRA_ALLOW_INSECURE_SECRET_FILE=1 (tests only). Trailing newline trimmed.
+const fileCache = new Map();
+export function readSecretFile(path, env = process.env) {
+  if (typeof path !== 'string' || !isAbsolute(path) || path.includes('\0')) throw new ApprovalConfigError('Secret file path must be absolute');
+  let st;
+  try { st = lstatSync(path); } catch { throw new ApprovalConfigError('Secret file is not readable'); }
+  if (st.isSymbolicLink() || !st.isFile()) throw new ApprovalConfigError('Secret file must be a regular file (symlinks are refused)');
+  if ((st.mode & 0o077) !== 0 && env.DAFTRA_ALLOW_INSECURE_SECRET_FILE !== '1')
+    throw new ApprovalConfigError('Secret file must not be accessible by group/others (chmod 0400 or 0600)');
+  const key = path + '|' + st.ino + '|' + st.mtimeMs + '|' + st.size;
+  const hit = fileCache.get(path);
+  if (hit && hit.key === key) return hit.value;
+  let value;
+  try { value = readFileSync(path, 'utf8').replace(/\r?\n$/, ''); } catch { throw new ApprovalConfigError('Secret file is not readable'); }
+  fileCache.set(path, { key, value });
+  return value;
+}
+// NAME_FILE wins over NAME. Returns undefined when neither is set.
+export function readSecret(env, name) {
+  const file = env[name + '_FILE'];
+  if (file !== undefined && file !== '') return readSecretFile(file, env);
+  return env[name];
+}
+
 export function approvalSecret(env = process.env) {
-  const s = env.DAFTRA_APPROVAL_SECRET;
+  const s = readSecret(env, 'DAFTRA_APPROVAL_SECRET');
   if (typeof s !== 'string' || s.length < 32)
-    throw new ApprovalConfigError('DAFTRA_APPROVAL_SECRET (at least 32 characters, held by the operator) is required for financial operations');
+    throw new ApprovalConfigError('DAFTRA_APPROVAL_SECRET or DAFTRA_APPROVAL_SECRET_FILE (at least 32 characters, held by the operator) is required for financial operations');
   return s;
 }
 
@@ -39,7 +68,7 @@ export function signedFields(p) {
   return {
     id: p.id, type: p.type, created_at: p.created_at, expires_at: p.expires_at, actor: p.actor, mode: p.mode,
     effects: p.effects, totals: p.totals, party: p.party, request: p.request, request_hash: p.request_hash,
-    acknowledged_duplicates: p.acknowledged_duplicates ?? [], ready: p.ready === true,
+    acknowledged_duplicates: p.acknowledged_duplicates ?? [], ready: p.ready === true, meta: p.meta ?? null,
   };
 }
 export const proposalAuth = (env, proposal) => mac(env, 'proposal', signedFields(proposal));

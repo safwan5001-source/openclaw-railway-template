@@ -54,8 +54,68 @@ async function findDuplicates(type, preview, env, fetcher) {
   return out;
 }
 
+
+const norm = (s) => String(s ?? '').trim().toLowerCase();
+const sameValue = (a, b) => { const x = num(a); const y = num(b); return x !== null && y !== null ? x === y : String(a ?? '') === String(b ?? ''); };
+
+// Product / category checks (GET only). `snapshot` = the current values seen when the preview was built;
+// if the live record differs at approval time the change is blocked (someone edited it meanwhile).
+async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, snapshot) {
+  const checks = []; const blocking = []; const warnings = [];
+  const check = (ok, name, detail, isBlocking = false) => { checks.push({ name, ok, detail }); if (!ok && isBlocking) blocking.push(detail); };
+  const spec = ACTION_TYPES[type];
+  await probe(spec.resource, env, fetcher, check);
+  const body = Object.values(preview.request.body)[0];
+  let counterparty = null; let duplicates = [];
+  const singleEntity = spec.resource;                         // 'products' | 'product_categories'
+  if (preview.tax_ids?.length) {
+    try {
+      const page = await listPage('taxes', {}, env, fetcher);
+      const table = new Map(page.records.map((r) => [String(r.id), r]));
+      for (const taxId of preview.tax_ids) {
+        const tax = table.get(String(taxId));
+        check(Boolean(tax) && Number(tax.is_active) !== 0, 'tax_' + taxId + '_valid', tax ? (Number(tax.is_active) === 0 ? 'Tax ' + taxId + ' is inactive' : 'Tax ' + taxId + ' valid') : 'Tax ' + taxId + ' does not exist in this tenant', true);
+      }
+    } catch (e) { check(false, 'tax_table', 'Tax table unavailable: ' + e.message, true); }
+  }
+  if (preview.supplier_id) await exists('suppliers', preview.supplier_id, env, fetcher, check, 'supplier');
+  for (const cid of preview.categories_id ?? []) await exists('product_categories', cid, env, fetcher, check, 'category ' + cid);
+  if (preview.parent_id) await exists('product_categories', preview.parent_id, env, fetcher, check, 'parent category');
+  const q = (o) => ({ query: o });
+  try {
+    if (type === 'product_create') {
+      const hits = new Map();
+      if (body.barcode) for (const r of (await fetchAllRecords('products', q({ barcode: body.barcode }), env, fetcher)).records) if (!r.barcode || String(r.barcode) === String(body.barcode)) hits.set(String(r.id), r);
+      if (body.product_code) for (const r of (await fetchAllRecords('products', q({ product_code: body.product_code }), env, fetcher)).records) if (!r.product_code || norm(r.product_code) === norm(body.product_code)) hits.set(String(r.id), r);
+      for (const r of (await fetchAllRecords('products', q({ keywords: body.name }), env, fetcher)).records) if (norm(r.name) === norm(body.name)) hits.set(String(r.id), r);
+      duplicates = [...hits.keys()].map((id) => ({ entity: 'products', id }));
+    } else if (type === 'product_update') {
+      counterparty = await exists('products', preview.target_id, env, fetcher, check, 'product');
+      for (const f of ['barcode', 'product_code']) if (body[f]) {
+        const rows = (await fetchAllRecords('products', q({ [f]: body[f] }), env, fetcher)).records;
+        for (const r of rows) if (String(r.id) !== String(preview.target_id) && (!r[f] || norm(r[f]) === norm(body[f]))) duplicates.push({ entity: 'products', id: String(r.id) });
+      }
+    } else if (type === 'category_create') {
+      const rows = (await fetchAllRecords('product_categories', q(body.parent_id ? { parent_id: String(body.parent_id) } : {}), env, fetcher)).records;
+      duplicates = rows.filter((r) => norm(r.name) === norm(body.name) && String(r.parent_id ?? 0) === String(body.parent_id ?? 0)).map((r) => ({ entity: 'product_categories', id: String(r.id) }));
+    } else if (type === 'category_update') {
+      counterparty = await exists('product_categories', preview.target_id, env, fetcher, check, 'category');
+    }
+    const open = duplicates.filter((d) => !acknowledged.has(d.entity + '#' + d.id));
+    check(open.length === 0, 'no_remote_duplicate', open.length
+      ? 'Possible duplicates already in Daftra: ' + open.map((d) => d.entity + '#' + d.id).join(', ') + ' (re-propose with acknowledge_duplicates to override)'
+      : (duplicates.length ? 'Possible duplicates acknowledged by the requester' : 'No duplicate found'), true);
+  } catch (e) { check(false, 'no_remote_duplicate', 'Duplicate scan failed (' + e.message + ')', true); }
+  if (snapshot && counterparty) {
+    const changed = Object.entries(snapshot).filter(([f, v]) => counterparty[f] !== undefined && !sameValue(counterparty[f], v)).map(([f]) => f);
+    check(changed.length === 0, 'unchanged_since_preview', changed.length ? 'Changed in Daftra since the preview: ' + changed.join(', ') + ' (create a new proposal)' : 'Record unchanged since the preview', true);
+  }
+  return { checks, blocking, warnings, duplicates, counterparty };
+}
+
 // Checks that must hold both when proposing and again right before submitting.
-export async function collectChecks(type, preview, env, fetcher, acknowledged = new Set()) {
+export async function collectChecks(type, preview, env, fetcher, acknowledged = new Set(), extra = {}) {
+  if (ACTION_TYPES[type]?.catalog) return collectCatalogChecks(type, preview, env, fetcher, acknowledged, extra.snapshot);
   const checks = []; const blocking = []; const warnings = [];
   const check = (ok, name, detail, isBlocking = false) => {
     checks.push({ name, ok, detail });
@@ -93,7 +153,7 @@ export async function collectChecks(type, preview, env, fetcher, acknowledged = 
   return { checks, blocking, warnings, duplicates, counterparty };
 }
 
-export async function createProposal(type, input, { env = process.env, fetcher = fetch, actor = 'unknown', now = Date.now() } = {}) {
+export async function createProposal(type, input, { env = process.env, fetcher = fetch, actor = 'unknown', now = Date.now(), meta = null } = {}) {
   if (!Object.hasOwn(ACTION_TYPES, type)) throw Error('Unsupported financial action');
   approvalSecret(env); // proposals are authenticated; refuse early when the operator secret is not configured
   // Tax table: required for invoice-like documents so every tax id is verified against this tenant.
@@ -104,13 +164,19 @@ export async function createProposal(type, input, { env = process.env, fetcher =
       if (page.complete) taxes = page.records; else preBlocking.push('Tax table could not be proven complete');
     } catch (e) { preBlocking.push('Tax table unavailable: ' + e.message); }
   }
-  let preview = prepareFinancialAction(type, input, { taxes, requireDate: true });
+  let current; let snapshot = null;
+  if (type === 'product_update' || type === 'category_update') {
+    const entity = ACTION_TYPES[type].resource; const key = type === 'product_update' ? input.product_id : input.category_id;
+    try { current = await getOne(entity, key, env, fetcher); } catch (e) { preBlocking.push('Target record not accessible (' + e.message + ')'); }
+  }
+  let preview = prepareFinancialAction(type, input, { taxes, requireDate: true, current });
+  if (current && preview.changes) snapshot = Object.fromEntries(preview.changes.filter((c) => typeof c.from !== 'object' && !String(c.from).startsWith('(')).map((c) => [c.field, c.from]));
   if (type === 'expense') {
     // Expenses support a real server-side idempotency key; derive it from the request itself.
     preview = prepareFinancialAction(type, input, { taxes, requireDate: true, idempotencyKey: 'basht-' + preview.request_hash.slice(0, 40) });
   }
   const acknowledged = new Set((input.acknowledge_duplicates ?? []).map(String));
-  const collected = await collectChecks(type, preview, env, fetcher, acknowledged);
+  const collected = await collectChecks(type, preview, env, fetcher, acknowledged, { snapshot });
   const effective = [...preBlocking, ...collected.blocking];
   const ledger = await readLedger(env);
   const ledgerState = isBlockedByLedger(ledger, preview.request_hash);
@@ -136,6 +202,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     warnings: [...preview.warnings, ...collected.warnings],
     duplicates: collected.duplicates,
     acknowledged_duplicates: [...acknowledged],
+    meta: { ...(meta ?? {}), ...(snapshot ? { snapshot } : {}), ...(preview.changes ? { changes: preview.changes, price_changes: preview.price_changes } : {}) },
   };
   if (hashRequest(proposal.request) !== proposal.request_hash) throw Error('Internal hash mismatch');
   await saveProposal(proposal, env);
@@ -144,5 +211,5 @@ export async function createProposal(type, input, { env = process.env, fetcher =
 
 function summariseParty(preview, record) {
   const name = record?.business_name || record?.name || record?.first_name || null;
-  return { client_id: preview.client_id ?? null, supplier_id: preview.supplier_id ?? null, invoice_id: preview.invoice_id ?? null, name };
+  return { client_id: preview.client_id ?? null, supplier_id: preview.supplier_id ?? null, invoice_id: preview.invoice_id ?? null, target_id: preview.target_id ?? null, name };
 }

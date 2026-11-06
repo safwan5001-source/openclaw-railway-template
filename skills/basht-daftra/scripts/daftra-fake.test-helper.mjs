@@ -7,7 +7,8 @@ export class FakeDaftra {
     this.records = seed.records ?? {
       clients: { 4: { id: 4, business_name: 'شركة نبراس' } },
       suppliers: { 7: { id: 7, business_name: 'مورد' } },
-      products: { 9: { id: 9 } },
+      products: { 9: { id: 9, name: 'Diesel 10L', unit_price: '18.90', tax1: 1, product_code: 'D10', barcode: '6291041500213', status: 0 } },
+      product_categories: { 12: { id: 12, name: 'Fuel', parent_id: 0 }, 13: { id: 13, name: 'Oil', parent_id: 0 } },
       invoices: { 3: { id: 3, draft: 0, summary_total: '115.00', summary_unpaid: '115.00', client_id: 4 } },
     };
     this.lists = seed.lists ?? {};
@@ -21,7 +22,7 @@ export class FakeDaftra {
     const method = options.method ?? 'GET';
     const path = url.pathname; const search = url.search;
     this.calls.push({ method, path, search, body: options.body, headers: options.headers });
-    if (method === 'POST') {
+    if (method !== 'GET') {
       if (this.postError) throw this.postError;
       const out = this.post(url, JSON.parse(options.body));
       return new Response(JSON.stringify(out.json), { status: out.status });
@@ -31,11 +32,12 @@ export class FakeDaftra {
     const [, resource, id] = m;
     if (this.forbidden.has(resource)) return new Response(JSON.stringify({ message: 'Forbidden' }), { status: 403 });
     const models = { clients: 'Client', suppliers: 'Supplier', products: 'Product', invoices: 'Invoice', estimates: 'Estimate', expenses: 'Expense',
-      invoice_payments: 'InvoicePayment', client_payments: 'ClientPayment', purchase_invoices: 'PurchaseOrder', taxes: 'Tax' };
+      invoice_payments: 'InvoicePayment', client_payments: 'ClientPayment', purchase_invoices: 'PurchaseOrder', taxes: 'Tax', product_categories: 'ProductCategory' };
     const model = models[resource];
+    const singleModel = resource === 'product_categories' ? 'Category' : model;
     if (id) {
       const rec = this.records[resource]?.[id] ?? this.created[resource]?.[id];
-      return rec ? new Response(JSON.stringify({ code: 200, data: { [model]: rec } }), { status: 200 })
+      return rec ? new Response(JSON.stringify({ code: 200, data: { [singleModel]: rec } }), { status: 200 })
         : new Response(JSON.stringify({ message: 'not found' }), { status: 404 });
     }
     const all = resource === 'taxes' ? this.taxes : (this.lists[resource] ?? []);

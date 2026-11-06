@@ -74,8 +74,9 @@ export function extractList(payload, entity) {
 export function extractOne(payload, entity) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw Error('Invalid Daftra response');
   if (!Object.hasOwn(ENTITIES, entity)) throw Error('Unsupported entity');
-  const model = payload.data?.[ENTITIES[entity].model];
-  if (!model || typeof model !== 'object' || Array.isArray(model)) throw Error('Missing model ' + ENTITIES[entity].model);
+  const key = ENTITIES[entity].singleModel ?? ENTITIES[entity].model;
+  const model = payload.data?.[key];
+  if (!model || typeof model !== 'object' || Array.isArray(model)) throw Error('Missing model ' + key);
   return model;
 }
 
