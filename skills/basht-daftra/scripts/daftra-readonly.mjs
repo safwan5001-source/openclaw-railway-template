@@ -31,12 +31,18 @@ export class DaftraError extends Error {
   }
 }
 
-export function config(env = process.env) {
+// The tenant root only (no credential needed): used by components that must NOT hold the API key (the login browser).
+export function tenantBase(env = process.env) {
   let base;
   try { base = new URL(env.DAFTRA_BASE_URL || ''); } catch { throw new Error('DAFTRA_BASE_URL must be an HTTPS Daftra tenant root'); }
   if (base.protocol !== 'https:' || !base.hostname.endsWith('.daftra.com') || base.username || base.password || base.search || base.hash || base.pathname !== '/') {
     throw new Error('DAFTRA_BASE_URL must be an HTTPS Daftra tenant root');
   }
+  return base;
+}
+
+export function config(env = process.env) {
+  const base = tenantBase(env);
   if (!env.DAFTRA_API_KEY) throw new Error('DAFTRA_API_KEY is required');
   return { base, apiKey: env.DAFTRA_API_KEY };
 }

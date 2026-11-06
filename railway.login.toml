@@ -1,0 +1,10 @@
+# OPTIONAL REFERENCE ONLY — the primary wiring is the service variable RAILWAY_DOCKERFILE_PATH=Dockerfile.login (see Dockerfile.login).
+# Holds NO variables and NO secrets. The experimental login-browser service must NOT be deployed before review and approval.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.login"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"

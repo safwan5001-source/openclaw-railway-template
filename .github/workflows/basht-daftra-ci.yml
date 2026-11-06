@@ -11,6 +11,7 @@ on:
   pull_request:
     paths:
       - 'skills/basht-daftra/**'
+      - 'daftra-login/**'
       - 'src/**'
       - 'scripts/**'
       - 'Dockerfile'
@@ -20,6 +21,7 @@ on:
       - 'skill-sync.sh'
       - 'railway.toml'
       - 'railway.broker.toml'
+      - 'railway.login.toml'
       - '.dockerignore'
       - 'docs/DAFTRA_*.md'
       - 'package.json'
@@ -56,6 +58,8 @@ jobs:
         run: node --version
       - name: Node tests (wrapper + Daftra skill, offline fakes only)
         run: node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
+      - name: Login-browser tests (fake browser + real Chromium against a local fake Daftra when Chrome is installed; no real Daftra, no internet)
+        run: node --test daftra-login/*.test.mjs
       - name: Skill frontmatter is valid and self-contained
         run: |
           node -e "
@@ -86,6 +90,7 @@ jobs:
         run: |
           docker build --check -f Dockerfile .
           docker build --check -f Dockerfile.broker .
+          docker build --check -f Dockerfile.login .
 
   broker-image:
     runs-on: ubuntu-latest
