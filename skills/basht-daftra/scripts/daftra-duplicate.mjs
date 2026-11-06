@@ -15,19 +15,14 @@ import { redactRecord } from './daftra-normalize.mjs';
 import { listPage } from './daftra-readonly.mjs';
 import { prepareFinancialAction } from './daftra-finance-preflight.mjs';
 import { parseDecimal } from './daftra-money.mjs';
+import { DUP_SOURCES, TOTAL_AFFECTING, locate, trustedSourceId, sourceFingerprint } from './daftra-duplicate-source.mjs';
 
-export const DUP_SOURCES = Object.freeze({
-  invoices:          { type: 'sales_invoice',    header: 'Invoice',       items: 'InvoiceItem',       party: 'client_id' },
-  estimates:         { type: 'estimate',         header: 'Estimate',      items: 'InvoiceItem',       party: 'client_id' },
-  purchase_invoices: { type: 'purchase_invoice', header: 'PurchaseOrder', items: 'PurchaseOrderItem', party: 'supplier_id' },
-});
+export { DUP_SOURCES };
 
 const LINE_KEYS = ['item', 'description', 'quantity', 'unit_price', 'tax1', 'tax2', 'discount', 'discount_type', 'product_id'];
 const NEVER_COPIED = ['id', 'no', 'payments', 'payment_status', 'summary_paid', 'summary_unpaid', 'summary_deposit', 'summary_refund', 'created', 'modified',
   'invoice_pdf_url', 'invoice_html_url', 'qr_code_url', 'password', 'estimate_id', 'source_type', 'source_id', 'subscription_id', 'work_order_id',
   'pos_shift_id', 'staff_id', 'is_received', 'received_date'];
-// Header-level amounts that change a document total and cannot be reproduced by a copy.
-const TOTAL_AFFECTING = ['discount', 'discount_amount', 'summary_discount', 'shipping_amount', 'deposit', 'summary_deposit', 'summary_refund', 'adjustment', 'adjustment_value', 'adjustments'];
 const ALLOWED_SOURCE_TYPES = { invoices: [0], estimates: [3] };   // Daftra type ids: 0 invoice, 3 estimate (credit notes, debit notes, subscriptions are refused)
 const OVERRIDE_KEYS = new Set(['date', 'client_id', 'supplier_id', 'currency_code', 'notes', 'finalize', 'line_overrides', 'remove_lines', 'add_lines',
   'accept_total_difference', 'acknowledge_duplicates']);
@@ -39,19 +34,6 @@ const plain = (v, label) => {
   return s;
 };
 const hasValue = (v) => { if (v === undefined || v === null || v === '' || v === false) return false; const n = Number(v); return Number.isNaN(n) ? true : n !== 0; };
-
-// Locate the header and line items inside a single-document payload. The docs show items as a sibling of the
-// header for invoices/purchase invoices; for estimates the location is not spelled out, so look in the
-// plausible places and fail closed if nothing is found.
-function locate(payload, spec) {
-  const data = payload?.data;
-  const header = data?.[spec.header] ?? (spec.header === 'Estimate' ? data?.Invoice : undefined);
-  if (!header || typeof header !== 'object' || Array.isArray(header)) throw Error('Source response has no ' + spec.header + ' section');
-  const candidates = [data?.[spec.items], header?.[spec.items], data?.Invoice?.[spec.items]];
-  const items = candidates.find((c) => Array.isArray(c) && c.length);
-  if (!items) throw Error('Source has no readable line items; refusing to guess');
-  return { header, items };
-}
 
 // Purchase lines carry the tax VALUE, sales lines the tax ID. Map value -> id only when unambiguous.
 function mapPurchaseTax(value, taxes, label) {
@@ -70,6 +52,7 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
   const spec = DUP_SOURCES[source];
   const payload = await getRecord(source, id, env, fetcher);
   const { header, items } = locate(payload, spec);
+  const sourceId = trustedSourceId(header, id);                  // identity comes from the returned document, never from the caller's input
   if (items.length > 100) throw Error('Source has more than 100 lines');
   const srcType = header.type === undefined || header.type === null || header.type === '' ? undefined : Number(header.type);
   if (ALLOWED_SOURCE_TYPES[source] && srcType !== undefined && !ALLOWED_SOURCE_TYPES[source].includes(srcType)) throw Error('Source document type ' + srcType + ' is not a standard ' + source.replace(/s$/, '').replace('_', ' ') + ' and cannot be duplicated');
@@ -132,6 +115,7 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
   if (Array.isArray(payload?.data?.Payment) && payload.data.Payment.length) notCopied.push('payments');
   const totalAffecting = TOTAL_AFFECTING.filter((k) => hasValue(header[k]));
   if (source === 'purchase_invoices' && lines.some((l) => l.discount !== undefined)) warnings.push('Purchase invoice line discounts are not documented for creation: Daftra may ignore them; compare the total');
+  warnings.unshift('THIS CREATES A NEW FINANCIAL DOCUMENT: if approved and executed, a new ' + (input.finalize === true ? 'FINAL' : 'DRAFT') + ' ' + spec.type.replace('_', ' ') + ' with its own number is created in Daftra. The source ' + source + '#' + sourceId + ' is not modified and is not treated as a duplicate of the copy; any OTHER matching document still blocks the proposal.');
   if (header.draft && String(header.draft) !== '0') warnings.push('The source is itself a draft');
   if (totalAffecting.length && overrides.accept_total_difference !== true)
     blocking.push('Source has header-level ' + totalAffecting.join('/') + ' that a copy cannot reproduce; the new total would differ. Re-propose with accept_total_difference:true after reviewing');
@@ -157,10 +141,10 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
     { field: 'currency_code', original: header.currency_code ?? null, proposed: input.currency_code ?? null },
     { field: 'notes', original: header.notes ?? null, proposed: input.notes ?? null },
   ].filter((d) => String(d.original ?? '') !== String(d.proposed ?? '') || d.field === 'date');
-  const original = redactRecord({ source, id: String(header.id ?? id), number: header.no ?? null, date: header.date ?? null, [partyKey]: header[partyKey] ?? null,
+  const original = redactRecord({ source, id: sourceId, number: header.no ?? null, date: header.date ?? null, [partyKey]: header[partyKey] ?? null,
     currency_code: header.currency_code ?? null, summary_total: header.summary_total ?? null, lines: items.length });
   const diff = { original, header: headerDiff, lines: lineDiff, not_copied: notCopied };
-  return { type: spec.type, input, meta: { duplicate_of: { entity: source, id: String(header.id ?? id) }, diff }, blocking, warnings, diff };
+  return { type: spec.type, input, meta: { duplicate_of: { entity: source, id: sourceId }, source_fingerprint: sourceFingerprint(source, header, items), diff }, blocking, warnings, diff };
 }
 
 // Read-only end to end (GETs only). Nothing is sent to Daftra; the result is an approval proposal whose signed

@@ -154,14 +154,20 @@ test('absolute line discounts are copied faithfully (type 2)', async () => {
   } finally { await c.done(); }
 });
 
-test('copying with the original date/client/total is flagged as a likely duplicate of the original', async () => {
+test('copying with the original date/client/total: the SOURCE alone no longer blocks, but any OTHER matching document does', async () => {
   const c = await setup({ seed: { lists: { invoices: [{ id: 3, summary_total: '237.00' }] } } });
   try {
     const p = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-01-10' } }, R(c));
-    assert.equal(p.status, 'BLOCKED'); assert.match(p.blocking.join(' '), /invoices#3/);
-    const ack = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-01-10', acknowledge_duplicates: ['invoices#3'] } }, R(c));
-    assert.equal(ack.status, 'READY_FOR_APPROVAL');
+    assert.equal(p.status, 'READY_FOR_APPROVAL', p.blocking?.join(' '));
+    assert.deepEqual(p.duplicates, []);
   } finally { await c.done(); }
+  const o = await setup({ seed: { lists: { invoices: [{ id: 3, summary_total: '237.00' }, { id: 9, summary_total: '237.00' }] } } });
+  try {
+    const p = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-01-10' } }, R(o));
+    assert.equal(p.status, 'BLOCKED'); assert.match(p.blocking.join(' '), /invoices#9/); assert.doesNotMatch(p.blocking.join(' '), /invoices#3\b/);
+    const ack = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-01-10', acknowledge_duplicates: ['invoices#9'] } }, R(o));
+    assert.equal(ack.status, 'READY_FOR_APPROVAL');
+  } finally { await o.done(); }
 });
 
 test('estimates and purchase invoices: own endpoints, purchase tax VALUE mapped to a unique tax id', async () => {
