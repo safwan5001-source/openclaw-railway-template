@@ -350,7 +350,7 @@ export async function fetchOfficialPdfResponse(url, { env = process.env, fetcher
   let current = url;
   for (let hop = 0; ; hop++) {
     const response = await fetcher(current, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(20000) });
-    if (!PDF_REDIRECT_STATUS.has(response.status)) return { response, redirects: hop };
+    if (!PDF_REDIRECT_STATUS.has(response.status)) return { response, redirects: hop, landedOnLogin: /login|sign[-_]?in|auth/i.test(current.pathname) };
     try { await response.body?.cancel?.(); } catch { /* body already closed */ }
     if (hop >= MAX_PDF_REDIRECTS) throw new Error('PDF download failed: too many redirects');
     const location = response.headers?.get?.('location');
@@ -365,11 +365,15 @@ export function invoiceIsDraft(invoice) {
 }
 
 // Why a final response is not a usable PDF (null = usable). No URLs in the text.
-export function pdfResponseProblem(response, { draft = false } = {}) {
+export function pdfResponseProblem(response, { draft = false, redirects = 0, landedOnLogin = false } = {}) {
   const note = draft ? ' (the invoice is a draft; Daftra may not serve an official PDF for drafts)' : '';
   if (!response.ok) return 'PDF download failed (HTTP ' + response.status + ')' + note;
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) return 'Response is not PDF' + note;
+  if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) {
+    // Diagnostics only: status, media type (no parameters), redirect count and whether the final hop was a login page. Never a URL.
+    const media = contentType.split(';')[0].trim().replace(/[^a-z0-9.+\/-]/g, '').slice(0, 60) || 'none';
+    return 'Response is not PDF [HTTP ' + response.status + ', ' + media + ', ' + redirects + ' redirect(s)' + (landedOnLogin ? ', ended on a login page: Daftra requires a signed-in session for this document' : '') + ']' + note;
+  }
   return null;
 }
 
@@ -379,8 +383,8 @@ export async function downloadInvoicePdf(id, outPath, env = process.env, fetcher
   const invoice = await getInvoice(id, env, fetcher);
   const url = pdfUrl(invoice, env);
   const draft = invoiceIsDraft(invoice);
-  const { response, redirects } = await fetchOfficialPdfResponse(url, { env, fetcher });
-  const problem = pdfResponseProblem(response, { draft });
+  const { response, redirects, landedOnLogin } = await fetchOfficialPdfResponse(url, { env, fetcher });
+  const problem = pdfResponseProblem(response, { draft, redirects, landedOnLogin });
   if (problem) throw new Error(problem);
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PDF_BYTES) throw new Error('PDF exceeds size limit');

@@ -138,8 +138,8 @@ export async function fetchInvoicePdf(id, { env, fetcher = fetch }) {
   const draft = invoiceIsDraft(got.body);
   let fetched;
   try { fetched = await fetchOfficialPdfResponse(url, { env, fetcher }); } catch (e) { return { status: 502, message: clean(e.message), draft }; }
-  const { response, redirects } = fetched;
-  const problem = pdfResponseProblem(response, { draft });
+  const { response, redirects, landedOnLogin } = fetched;
+  const problem = pdfResponseProblem(response, { draft, redirects, landedOnLogin });
   if (problem) return { status: 502, message: problem, draft };
   let bytes;
   try { bytes = await readCapped(response, MAX_PDF); } catch (e) { return { status: 502, message: clean(e.message) }; }

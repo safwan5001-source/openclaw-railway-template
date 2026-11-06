@@ -97,8 +97,17 @@ test('official PDF of a DRAFT invoice is attempted; the result carries draft:tru
 test('a redirect to a login/HTML page is not saved as a PDF; nothing is written', async () => {
   const t = await tmp(); const s = scripted([redirect('/users/login'), new Response('<html>login</html>', { status: 200, headers: { 'content-type': 'text/html' } })]);
   try {
-    await assert.rejects(downloadInvoicePdf('97900', t.out, env, s.fetcher), /not PDF/);
+    await assert.rejects(downloadInvoicePdf('97900', t.out, env, s.fetcher), (e) =>
+      /not PDF \[HTTP 200, text\/html, 1 redirect\(s\), ended on a login page/.test(e.message) && !e.message.includes(HASH) && !e.message.includes('http'));
     await assert.rejects(stat(t.out));
+  } finally { await t.done(); }
+});
+
+test('non-PDF 200 without redirect reports status and media type only (no URL, no hash)', async () => {
+  const t = await tmp(); const s = scripted([new Response('<html>x</html>', { status: 200, headers: { 'content-type': 'text/html; charset=UTF-8' } })], { draft: 1 });
+  try {
+    await assert.rejects(downloadInvoicePdf('97900', t.out, env, s.fetcher), (e) =>
+      /not PDF \[HTTP 200, text\/html, 0 redirect\(s\)\]/.test(e.message) && /draft/.test(e.message) && !/login/.test(e.message) && !e.message.includes(HASH));
   } finally { await t.done(); }
 });
 
