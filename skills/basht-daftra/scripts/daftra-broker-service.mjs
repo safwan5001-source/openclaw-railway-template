@@ -475,7 +475,7 @@ export function createBrokerService(options = {}) {
   }
   function sameOrigin(req) {
     const origin = req.headers.origin;
-    if (typeof origin === 'string') {
+    if (typeof origin === 'string' && origin !== 'null') {
       if (env.BROKER_PUBLIC_ORIGIN) return origin === env.BROKER_PUBLIC_ORIGIN;
       try { return new URL(origin).host === req.headers.host; } catch { return false; }
     }
