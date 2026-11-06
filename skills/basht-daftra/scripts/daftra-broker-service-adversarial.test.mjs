@@ -609,3 +609,42 @@ test('SECRETS never appear in any HTTP response, header, log line, ledger, propo
     assert.ok(seen.join('').includes('[redacted]') || true);
   } finally { await c.stop(); }
 });
+
+// ---- added after the mutation sweep (each pins a guard that previously survived) -------------------------------------
+test('MUTATION#1 a request with ONLY the public Host (no edge headers) already raises the exposure alarm', async () => {
+  const c = await startService();
+  try {
+    assert.equal(c.service.exposure.alarm, false);
+    assert.equal((await c.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { host: PUBLIC_HOST })).status, 404);
+    assert.equal(c.service.exposure.alarm, true);
+  } finally { await c.stop(); }
+});
+
+test('MUTATION#2 two Authorization headers are refused even when the FIRST one is the valid token', async () => {
+  const c = await startService();
+  try {
+    const send = (headers) => new Promise((res) => { const s = net.createConnection(c.privatePort, '127.0.0.1'); let out = ''; s.on('data', (d) => { out += d; }); s.on('close', () => res(out)); s.on('connect', () => s.write(`POST /v1/status HTTP/1.1\r\nHost: ${PRIVATE_HOST}\r\n${headers}Content-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{"id":"prop_0123456789abcdef"}`)); });
+    assert.match(await send(`Authorization: Bearer ${AGENT_TOKEN}\r\n`), /^HTTP\/1\.1 422/, 'control: one valid header is accepted');
+    assert.match(await send(`Authorization: Bearer ${AGENT_TOKEN}\r\nAuthorization: Bearer nope\r\n`), /^HTTP\/1\.1 401/);
+    assert.match(await send(`Authorization: Bearer ${AGENT_TOKEN}\r\nauthorization: Bearer ${AGENT_TOKEN}\r\n`), /^HTTP\/1\.1 401/);
+  } finally { await c.stop(); }
+});
+
+test('MUTATION#3 the library environment of the service never has writes on unless the SERVICE env says 1 and it is configured', async () => {
+  const off = await startService({ env: { DAFTRA_WRITES_ENABLED: undefined } });
+  try { assert.equal(off.service._brokerEnv.DAFTRA_WRITES_ENABLED, '0'); } finally { await off.stop(); }
+  const unconfigured = await startService({ env: { OPERATOR_PASSWORD: undefined } });
+  try { assert.equal(unconfigured.service._brokerEnv.DAFTRA_WRITES_ENABLED, '0'); } finally { await unconfigured.stop(); }
+  const on = await startService();
+  try { assert.equal(on.service._brokerEnv.DAFTRA_WRITES_ENABLED, '1'); for (const k of ['OPERATOR_PASSWORD', 'OPERATOR_TOTP_SEED', 'BROKER_AGENT_TOKEN']) assert.equal(k in on.service._brokerEnv, false, k + ' must not reach the libraries'); } finally { await on.stop(); }
+});
+
+test('MUTATION#5 the private API has exactly four routes: a well-formed /v1/execute or /v1/resolve request is a 404, not a validation error', async () => {
+  const c = await startService();
+  try {
+    const id = (await proposeInvoice(c)).json.result.proposal_id;
+    for (const [route, body] of [['/v1/execute', { id, phrase: 'x' }], ['/v1/resolve', { id, created: false, code: 'x' }], ['/v1/approve', { id }], ['/v1/reject', { id }], ['/v1/enable_writes', {}]]) {
+      const r = await c.agent(route, body); assert.equal(r.status, 404, route); assert.equal(r.json.ok, false);
+    }
+  } finally { await c.stop(); }
+});
