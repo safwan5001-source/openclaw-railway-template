@@ -639,7 +639,7 @@ test('SAFARI: Origin-less same-origin form POST requires Fetch Metadata, exact p
       headers: { 'Sec-Fetch-Site': 'same-origin' }, form: { pre: wrongHostPre, password: OPERATOR_PASSWORD } });
     assert.equal(wrongHost.status, 403, 'claimed same-origin with wrong Host must be rejected');
     const goodPre = await getPre();
-    const good = await op.request('POST', '/enroll', { host: PUBLIC_HOST, origin: null,
+    const good = await op.request('POST', '/enroll', { host: PUBLIC_HOST, origin: 'null',
       headers: { 'Sec-Fetch-Site': 'same-origin' }, form: { pre: goodPre, password: OPERATOR_PASSWORD } });
     assert.equal(good.status, 200, 'Safari same-origin form submission should succeed');
     assert.match(good.text, /Setup key/);
