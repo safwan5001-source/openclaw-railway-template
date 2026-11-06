@@ -83,9 +83,9 @@ export function createBrokerFetcher({ url, token, env = process.env, fetcher = f
 // Official invoice PDF through the broker (the broker downloads it; the agent never sees a document link or a key).
 export async function downloadInvoicePdfViaBroker({ id, outPath, url, token, env = process.env, fetcher = fetch }) {
   const reply = await callBrokerService({ url, token, cmd: 'invoice_pdf', body: { id: String(id) }, env, fetcher, timeoutMs: 60_000 });
-  if (reply?.status !== 200 || typeof reply.base64 !== 'string') throw new Error('PDF not available: ' + String(reply?.message ?? 'unknown').slice(0, 120));
+  if (reply?.status !== 200 || typeof reply.base64 !== 'string') throw new Error('PDF not available: ' + String(reply?.message ?? 'unknown').slice(0, 320));
   const bytes = Buffer.from(reply.base64, 'base64');
   assertPdfBytes(new Uint8Array(bytes));
   await writeFile(outPath, bytes, { flag: 'wx', mode: 0o600 });
-  return { path: outPath, size: bytes.length, source: 'daftra_official', draft: reply.draft === true, redirects: Number.isInteger(reply.redirects) ? reply.redirects : 0 };
+  return { path: outPath, size: bytes.length, source: 'daftra_official', via: reply.source === 'daftra_session' ? 'daftra_session' : 'daftra_link', draft: reply.draft === true, redirects: Number.isInteger(reply.redirects) ? reply.redirects : 0 };
 }

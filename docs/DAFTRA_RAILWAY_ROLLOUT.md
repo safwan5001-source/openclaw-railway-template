@@ -63,6 +63,13 @@
 2. انسخ **setup key** إلى تطبيق **Passwords** (iOS): Verification Code ← Enter Setup Key (رمز زمني، 6 أرقام، 30 ث).
 3. **احذف `OPERATOR_ENROLLMENT`** وأعد نشر الـ broker. بعدها `/enroll` غير موجود.
 
+### 3.2b جلسة دفترة لتنزيل PDF الرسمي (مرة واحدة، وتتكرر عند انتهاء الجلسة)
+1. على متصفحك (يفضَّل حاسوب): سجّل الدخول إلى دفترة بنفسك. ثم أدوات المطوّر ← Application/Storage ← Cookies ← موقع دفترة ← انسخ قيمة **`OISystem`** (أو سطر `Cookie` كاملًا).
+2. افتح كونسول الـ broker ← **Daftra session** ← الصق القيمة ← أدخل **رمزًا جديدًا** من المصادقة ← حفظ.
+3. اطلب من باشت «هات فاتورة 97900». النتيجة تعيد `download_path` لفتح الملف على الآيفون (بعد تسجيل دخول `/setup`).
+4. عند ظهور `session expired … reconnect it in the operator console` كرّر الخطوات 1–2. زر **Disconnect** يحذف الجلسة فورًا.
+كلمة مرور دفترة لا تُدخل في أي مكان من هذه الخطوات. التفاصيل والمخاطر المتبقية: `docs/DAFTRA_RAILWAY_SERVICE_NOTES.md` (قسم Daftra session).
+
 ### 3.3 خدمة الوكيل (openclaw — الموجودة)
 أضف **فقط**: `DAFTRA_BASE_URL`، `DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081`، `DAFTRA_BROKER_TOKEN` (نفس قيمة `BROKER_AGENT_TOKEN`).
 **احذف** أي `DAFTRA_API_KEY` أو `DAFTRA_WRITE_API_KEY` أو أي سرّ للـ broker من هذه الخدمة، ولا تُنشئ لها `RAILWAY_API_TOKEN`. لا تستخدم متغيرات مرجعية `${{basht-broker.*}}` لأي شيء سوى الرمز أعلاه.
