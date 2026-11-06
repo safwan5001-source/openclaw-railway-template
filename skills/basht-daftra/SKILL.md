@@ -23,11 +23,14 @@ Run `capabilities` first if unsure what is installed. **Never claim an operation
 | Search / page through records | `list <entity> [--query k=v]... [--columns a,b]` (one page, **flagged incomplete**) |
 | Every record, proven complete | `list <entity> --all [--query k=v]...` |
 | One record | `get <entity> <id>` |
+| Credit notes (read-only) | `list credit_notes --all --query client_id=48` or `list credit_notes --query no=00004`; `get credit_notes <internal-id>` |
 | Official Daftra report | `report <name> [--param k=v]...` |
 | Client statement | `statement <client-id> --from YYYY-MM-DD --to YYYY-MM-DD` |
 | Invoice ↔ payment reconciliation | `reconcile-payments <client-id> --from YYYY-MM-DD --to YYYY-MM-DD` |
 
-Entities: `invoices estimates clients suppliers products invoice_payments client_payments expenses purchase_invoices taxes treasuries`.
+Entities: `invoices estimates credit_notes clients suppliers products invoice_payments client_payments expenses purchase_invoices product_categories taxes treasuries`.
+
+**Credit notes:** `credit_notes` uses the documented `CreditNote` model and accepts the official list filters; the visible credit-note number (`no`, e.g. `00004`) must first be resolved from a list response before using the internal record `id` with `get`. Access may be restricted by Daftra's API-key role; do not claim visibility until verified against the tenant. This is GET-only through Broker and does not enable credit-note issuance, edits, deletion or refund.
 Reports: ledger, trial_balance, income_statement, balance_sheet, tax_summary/tax_details/tax_declaration, revenue, payments, expenses_summary/expenses_details, cash_flow, chart_of_accounts, … (`capabilities` lists them all). `--query`/`--param` names are an allowlist taken from the official docs; unknown names are rejected.
 
 **Payment reconciliation (`reconcile-payments`, read-only, `official:false`).** The `invoice_payments` list can omit settlements Daftra applied to an invoice (seen with `client_credit`), so a page-complete list is **not** proof of accounting coverage. Sources, in order: (1) invoices of the period (complete, scope-checked); (2) the client's `invoice_payments` list (complete, no status/date filter); (3) each invoice's **detail** `GET invoices/<id>`, payments read from exactly these three paths — `data.Payment`, `data.InvoicePayment`, `data.Invoice.InvoicePayment` (all three count as ONE source "detail"; the evidence status of each path is in `docs/DAFTRA_INTEGRATION_CONTRACT.md` §6.1, which is the single reference); (4) `GET invoice_payments/<id>` only for payments not corroborated. Never read other paths or infer a payment from a total.
