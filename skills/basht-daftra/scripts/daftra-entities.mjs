@@ -66,6 +66,24 @@ export function isCalendarDate(value) {
   return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
 
+// Strict normalisation of a date VALUE returned by Daftra to ISO YYYY-MM-DD. The same document can carry its date as
+// "2026-10-05" (list) or "05/10/2026" (detail, DD/MM/YYYY). Accepted, nothing else:
+//   YYYY-MM-DD            optionally followed by a time ("T..." or " ...")
+//   DD/MM/YYYY            day first, 2-digit day and month; optionally followed by a time
+// The result must be a real calendar date. Anything else (MM/DD, 2-digit years, other separators, impossible dates, empty,
+// non-strings) returns null: the caller must reject it, never guess. Because DD/MM and MM/DD cannot be told apart for days
+// <= 12, callers compare the normalised value with another source instead of trusting a single reading.
+export function normalizeDaftraDate(value) {
+  if (typeof value !== 'string') return null;
+  const s = value.trim();
+  let m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.exec(s);
+  let iso;
+  if (m) iso = m[1] + '-' + m[2] + '-' + m[3];
+  else if ((m = /^(\d{2})\/(\d{2})\/(\d{4})(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$/.exec(s))) iso = m[3] + '-' + m[2] + '-' + m[1];
+  else return null;
+  return isCalendarDate(iso) ? iso : null;
+}
+
 // Validate and normalise a query-parameter bag against an allowlist.
 export function buildQuery(allowed, query = {}) {
   if (query === null || typeof query !== 'object' || Array.isArray(query)) throw Error('Invalid query');
