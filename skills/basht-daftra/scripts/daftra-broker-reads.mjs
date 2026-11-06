@@ -9,7 +9,7 @@
 // strict regex built from the registry in daftra-entities.mjs and the query is rebuilt with buildQuery() (allowlist + per-key
 // validation), exactly as the in-process reader does.
 import { ENTITIES, REPORTS, buildQuery, buildReportQuery } from './daftra-entities.mjs';
-import { config, pdfUrl, assertPdfBytes, fetchOfficialPdfResponse, pdfResponseProblem, invoiceIsDraft } from './daftra-readonly.mjs';
+import { config, pdfUrl, assertPdfBytes, fetchOfficialPdfResponse, pdfResponseProblem, diagnosePdfResponse, invoiceIsDraft } from './daftra-readonly.mjs';
 import { summariseValidationErrors } from './daftra-errors.mjs';
 
 // Response caps: list/single-record reads 6 MiB (a page is <= 500 rows), reports 16 MiB (single response, no pagination).
@@ -139,8 +139,9 @@ export async function fetchInvoicePdf(id, { env, fetcher = fetch }) {
   let fetched;
   try { fetched = await fetchOfficialPdfResponse(url, { env, fetcher }); } catch (e) { return { status: 502, message: clean(e.message), draft }; }
   const { response, redirects, landedOnLogin } = fetched;
-  const problem = pdfResponseProblem(response, { draft, redirects, landedOnLogin });
-  if (problem) return { status: 502, message: problem, draft };
+  const diagnostic = await diagnosePdfResponse(response, { redirects, landedOnLogin });
+  const problem = diagnostic && pdfResponseProblem(response, { draft, redirects, landedOnLogin, page: diagnostic.page });
+  if (problem) return { status: 502, message: problem, draft, diagnostic };   // diagnostic: status / media type / redirects / page class only
   let bytes;
   try { bytes = await readCapped(response, MAX_PDF); } catch (e) { return { status: 502, message: clean(e.message) }; }
   try { assertPdfBytes(new Uint8Array(bytes)); } catch (e) { return { status: 502, message: clean(e.message) }; }
