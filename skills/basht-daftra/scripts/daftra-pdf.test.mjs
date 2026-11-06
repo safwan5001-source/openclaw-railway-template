@@ -27,22 +27,32 @@ test('html is escaped, RTL, CSP-locked, and says it is NOT an official Daftra do
 });
 
 test('renderReportPdf passes locked-down flags to the runner and cleans up its temp dir', async () => {
-  const before = (await readdir(tmpdir())).filter((n) => n.startsWith('basht-pdf-')).length;
-  let seen;
-  const runner = async (bin, args) => {
-    seen = { bin, args };
-    const html = await readFile(new URL(args.at(-1)), 'utf8');
-    assert.ok(html.includes('كشف حساب العملاء'));
-    await writeFile(args.find((a) => a.startsWith('--print-to-pdf=')).slice(15), '%PDF-1.7\n1 0 obj\n%%EOF\n');
-  };
-  const pdf = await renderReportPdf(report, { runner });
-  assert.equal(pdf.subarray(0, 5).toString(), '%PDF-');
-  for (const flag of ['--headless', '--no-sandbox', '--disable-gpu', '--disable-remote-fonts', '--no-pdf-header-footer', '--host-resolver-rules=MAP * ~NOTFOUND'])
-    assert.ok(seen.args.includes(flag), flag);
-  assert.equal((await readdir(tmpdir())).filter((n) => n.startsWith('basht-pdf-')).length, before);
-  await assert.rejects(renderReportPdf(report, { runner: async () => {} }), /ENOENT/);           // renderer wrote nothing
-  await assert.rejects(renderReportPdf(report, { runner: async (_b, a) => writeFile(a.find((x) => x.startsWith('--print-to-pdf=')).slice(15), '<html>') }), /invalid PDF/);
-  assert.equal((await readdir(tmpdir())).filter((n) => n.startsWith('basht-pdf-')).length, before);
+  // Private TMPDIR: other test files run in parallel processes and also create basht-pdf-* dirs in the shared /tmp,
+  // so counting there is racy. os.tmpdir() reads process.env.TMPDIR at call time.
+  const priv = await mkdtemp(join(tmpdir(), 'pdf-test-'));
+  const oldTmp = process.env.TMPDIR;
+  process.env.TMPDIR = priv;
+  try {
+    let seen;
+    const runner = async (bin, args) => {
+      seen = { bin, args };
+      const html = await readFile(new URL(args.at(-1)), 'utf8');
+      assert.ok(html.includes('كشف حساب العملاء'));
+      await writeFile(args.find((a) => a.startsWith('--print-to-pdf=')).slice(15), '%PDF-1.7\n1 0 obj\n%%EOF\n');
+    };
+    const left = async () => (await readdir(priv)).filter((n) => n.startsWith('basht-pdf-')).length;
+    const pdf = await renderReportPdf(report, { runner });
+    assert.equal(pdf.subarray(0, 5).toString(), '%PDF-');
+    for (const flag of ['--headless', '--no-sandbox', '--disable-gpu', '--disable-remote-fonts', '--no-pdf-header-footer', '--host-resolver-rules=MAP * ~NOTFOUND'])
+      assert.ok(seen.args.includes(flag), flag);
+    assert.equal(await left(), 0);
+    await assert.rejects(renderReportPdf(report, { runner: async () => {} }), /ENOENT/);           // renderer wrote nothing
+    await assert.rejects(renderReportPdf(report, { runner: async (_b, a) => writeFile(a.find((x) => x.startsWith('--print-to-pdf=')).slice(15), '<html>') }), /invalid PDF/);
+    assert.equal(await left(), 0);
+  } finally {
+    if (oldTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmp;
+    await rm(priv, { recursive: true, force: true });
+  }
 });
 
 test('renderReportPdf validates input and reports a missing browser', async () => {
