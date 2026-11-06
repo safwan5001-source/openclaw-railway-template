@@ -266,3 +266,42 @@ test('CLI: reconcile-payments is a read command, validates input and never sends
   await assert.rejects(run(['reconcile-payments', '48', '--from', '2026-11-06', '--to', '2026-10-01'], { env, fetcher: w.fetcher, sleep: noSleep }), /from <= to|valid/);
   await assert.rejects(run(['reconcile-payments', '4x', '--from', '2026-10-01', '--to', '2026-11-06'], { env, fetcher: w.fetcher, sleep: noSleep }), /Invalid client id/);
 });
+
+
+test('fail closed if Daftra ignores the invoice client/date filters; never silently exclude out-of-scope rows', async () => {
+  const good = inv(100, '100.00', '0.00');
+  for (const bad of [
+    inv(101, '10.00', '0.00', { client_id: 49 }),
+    inv(102, '10.00', '0.00', { date: '2026-09-30' }),
+    inv(103, '10.00', '0.00', { date: '2026-11-07' }),
+    inv(104, '10.00', '0.00', { date: null }),
+    inv(105, '10.00', '0.00', { client_id: null }),
+  ]) {
+    const w = world({ invoices: [good, bad], embedded: { 100: [] } });
+    await assert.rejects(R(w), /Invoice list scope mismatch/);
+    assert.equal(w.calls.filter((c) => /\/api2\/invoices\/\d+\.json/.test(c.path)).length, 0, 'reject before reading details');
+    assert.ok(w.calls.every((c) => c.method === 'GET'));
+  }
+});
+
+test('fail closed for invoice whose individual detail contradicts the list client/date', async () => {
+  const i = inv(110, '10.00', '0.00');
+  for (const wrong of [{ client_id: 49 }, { date: '2026-10-16' }]) {
+    const w = world({ invoices: [i], embedded: { 110: [] }, detailHeader: { 110: wrong } });
+    const r = await R(w);
+    assert.equal(one(r, 110).state, 'unresolved');
+    assert.match(one(r, 110).reasons.join(' '), /detail_unavailable.*scope mismatch/);
+    assert.equal(r.accounting_coverage, 'unresolved');
+    assert.ok(w.calls.every((c) => c.method === 'GET'));
+  }
+});
+
+test('matching client and dates at period boundaries remain eligible', async () => {
+  const invoices = [
+    inv(120, '10.00', '0.00', { date: '2026-10-01' }),
+    inv(121, '20.00', '0.00', { date: '2026-11-06' }),
+  ];
+  const r = await R(world({ invoices, embedded: { 120: [], 121: [] } }));
+  assert.deepEqual(r.state_counts, { matched: 2, mismatch: 0, unresolved: 0 });
+  assert.equal(r.accounting_coverage, 'complete');
+});
