@@ -28,10 +28,10 @@ iPhone-only rollout plan (the parent folds them into the PR docs).
    volume /data (existing)                                    volume /broker-data (its OWN volume; one volume per service)
    public domain: existing (Gateway/setup)                    public domain: operator console ONLY, target port 8080
    vars (agent side only):                                    private: http://basht-broker.railway.internal:8081 (never a public domain)
-     DAFTRA_BASE_URL, DAFTRA_API_KEY (READ-only role key)     vars (broker only, never on openclaw):
-     DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081   DAFTRA_BASE_URL, DAFTRA_API_KEY (write-capable key)
+     DAFTRA_BASE_URL (no secret)                              vars (broker only, never on openclaw):
+     DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081   DAFTRA_BASE_URL, DAFTRA_WRITE_API_KEY (the ONLY Daftra credential)
      DAFTRA_BROKER_TOKEN                                          DAFTRA_APPROVAL_SECRET, BROKER_AGENT_TOKEN, OPERATOR_PASSWORD,
-     (NO approval secret, NO write key, NO operator creds)        OPERATOR_TOTP_SEED, DAFTRA_WRITES_ENABLED (leave UNSET)
+     (NO Daftra key of ANY kind, NO approval secret, NO operator creds)        OPERATOR_TOTP_SEED, DAFTRA_WRITES_ENABLED (leave UNSET)
 ```
 
 ## 2. Railway facts relied on (and where they come from)
@@ -83,10 +83,10 @@ Node 24 behaviour (the sandbox had Node 22 and 26); the build on a clean `ubuntu
 1. **New service** from this GitHub repo, branch `feat/basht-daftra-readonly-pdf` (or `main` after merge). Name it exactly **`basht-broker`** (the private DNS name derives from it). Do **not** attach it to the OpenClaw service's volume.
 2. **Variable `RAILWAY_DOCKERFILE_PATH=Dockerfile.broker`** — add it *before the first deploy* (otherwise Railway builds the root Dockerfile = a second OpenClaw).
 3. **Volume**: add a new volume to `basht-broker`, mount path **`/broker-data`**.
-4. **Variables** (paste long random strings from the iOS Passwords generator; ≥ 32 characters for tokens/secrets, ≥ 20 for the password): `DAFTRA_BASE_URL` (`https://<tenant>.daftra.com`), `DAFTRA_API_KEY` (the **write-capable** Daftra key, a *different* key from the agent's read key), `DAFTRA_APPROVAL_SECRET`, `BROKER_AGENT_TOKEN`, `OPERATOR_PASSWORD`, `OPERATOR_TOTP_SEED`, `BROKER_TRUST_PROXY=1` (Railway's proxy sets the client IP header — Fork A's note), and temporarily `OPERATOR_ENROLLMENT=1`. Leave **`DAFTRA_WRITES_ENABLED` unset**.
+4. **Variables** (paste long random strings from the iOS Passwords generator; ≥ 32 characters for tokens/secrets, ≥ 20 for the password): `DAFTRA_BASE_URL` (`https://<tenant>.daftra.com`), `DAFTRA_WRITE_API_KEY` (the broker's **only** Daftra key, restricted by Daftra role to the entities needed; the agent holds no Daftra key at all), `DAFTRA_APPROVAL_SECRET`, `BROKER_AGENT_TOKEN`, `OPERATOR_PASSWORD`, `OPERATOR_TOTP_SEED`, `BROKER_TRUST_PROXY=1` (Railway's proxy sets the client IP header — Fork A's note), and temporarily `OPERATOR_ENROLLMENT=1`. Leave **`DAFTRA_WRITES_ENABLED` unset**.
 5. **Networking**: generate a public domain **for the console port 8080 only** (verify the target port); never create a domain/TCP proxy for 8081.
 6. Deploy; open `https://<domain>/healthz` in Safari → `ok`. Open `/` → login page; log in with the password, open `/enroll`, add the shown setup key to the iOS Passwords app (verification codes), then **remove `OPERATOR_ENROLLMENT`** and redeploy.
-7. On the **openclaw** service add only `DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081` and `DAFTRA_BROKER_TOKEN` (same value as the broker's `BROKER_AGENT_TOKEN`; do not use a `${{basht-broker.*}}` reference for anything else), plus the READ-role `DAFTRA_BASE_URL`/`DAFTRA_API_KEY`. No `RAILWAY_API_TOKEN`, no broker secret.
+7. On the **openclaw** service add only `DAFTRA_BASE_URL` (no secret), `DAFTRA_BROKER_URL=http://basht-broker.railway.internal:8081` and `DAFTRA_BROKER_TOKEN` (same value as the broker's `BROKER_AGENT_TOKEN`; do not use a `${{basht-broker.*}}` reference for anything else). **No Daftra key of any kind** (Daftra API-key roles are per *entity*, not per method, so a "read key" can also write): reads go through the broker. No `RAILWAY_API_TOKEN`, no broker secret.
 8. Merging this branch and redeploying `openclaw` applies the Dockerfile/entrypoint changes (fonts + skill copy) — a production change that needs its own approval; rollback = redeploy the previous deployment in Railway.
 9. Rollback of the broker: stop/delete the `basht-broker` service (its volume holds only proposals/ledger/audit); writes cannot happen without it because the agent has no write key.
 
