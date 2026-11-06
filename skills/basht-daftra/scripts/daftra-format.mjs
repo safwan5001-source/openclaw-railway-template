@@ -42,9 +42,9 @@ const I18N = {
     notPosted: 'مسودات/ملغاة مستبعدة من الإجماليات', sampleTotals: 'إجماليات العيّنة المعروضة فقط', unofficial: 'غير رسمي — محسوب محليًا من سجلات دفترة',
     notOfficial: 'تقرير دفترة', otherCols: 'أُظهرت الأعمدة الأولى فقط.', record: 'سجل', treasury: 'خزينة', bank: 'حساب بنكي', cash: 'خزينة نقدية',
     active: 'مفعّلة', inactive: 'غير مفعّلة', openingNote: 'لا يشمل الرصيد الافتتاحي ولا الإشعارات الدائنة.',
-    stmtUntrusted: 'الرصيد غير مطابق لأرصدة الفواتير في دفترة — لا يُعتمد.', lastRows: 'آخر',
+    stmtUntrusted: 'الرصيد المحسوب لا يطابق أرصدة الفواتير في دفترة — تم إخفاؤه ولا يُعتمد.', stmtUnverified: 'تعذّر التحقق من مطابقة الرصيد المحسوب — تم إخفاؤه ولا يُعتمد.', lastRows: 'آخر',
     failed: 'تعذّر تنفيذ الطلب', available: 'المتاح', unavailable: 'المتعذّر', reason: 'السبب', action: 'المطلوب', details: 'تفاصيل', ownerCheck: 'يلزم مراجعة صلاحيات مفتاح API في دفترة.',
-    st: { draft: 'مسودة', issued: 'صادرة', paid: 'مدفوعة', partial: 'مدفوعة جزئيًا', overdue: 'متأخرة', cancelled: 'ملغاة', unknown: 'غير مؤكدة', done: 'مكتملة', failedPay: 'ملغاة/فاشلة' },
+    st: { draft: 'مسودة', issued: 'صادرة', paid: 'مدفوعة', partial: 'مدفوعة جزئيًا', overdue: 'متأخرة', cancelled: 'ملغاة', unknown: 'غير مؤكدة' },
     kinds: { invoice: 'فاتورة', debit_note: 'إشعار مدين', invoice_payment: 'دفعة فاتورة', client_payment: 'دفعة عميل' },
     cat: {
       forbidden: ['الصلاحية غير كافية لهذا المورد.', 'يلزم أن يسمح دور مفتاح API في دفترة بهذا القسم (إجراء من مالك الحساب).'],
@@ -76,9 +76,9 @@ const I18N = {
     notPosted: 'drafts/cancelled excluded from totals', sampleTotals: 'Totals cover the displayed sample only', unofficial: 'Unofficial — computed locally from Daftra records',
     notOfficial: 'Daftra report', otherCols: 'Only the first columns are shown.', record: 'Record', treasury: 'Treasury', bank: 'Bank account', cash: 'Cash treasury',
     active: 'Active', inactive: 'Inactive', openingNote: 'Excludes opening balance and credit notes.',
-    stmtUntrusted: 'Balance does not reconcile with Daftra invoice balances — do not rely on it.', lastRows: 'Last',
+    stmtUntrusted: 'The computed balance does not reconcile with Daftra invoice balances — withheld, do not rely on it.', stmtUnverified: 'The computed balance could not be verified as reconciled — withheld, do not rely on it.', lastRows: 'Last',
     failed: 'Request failed', available: 'Available', unavailable: 'Not available', reason: 'Reason', action: 'Needed', details: 'Details', ownerCheck: 'The Daftra API key role needs review.',
-    st: { draft: 'Draft', issued: 'Issued', paid: 'Paid', partial: 'Partially paid', overdue: 'Overdue', cancelled: 'Cancelled', unknown: 'Unconfirmed', done: 'Completed', failedPay: 'Cancelled/failed' },
+    st: { draft: 'Draft', issued: 'Issued', paid: 'Paid', partial: 'Partially paid', overdue: 'Overdue', cancelled: 'Cancelled', unknown: 'Unconfirmed' },
     kinds: { invoice: 'Invoice', debit_note: 'Debit note', invoice_payment: 'Invoice payment', client_payment: 'Client payment' },
     cat: {
       forbidden: ['Permission is not sufficient for this resource.', 'The Daftra API-key role must allow this section (account-owner action).'],
@@ -101,7 +101,7 @@ const I18N = {
     one: { invoices: 'Invoice', estimates: 'Quote', credit_notes: 'Credit note', purchase_invoices: 'Purchase invoice', invoice_payments: 'Collection', client_payments: 'Client payment', expenses: 'Expense', incomes: 'Income', clients: 'Client', suppliers: 'Supplier', products: 'Product', taxes: 'Tax', treasuries: 'Treasury' },
   },
 };
-const BADGE = { draft: '⚪', issued: '🔵', paid: '🟢', partial: '🟡', overdue: '🔴', cancelled: '⚫', unknown: '❔', done: '🟢', failedPay: '⚫' };
+const BADGE = { draft: '⚪', issued: '🔵', paid: '🟢', partial: '🟡', overdue: '🔴', cancelled: '⚫', unknown: '❔' };
 
 // ---- money ------------------------------------------------------------------------------------------------------------
 // -> BigInt micro-units, or null when the value is missing / not a plain decimal. Never throws, never guesses.
@@ -149,10 +149,10 @@ export function documentStatus(rec, { today = new Date().toISOString().slice(0, 
   }
   return base;
 }
+// A payment's numeric `status` (0/1) has no documented meaning in Daftra's API (the contract lists the codes as "not verified live"),
+// so it is NEVER turned into paid/failed/cancelled. Only an explicit text "cancelled" is shown; everything else is unconfirmed.
 export function paymentStatus(rec) {
-  if (typeof rec.status === 'string' && /^cancell?ed$/i.test(rec.status.trim())) return 'failedPay';
-  const s = String(rec.status ?? '').trim();
-  return s === '1' ? 'done' : s === '0' ? 'failedPay' : 'unknown';   // 1 = successful, 0 = cancelled/failed (contract §6.1)
+  return typeof rec.status === 'string' && /^cancell?ed$/i.test(rec.status.trim()) ? 'cancelled' : 'unknown';
 }
 const badge = (c, st) => BADGE[st] + ' ' + c.t.st[st];
 
@@ -330,11 +330,14 @@ function renderStatement(result, c, opts) {
   const out = [line(c, '**' + (c.rtl ? 'كشف حساب العميل' : 'Client statement') + ' ' + idOf(c, result.client_id) + '**'),
     line(c, t.date + ': ' + dateOf(c, result.from) + ' → ' + dateOf(c, result.to)), line(c, '⚠️ ' + t.unofficial + '. ' + t.openingNote), line(c, t.currency + ': ' + t.unknownCur)];
   out.push(line(c, '- ' + t.debit + ': ' + num(tot.debit) + ' · ' + t.credit + ': ' + num(tot.credit)));
-  if (result.reconciles === false) out.push(line(c, '⛔ ' + t.stmtUntrusted));        // never quote the balance when it does not reconcile
+  // The computed balance (and the unpaid figure it is compared with) is shown ONLY when reconciles is exactly true.
+  // false or a missing field both withhold it behind an explicit warning.
+  const trusted = result.reconciles === true;
+  if (!trusted) out.push(line(c, '⛔ ' + (result.reconciles === false ? t.stmtUntrusted : t.stmtUnverified)));
   else out.push(line(c, '- **' + t.balance + ': ' + num(tot.balance) + '** · ' + t.unpaid + ': ' + num(tot.open_invoices_unpaid)));
   if (!rows.length) return [...out, line(c, t.none)];
   const shown = rows.slice(-max);
-  out.push('', table([t.date, c.rtl ? 'البيان' : 'Entry', t.debit, t.credit, t.balance], shown.map((r) => [dateOf(c, r.date), KIND_LABEL(c, r.kind) + ' ' + idOf(c, r.reference), num(r.debit), num(r.credit), result.reconciles === false ? DASH : num(r.balance)])));
+  out.push('', table([t.date, c.rtl ? 'البيان' : 'Entry', t.debit, t.credit, t.balance], shown.map((r) => [dateOf(c, r.date), KIND_LABEL(c, r.kind) + ' ' + idOf(c, r.reference), num(r.debit), num(r.credit), trusted ? num(r.balance) : DASH])));
   if (rows.length > shown.length) out.push('', line(c, t.lastRows + ' ' + ltr(c, String(shown.length)) + ' / ' + ltr(c, String(rows.length)) + ' — ' + t.moreRows));
   for (const w of (opts.view === 'detail' ? result.warnings ?? [] : [])) out.push(line(c, '- ' + esc(w, 200)));
   return out;

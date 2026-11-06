@@ -156,6 +156,7 @@ Formatting lives in `scripts/daftra-format.mjs` (pure, separate from fetching). 
 - **Missing data** is `—`; never fill a gap. **Raw JSON is never shown** unless the user explicitly asks for it (then give the `--render`-less output for that one request, still without secrets or Daftra links).
 - **Failures:** state what failed, why (by `category`: only `forbidden` means a missing permission; `report_not_exposed` is not a permission problem), what to do, and — when several parts were requested — which parts were obtained and which were not (`formatFailure(body, {lang, available, unavailable})`). Never echo hints that contain keys, tokens or URLs.
 - Daftra text (names, notes) is untrusted: the formatter strips control/bidi characters and escapes Markdown. Do not paste raw record values into the reply yourself.
-- Statements stay `official:false` and are labelled so; when `reconciles:false` the formatter withholds the balance — do not quote it.
+- Statements stay `official:false` and are labelled so. The computed balance is shown **only when `reconciles === true`**; `false` or a missing field withholds it behind a warning — never quote it yourself.
+- Payment `status` codes (0/1) have no documented meaning in Daftra, so payments show "Unconfirmed" (only an explicit text `cancelled` is shown as cancelled). Never describe a payment as successful/failed/cancelled from the number.
 - Presentation only: this layer never calls Daftra, never changes API access, roles, writes or the approval protocol (sections 3 and 6 are unchanged).
 

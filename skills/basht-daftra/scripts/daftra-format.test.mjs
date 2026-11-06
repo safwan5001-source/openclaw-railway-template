@@ -68,10 +68,7 @@ test('statuses come only from confirmed fields: draft, issued, paid, partial, ov
   assert.equal(st({ summary_total: undefined }), 'unknown');
   assert.equal(st({ summary_total: '0', summary_paid: '0', summary_unpaid: '0' }), 'unknown');
   assert.equal(st({ summary_paid: '0', summary_unpaid: '18100', due_date: 'soon' }), 'issued');  // unparseable due date is ignored
-  assert.equal(paymentStatus({ status: 1 }), 'done');
-  assert.equal(paymentStatus({ status: '0' }), 'failedPay');
-  assert.equal(paymentStatus({}), 'unknown');
-  assert.equal(paymentStatus({ status: 7 }), 'unknown');
+  assert.equal(paymentStatus({ status: 'Cancelled' }), 'cancelled');             // explicit text only
 });
 
 test('status badges and a legend appear in the table, in both languages', () => {
@@ -158,7 +155,6 @@ test('every supported entity renders without JSON and without throwing, in both 
     const g = renderMarkdown('get', entity, { ok: true, record: rec }, { lang, view: 'detail', today: TODAY });
     for (const md of [l, g]) { assert.ok(md.length > 20, entity); noJson(md); }
   }
-  assert.match(renderMarkdown('list', 'invoice_payments', list('invoice_payments', [samples.client_payments]), { lang: 'en' }), /⚫ Cancelled\/failed/);
   assert.match(renderMarkdown('list', 'treasuries', list('treasuries', [samples.treasuries]), { lang: 'en' }), /Bank account/);
   assert.match(renderMarkdown('list', 'taxes', list('taxes', [samples.taxes]), { lang: 'en' }), /15%/);
 });
@@ -248,4 +244,34 @@ test('drafts and cancelled documents are counted but never added to money totals
     inv({ id: 2, no: '2', draft: 1, summary_total: '900', summary_paid: '0', summary_unpaid: '900' }), inv({ id: 3, no: '3', status: 'cancelled', summary_total: '700', summary_paid: '0', summary_unpaid: '700' })]);
   assert.match(md, /Total 100\.00 SAR/); assert.ok(!/1,000|1,700|900\.00 SAR ·/.test(md.split('\n').find((l) => l.startsWith('**Total'))));
   assert.match(md, /2 drafts\/cancelled excluded from totals/);
+});
+
+test('payment status codes have no documented meaning: 0, 1 and anything else are "Unconfirmed", never paid/failed/cancelled', () => {
+  for (const status of [0, '0', 1, '1', 2, 'x', undefined, null]) {
+    assert.equal(paymentStatus({ id: 1, status }), 'unknown', String(status));
+    for (const lang of ['ar', 'en']) {
+      const l = renderMarkdown('list', 'invoice_payments', list('invoice_payments', [{ id: 1, date: '2026-05-02', client_id: 48, amount: '10', currency_code: 'SAR', status }]), { lang });
+      const g = renderMarkdown('get', 'client_payments', { ok: true, record: { id: 1, amount: '10', currency_code: 'SAR', status } }, { lang, view: 'detail' });
+      for (const md of [l, g]) {
+        assert.ok(md.includes(lang === 'ar' ? 'غير مؤكدة' : 'Unconfirmed'), md);
+        assert.ok(!/ملغاة|فاشلة|مكتملة|مدفوعة|Cancelled|failed|Completed|Paid/i.test(md), 'no inferred meaning: ' + md);
+      }
+    }
+  }
+  assert.match(renderMarkdown('list', 'client_payments', list('client_payments', [{ id: 2, amount: '5', status: 'cancelled' }]), { lang: 'en' }), /Cancelled/);
+});
+
+test('statement balance is shown only when reconciles === true; false or a missing field withholds it with a clear warning', () => {
+  const rows = [{ date: '2026-05-01', kind: 'invoice', reference: '1', debit: '10.00', credit: '0.00', balance: '777.00' }];
+  const base = { ok: true, client_id: '48', from: '2026-05-01', to: '2026-05-31', official: false, rows, totals: { debit: '10.00', credit: '0.00', balance: '4,321.00'.replace(',', ''), open_invoices_unpaid: '9876.00' } };
+  const ok = renderMarkdown('statement', '48', { ...base, reconciles: true }, { lang: 'en' });
+  assert.ok(ok.includes('4,321.00') && ok.includes('9,876.00') && ok.includes('777.00'));
+  for (const reconciles of [false, undefined, null, 'true', 1, 'yes']) for (const lang of ['ar', 'en']) {
+    const md = renderMarkdown('statement', '48', { ...base, reconciles }, { lang });
+    assert.ok(!/4,321|9,876|777\.00/.test(md), 'balance withheld for ' + String(reconciles) + ': ' + md);
+    assert.ok(md.includes('⛔') && /withheld|do not rely|مخفي|تم إخفاؤه/.test(md), md);
+    assert.ok(md.includes('10.00'), 'debit/credit totals still shown');
+  }
+  assert.match(renderMarkdown('statement', '48', { ...base, reconciles: false }, { lang: 'en' }), /does not reconcile/);
+  assert.match(renderMarkdown('statement', '48', { ...base }, { lang: 'en' }), /could not be verified/);
 });
