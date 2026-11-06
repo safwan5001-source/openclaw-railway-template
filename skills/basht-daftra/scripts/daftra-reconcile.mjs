@@ -98,22 +98,36 @@ export function mergeObservations(observations) {
       if (seen.size > 1) conflicts.push({ field: f, values: [...seen.entries()].map(([k, srcs]) => ({ value: f === 'amount' ? format(BigInt(k)) : k, sources: [...new Set(srcs)] })) });
       values[f] = seen.size === 1 ? [...seen.keys()][0] : null;
     }
-    // Repeats inside ONE source (same endpoint and path) must be identical in every compared field and in the payment date;
-    // the cross-source comparison above already covers amount / invoice / status / method.
+    // Repeats inside ONE source (same endpoint, any of its paths) must be identical in EVERY decisive field, and a field that is
+    // present in one copy but missing/empty/unparseable in another is a difference (missing values are compared, not skipped).
+    // This is evaluated among the copies of that source only, so the single GET (its own source) can never cancel it.
     const groups = new Map();
     for (const o of rec.observations) { if (!groups.has(o.source)) groups.set(o.source, []); groups.get(o.source).push(o); }
+    const withinFields = new Set();
+    const view = {
+      amount: (o) => (o.amount === null ? null : String(o.amount)), invoice_id: (o) => o.claimed_invoice_id, status: (o) => o.status,
+      method: (o) => o.method, date: (o) => o.date,
+    };
     for (const [k, group] of groups) {
       if (group.length < 2) continue;
-      const dates = new Set(group.map((o) => o.date ?? '(none)'));
-      if (dates.size > 1) conflicts.push({ field: 'date', within: k, values: [...dates].map((d) => ({ value: d, sources: [group[0].source] })) });
+      for (const f of ['amount', 'invoice_id', 'status', 'method', 'date']) {
+        const distinct = new Map();
+        for (const o of group) { const v = view[f](o); const key = v === null || v === undefined ? '\u0000absent' : String(v); if (!distinct.has(key)) distinct.set(key, []); distinct.get(key).push(o.path ?? k); }
+        if (distinct.size > 1) {
+          withinFields.add(f);
+          conflicts.push({ field: f, within_source: true, source: k, values: [...distinct.entries()].map(([key, where]) => ({ value: key === '\u0000absent' ? '(absent)' : (f === 'amount' ? format(BigInt(key)) : key), sources: [k], where: [...new Set(where)] })) });
+        }
+      }
     }
+    // a field that conflicts inside a source has NO merged value: neither copy is preferred
+    for (const f of withinFields) values[f] = null;
     const sources = [...new Set(rec.observations.map((o) => o.source))];
     const duplicates = rec.observations.some((o, i) => rec.observations.findIndex((x) => x.source === o.source) !== i);
     const problems = [...new Set(rec.observations.flatMap((o) => o.problems))];
     const duplicateIn = [...groups.entries()].filter(([, g]) => g.length > 1).map(([k, g]) => k + (g.some((o) => o.path) ? '[' + [...new Set(g.map((o) => o.path))].join(',') + ']' : '') + ' x' + g.length);
     return { id: rec.id, sources, conflicts, duplicate_in_source: duplicates, duplicate_in: duplicateIn, problems, observations: rec.observations,
       amount: values.amount === null ? null : BigInt(values.amount), invoice_id: values.invoice_id, status: values.status, method: values.method,
-      date: rec.observations.find((o) => o.date)?.date ?? null };
+      date: withinFields.has('date') ? null : (rec.observations.find((o) => o.date)?.date ?? null) };
   });
 }
 
@@ -164,7 +178,7 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
   const payments = merged.map((m) => {
     const reasons = [];
     const failedGet = individual.get(m.id)?.error;
-    if (m.conflicts.length) reasons.push('conflict:' + m.conflicts.map((c) => c.field).join('/'));
+    if (m.conflicts.length) reasons.push('conflict:' + [...new Set(m.conflicts.map((c) => c.field))].join('/') + (m.conflicts.some((c) => c.within_source) ? ' (inside one source)' : ''));
     if (m.problems.length) reasons.push(...m.problems);
     const crossChecked = m.sources.includes('individual') || m.sources.filter((s) => s !== 'individual').length >= 2;
     if (!crossChecked) reasons.push('single_source_unverified');
@@ -237,7 +251,7 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
       id, no: str(inv.no), date: normalizeDaftraDate(inv.date), state, reasons,
       evidence: state === 'matched' ? (counted.length ? 'payments_verified_by_id' : 'no_payments_claimed_and_none_found') : null,
       credit_source_unverified: counted.some((p) => p.category === 'client_credit' || p.method === CLIENT_CREDIT_METHOD),
-      classification_complete: counted.every((p) => p.category !== 'unclassified'),
+      classification_complete: state === 'matched' && counted.every((p) => p.category !== 'unclassified'),
       unclassified_payments: counted.filter((p) => p.category === 'unclassified').map((p) => ({ id: p.id, reason: p.classification_reason })),
       payments_paths: ds?.paths ?? [],
       summary_total: total === null ? null : format(total), summary_paid: paid === null ? null : format(paid), summary_unpaid: unpaid === null ? null : format(unpaid),
@@ -283,7 +297,7 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     listing_complete: listComplete === true,
     accounting_coverage: resolved ? 'complete' : 'unresolved',
     coverage_note: 'listing_complete only says every page of the lists was read. accounting_coverage is "complete" only when every invoice\'s summary_paid is explained by payments verified by id across independent sources, with no conflict, missing id or unreadable record.',
-    classification_complete: unclassified.length === 0,
+    classification_complete: rows.length > 0 && rows.every((r) => r.classification_complete) && unclassified.length === 0 && unidentified.length === 0,
     state_counts: stateCounts, totals,
     invoices: rows,
     payments: payments.map((p) => ({ id: p.id, invoice_id: p.invoice_id, candidate_invoices: p.candidate_invoices.length > 1 ? p.candidate_invoices : undefined, amount: p.amount === null ? null : format(p.amount), status: p.status, method: p.method, category: p.category, date: p.date,

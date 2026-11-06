@@ -572,3 +572,126 @@ test('DOCS: SKILL.md and the integration contract list exactly the three payment
     for (const m of mentioned) assert.ok(EMBEDDED_PATHS.includes(m), name + ' mentions an undocumented path ' + m);
   }
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round 2: a repeat that LACKS a decisive field is a difference, not a match. Missing values count.
+
+const ABSENT = { amount: { amount: undefined }, invoice_id: { invoice_id: undefined }, status: { status: undefined }, method: { payment_method: undefined }, date: { date: undefined } };
+const EMPTY = { amount: { amount: '' }, invoice_id: { invoice_id: null }, status: { status: '' }, method: { payment_method: null }, date: { date: '' } };
+const INVALID = { amount: { amount: 'abc' }, date: { date: '31/02/2026' } };
+
+function sameSourceArgs(where, a, b, extra = {}) {
+  const i = inv(300, '100.00', '100.00'); const o = inv(301, '5.00', '0.00');
+  const other = detailOf(o, []);
+  const args = { invoices: [i, o], ...extra };
+  if (where === 'list') { args.listPayments = [a, b]; args.details = { 300: detailOf(i, [a]), 301: other }; }
+  if (where === 'detail') { args.listPayments = [a]; args.details = { 300: detailOf(i, [a, b]), 301: other }; }
+  if (where === 'detail-two-paths') { args.listPayments = [a]; args.details = { 300: detailOf(i, [a], { InvoicePayment: [b] }), 301: other }; }
+  if (where === 'detail-nested-path') { args.listPayments = [a]; args.details = { 300: { payload: { data: { Invoice: { ...i, InvoicePayment: [b] }, Payment: [a] } }, header: i }, 301: other }; }
+  return args;
+}
+const WHERES = ['list', 'detail', 'detail-two-paths', 'detail-nested-path'];
+
+test('SAME-SOURCE MISSING FIELD: a repeat that lacks amount / invoice / status / method / date (absent, null or empty) is a conflict in every order and every source', () => {
+  const full = pay(12000, 300, '100.00', { date: '2026-10-20' });
+  for (const [variantName, variants] of Object.entries({ absent: ABSENT, empty: EMPTY })) {
+    for (const [field, change] of Object.entries(variants)) {
+      for (const where of WHERES) {
+        for (const order of ['full-first', 'missing-first']) {
+          const missing = { ...full, ...change };
+          const [a, b] = order === 'full-first' ? [full, missing] : [missing, full];
+          const r = direct(sameSourceArgs(where, a, b));
+          const label = variantName + ' ' + field + ' / ' + where + ' / ' + order;
+          const p = payment(r, 12000);
+          assert.equal(p.state, 'unresolved', label);
+          assert.ok(p.conflicts?.some((c) => c.field === field && c.within_source === true), label);
+          assert.equal(one(r, 300).state, 'unresolved', label);
+          assert.equal(r.totals.proven_paid, '0.00', label);                   // neither copy is counted
+          assert.equal(r.accounting_coverage, 'unresolved', label);
+        }
+      }
+    }
+  }
+});
+
+test('SAME-SOURCE MISSING FIELD: an unparseable copy (amount "abc", date 31/02/2026) differs from the valid copy too', () => {
+  const full = pay(12001, 300, '100.00', { date: '2026-10-20' });
+  for (const [field, change] of Object.entries(INVALID)) {
+    for (const where of WHERES) {
+      const r = direct(sameSourceArgs(where, full, { ...full, ...change }));
+      const label = field + ' / ' + where;
+      assert.equal(payment(r, 12001).state, 'unresolved', label); assert.ok(payment(r, 12001).conflicts?.some((c) => c.field === field), label);
+      assert.equal(r.totals.proven_paid, '0.00', label);
+    }
+  }
+});
+
+test('SAME-SOURCE MISSING FIELD: the single GET can never cancel a conflict that exists inside the original source', () => {
+  const full = pay(12002, 300, '100.00', { date: '2026-10-20' });
+  for (const field of Object.keys(ABSENT)) {
+    for (const where of WHERES) {
+      const missing = { ...full, ...ABSENT[field] };
+      // the single GET returns the complete record, identical to the full copy (and, separately, to the incomplete one)
+      for (const individualRecord of [full, missing]) {
+        const r = direct(sameSourceArgs(where, full, missing, { individual: { 12002: individualRecord } }));
+        const label = field + ' / ' + where + ' / individual=' + (individualRecord === full ? 'full' : 'missing');
+        assert.equal(payment(r, 12002).state, 'unresolved', label); assert.equal(one(r, 300).state, 'unresolved', label);
+        assert.ok(payment(r, 12002).sources.includes('individual'), label);
+        assert.ok(payment(r, 12002).conflicts.some((c) => c.field === field && c.within_source === true), label);
+        assert.equal(r.totals.proven_paid, '0.00', label);
+      }
+    }
+  }
+});
+
+test('SAME-SOURCE MISSING FIELD: through the orchestrator (real fetch path) a list/detail repeat with a missing field stays unresolved even though the single GET is complete', async () => {
+  const full = pay(12003, 310, '100.00', { date: '2026-10-20' });
+  for (const field of Object.keys(ABSENT)) {
+    const missing = { ...full, ...ABSENT[field] };
+    const w = world({ invoices: [inv(310, '100.00', '100.00')], list: [full], embedded: { 310: [full, missing] }, singles: { 12003: full } });
+    const r = await R(w);
+    assert.equal(one(r, 310).state, 'unresolved', field); assert.equal(payment(r, 12003).state, 'unresolved', field);
+    assert.deepEqual(singleGets(w), ['12003'], field);                              // it WAS consulted, and it did not rescue the payment
+    assert.equal(r.totals.proven_paid, '0.00', field); assert.equal(r.accounting_coverage, 'unresolved', field);
+  }
+});
+
+test('SAME-SOURCE: genuinely identical repeats (all decisive fields present and equal, in any order/path) are still accepted once', () => {
+  const full = pay(12004, 300, '100.00', { date: '2026-10-20' });
+  for (const where of WHERES) {
+    const r = direct(sameSourceArgs(where, full, { ...full }));
+    assert.equal(payment(r, 12004).state, 'verified', where); assert.equal(one(r, 300).state, 'matched', where); assert.equal(r.totals.proven_paid, '100.00', where);
+  }
+  // a different second source that merely lacks a field is NOT a same-source repeat: the list/detail difference is handled by the two-source rule
+  const noMethod = { ...full }; delete noMethod.payment_method;
+  const r = direct({ invoices: [inv(300, '100.00', '100.00')], listPayments: [full], details: { 300: detailOf(inv(300, '100.00', '100.00'), [noMethod]) }, individual: { 12004: full } });
+  assert.equal(payment(r, 12004).state, 'verified');
+});
+
+test('UNKNOWN METHODS never enter cash/bank, and classification_complete reflects that at invoice and report level', () => {
+  const mk = (id, invoice, method) => pay(id, invoice, '10.00', { payment_method: method });
+  const invoices = [inv(320, '20.00', '20.00'), inv(321, '10.00', '10.00'), inv(322, '10.00', '10.00')];
+  const [cash, odd, onlyOdd, bad] = [mk(12100, 320, 'cash'), mk(12101, 320, 'bank_transfer'), mk(12102, 321, 'credit'), mk(12103, 322, 'cash')];
+  const both = (p) => detailOf(invoices.find((i) => String(i.id) === String(p.invoice_id)), [p]);
+  const r = direct({ invoices, listPayments: [cash, odd, onlyOdd, bad], details: { 320: detailOf(invoices[0], [cash, odd]), 321: both(onlyOdd), 322: detailOf(invoices[2], [{ ...bad, amount: '11.00' }]) },
+    individual: { 12100: cash, 12101: odd, 12102: onlyOdd, 12103: bad } });
+  assert.equal(payment(r, 12100).category, 'cash_bank');
+  assert.equal(payment(r, 12101).category, 'unclassified'); assert.equal(payment(r, 12101).classification_reason, 'method_unrecognised:bank_transfer');
+  assert.equal(payment(r, 12102).category, 'unclassified'); assert.equal(payment(r, 12102).classification_reason, 'method_unrecognised:credit');
+  assert.equal(r.totals.proven_cash_bank, '10.00'); assert.equal(r.totals.proven_unclassified, '20.00'); assert.equal(r.totals.proven_client_credit, '0.00');
+  assert.equal(one(r, 320).state, 'matched'); assert.equal(one(r, 320).classification_complete, false); assert.deepEqual(one(r, 320).unclassified_payments, [{ id: '12101', reason: 'method_unrecognised:bank_transfer' }]);
+  assert.equal(one(r, 321).classification_complete, false);
+  // an invoice whose payment is unresolved has no complete classification either
+  assert.equal(one(r, 322).state, 'unresolved'); assert.equal(one(r, 322).classification_complete, false);
+  assert.equal(r.classification_complete, false);
+  // only recognised methods => complete
+  const ok = direct({ invoices: [invoices[0]], listPayments: [cash, mk(12104, 320, 'client_credit')], details: { 320: detailOf(invoices[0], [cash, mk(12104, 320, 'client_credit')]) } });
+  assert.equal(ok.classification_complete, true); assert.equal(one(ok, 320).classification_complete, true); assert.equal(ok.totals.proven_cash_bank, '10.00'); assert.equal(ok.totals.proven_client_credit, '10.00');
+});
+
+test('classification_complete is false whenever any payment of the report is unresolved or has no id', () => {
+  const i = inv(330, '10.00', '10.00'); const p = pay(12200, 330, '10.00');
+  const noId = { invoice_id: 330, amount: '10.00', status: 1, payment_method: 'cash' };
+  const r = direct({ invoices: [i], listPayments: [p], details: { 330: detailOf(i, [p, noId]) } });
+  assert.equal(r.classification_complete, false); assert.equal(one(r, 330).classification_complete, false);
+});
