@@ -22,7 +22,7 @@ import { executeProposal, resolveProposal, WriteRefused } from './daftra-write.m
 import { loadProposal } from './daftra-ledger.mjs';
 import { publicProposal } from './daftra-public.mjs';
 import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
-import { callBrokerService } from './daftra-broker-service-client.mjs';
+import { callBrokerService, createBrokerFetcher, downloadInvoicePdfViaBroker } from './daftra-broker-service-client.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -108,18 +108,30 @@ async function forwardToService(command, a1, a2, flags, env) {
   }
 }
 const SERVICE_COMMANDS = new Set(['propose', 'duplicate', 'show', 'status', 'execute', 'resolve']);
+// Reads in service mode: the agent holds NO Daftra credential (Daftra roles are per entity, not per method, so a key that can
+// read can also write). Every GET goes through the broker's /v1/get; a real key that happens to be in the env is never used.
+const READ_COMMANDS = new Set(['list', 'get', 'report', 'statement', 'pdf', 'export', 'export-report', 'export-statement']);
+const KEYLESS_PLACEHOLDER = 'keyless-service-mode-no-credential';
+const DAFTRA_CREDENTIAL_ENV = ['DAFTRA_API_KEY', 'DAFTRA_API_KEY_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'];
 const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
   'OPERATOR_PASSWORD', 'OPERATOR_TOTP_SEED', 'BROKER_AGENT_TOKEN', 'BROKER_AGENT_TOKEN_PREVIOUS', 'BROKER_STATE_DIR', 'RAILWAY_API_TOKEN', 'RAILWAY_TOKEN'];
 
-export async function run(argv, { env = process.env, fetcher = fetch, sleep } = {}) {
+export async function run(argv, { env = process.env, fetcher = fetch, sleep, brokerFetcher = fetch } = {}) {
   const { positional, flags, query } = parseArgs(argv);
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
   const serviceMode = Boolean(env.DAFTRA_BROKER_URL || env.DAFTRA_BROKER_TOKEN);
+  let serviceReadTarget = null;
   if (serviceMode && env.DAFTRA_BROKER_SOCKET) throw Error('Set only one of DAFTRA_BROKER_SOCKET (local broker) and DAFTRA_BROKER_URL (separate service)');
   if (serviceMode && SERVICE_COMMANDS.has(command)) {
     if (!env.DAFTRA_BROKER_URL || !env.DAFTRA_BROKER_TOKEN) throw Error('Service mode needs both DAFTRA_BROKER_URL and DAFTRA_BROKER_TOKEN');
     return forwardToService(command, a1, a2, flags, env);
+  }
+  if (serviceMode && READ_COMMANDS.has(command)) {
+    if (!env.DAFTRA_BROKER_URL || !env.DAFTRA_BROKER_TOKEN) throw Error('Service mode needs both DAFTRA_BROKER_URL and DAFTRA_BROKER_TOKEN');
+    serviceReadTarget = { url: env.DAFTRA_BROKER_URL, token: env.DAFTRA_BROKER_TOKEN, env, fetcher: brokerFetcher };
+    fetcher = createBrokerFetcher({ url: env.DAFTRA_BROKER_URL, token: env.DAFTRA_BROKER_TOKEN, env, fetcher: brokerFetcher });
+    env = { ...env, DAFTRA_API_KEY: KEYLESS_PLACEHOLDER };            // a real key in the env is NEVER used by the agent
   }
   if (!serviceMode && command === 'status') throw Error('status is only available in service mode (DAFTRA_BROKER_URL); use show');
   if (env.DAFTRA_BROKER_SOCKET && BROKERED.has(command)) return forwardToBroker(command, a1, a2, flags, env);
@@ -132,7 +144,12 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
         writes_enabled: serviceMode ? false : env.DAFTRA_WRITES_ENABLED === '1',
         broker_mode: serviceMode ? 'service' : Boolean(env.DAFTRA_BROKER_SOCKET),
         writes_note: serviceMode ? 'writes are controlled by the broker service and approved by the operator in its console; the agent cannot execute' : undefined,
-        env_warnings: serviceMode ? OPERATOR_ONLY_ENV.filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator/broker secrets must only be held by the broker service') : env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
+        daftra_credentials_on_agent: serviceMode ? DAFTRA_CREDENTIAL_ENV.some((k) => env[k]) : undefined,
+        reads_via_broker: serviceMode ? true : undefined,
+        env_warnings: serviceMode ? [
+          ...DAFTRA_CREDENTIAL_ENV.filter((k) => env[k]).map((k) => k + ' is present in the agent environment. Daftra API-key roles are per ENTITY, not per method: any key that can read can also write, so the agent must hold NO Daftra credential (reads go through the broker; the key is ignored by this CLI but remains a bypass for any other process).'),
+          ...OPERATOR_ONLY_ENV.filter((k) => env[k] && !DAFTRA_CREDENTIAL_ENV.includes(k)).map((k) => k + ' is present in the agent environment: operator/broker secrets must only be held by the broker service'),
+        ] : env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
         duplicate_sources: Object.keys(DUP_SOURCES),
         not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'delete/deactivate/suspend or bulk operations on customers and suppliers', 'customer/supplier portal passwords, notifications, opening balances, custom fields', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],
@@ -165,6 +182,7 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep } = 
     case 'pdf': {
       if (!a1 || !a2) throw Error('Usage: pdf <invoice-id> <file.pdf>');
       await ensureExportsDir(env);
+      if (serviceReadTarget) return { ok: true, ...(await downloadInvoicePdfViaBroker({ id: a1, outPath: safeOutputPath(a2, 'pdf', env), ...serviceReadTarget })) };
       return { ok: true, ...(await downloadInvoicePdf(a1, safeOutputPath(a2, 'pdf', env), env, fetcher)) };
     }
     case 'export': {

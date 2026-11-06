@@ -19,7 +19,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstatSync, mkdirSync } from 'node:fs';
-import { readdir, readFile, stat, appendFile, lstat, writeFile } from 'node:fs/promises';
+import { readdir, readFile, stat, appendFile, lstat, writeFile, open, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { approvalSecret, approvalPhrase, readSecret, resolveCode, tenantOf, macEqual } from './daftra-auth.mjs';
 import { createProposal } from './daftra-proposal.mjs';
@@ -30,6 +30,7 @@ import { publicProposal, safeText } from './daftra-public.mjs';
 import { reviewLines } from './daftra-approve.mjs';
 import { validateRequest } from './daftra-broker.mjs';
 import { createOperatorAuth, constantTimeEqual, totpBase32, otpauthUri } from './daftra-operator-auth.mjs';
+import { validateGet, performGet, validateInvoicePdfRequest, fetchInvoicePdf, BadRead } from './daftra-broker-reads.mjs';
 
 const MAX_API_BODY = 256 * 1024;
 const MAX_FORM_BODY = 16 * 1024;
@@ -37,7 +38,10 @@ const PROPOSAL_FILE = /^prop_[0-9a-f]{16}\.json$/;
 const PROPOSAL_ID = /^prop_[0-9a-f]{16}$/;
 // Headers that only a proxy/edge adds. Private-network calls never carry them; their presence means "came through the public edge".
 const EDGE_HEADER = /^(x-forwarded-.*|forwarded|x-real-ip|x-railway-.*|cf-.*|true-client-ip|x-envoy-.*|x-request-start|via)$/;
-const API_ROUTES = Object.freeze({ '/v1/propose': 'propose', '/v1/propose_duplicate': 'propose_duplicate', '/v1/show': 'show', '/v1/status': 'status' });
+const API_ROUTES = Object.freeze({ '/v1/propose': 'propose', '/v1/propose_duplicate': 'propose_duplicate', '/v1/show': 'show', '/v1/status': 'status', '/v1/get': 'get', '/v1/invoice_pdf': 'invoice_pdf' });
+const READ_CMDS = new Set(['get', 'invoice_pdf']);
+const MAX_PROPOSAL_BYTES = 96 * 1024;            // a stored proposal larger than this is refused (and deleted)
+const MAX_APPROVABLE_BODY = 48 * 1024;           // ... and so is a request body a human could not sensibly review
 
 // ---------------------------------------------------------------------------------------------------------------
 // configuration (never throws: problems become `issues`, which keep the service read-only/unavailable but alive)
@@ -50,7 +54,8 @@ export function loadServiceConfig(env = process.env) {
   let writeKey; try { writeKey = readSecret(env, 'DAFTRA_WRITE_API_KEY') ?? env.DAFTRA_API_KEY; } catch (e) { issues.push('write key unreadable: ' + e.message); }
   need(typeof writeKey === 'string' && writeKey.length >= 8, 'DAFTRA_WRITE_API_KEY (or DAFTRA_API_KEY) is missing');
   let secret; try { secret = approvalSecret(env); } catch (e) { issues.push(e.message); }
-  const tokens = [env.BROKER_AGENT_TOKEN, env.BROKER_AGENT_TOKEN_PREVIOUS].filter((t) => typeof t === 'string' && t.length > 0);
+  const tokens = [env.BROKER_AGENT_TOKEN, env.BROKER_AGENT_TOKEN_PREVIOUS].filter((t) => typeof t === 'string' && t.length >= 32);
+  need(env.BROKER_AGENT_TOKEN_PREVIOUS === undefined || env.BROKER_AGENT_TOKEN_PREVIOUS === '' || (typeof env.BROKER_AGENT_TOKEN_PREVIOUS === 'string' && env.BROKER_AGENT_TOKEN_PREVIOUS.length >= 32), 'BROKER_AGENT_TOKEN_PREVIOUS must be at least 32 characters (or unset)');
   need(typeof env.BROKER_AGENT_TOKEN === 'string' && env.BROKER_AGENT_TOKEN.length >= 32, 'BROKER_AGENT_TOKEN must be at least 32 characters');
   need(typeof env.OPERATOR_PASSWORD === 'string' && env.OPERATOR_PASSWORD.length >= 20, 'OPERATOR_PASSWORD must be at least 20 characters');
   need(typeof env.OPERATOR_TOTP_SEED === 'string' && env.OPERATOR_TOTP_SEED.length >= 32, 'OPERATOR_TOTP_SEED must be at least 32 characters');
@@ -132,7 +137,8 @@ export function createBrokerService(options = {}) {
   const configured = issues.length === 0;
   const secrets = [cfg.writeKey, cfg.secret, env.BROKER_AGENT_TOKEN, env.BROKER_AGENT_TOKEN_PREVIOUS, env.OPERATOR_PASSWORD, env.OPERATOR_TOTP_SEED,
     env.DAFTRA_API_KEY, env.DAFTRA_WRITE_API_KEY].filter((s) => typeof s === 'string' && s.length >= 6);
-  const scrub = (text) => { let out = String(text); for (const s of secrets) out = out.split(s).join('[redacted]'); return out; };
+  const scrub = (text) => { let out = String(text); for (const s of secrets) if (out.includes(s)) out = out.split(s).join('[redacted]'); return out; };
+  const containsSecret = (text) => secrets.some((s) => String(text).includes(s));
   const rawLog = options.log ?? ((line) => console.log(line));
   const log = (obj) => { try { rawLog(scrub(JSON.stringify({ ts: new Date(now()).toISOString(), svc: 'basht-broker', ...obj }))); } catch { /* logging must never break a request */ } };
 
@@ -149,35 +155,72 @@ export function createBrokerService(options = {}) {
   const lastAuditKey = new Map();
 
   // ---- audit (HMAC chain, fail-closed) ------------------------------------------------------------------------
+  // The chain head is CACHED: the whole file is verified at start-up (and every 5 minutes), every append only checks that the
+  // file's last line still carries the cached head (O(1)). Unauthenticated noise is never audited line by line: it is counted
+  // and flushed as ONE `unauth_summary` line per minute, so an attacker cannot grow the log or slow the operator's approvals.
   const auditFile = join(cfg.stateDir, 'audit.jsonl');
   const auditKey = cfg.secret ? createHash('sha256').update('audit-key\n' + cfg.secret).digest() : null;
-  let auditQueue = Promise.resolve();
   const auditMac = (body) => createHmac('sha256', auditKey).update(JSON.stringify(body)).digest('hex');
-  // Verifies the WHOLE chain on every append: a tampered audit log stops further audited actions (and so all approvals).
-  async function lastAuditMac() {
+  const tamper = () => { const e = new Error('Audit chain broken'); e.code = 'AUDIT_TAMPERED'; return e; };
+  let auditHead = null; let auditVerifiedAt = 0; let auditBroken = null; let auditQueue = Promise.resolve();
+  async function verifyAuditChain() {
     let raw = ''; try { raw = await readFile(auditFile, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     let prev = 'genesis';
     for (const line of raw.split('\n').filter(Boolean)) {
-      const { mac, ...body } = JSON.parse(line);
-      if (body.prev !== prev || typeof mac !== 'string' || !macEqual(mac, auditMac(body))) { const e = new Error('Audit chain broken'); e.code = 'AUDIT_TAMPERED'; throw e; }
+      let parsed; try { parsed = JSON.parse(line); } catch { throw tamper(); }
+      const { mac, ...body } = parsed;
+      if (body.prev !== prev || typeof mac !== 'string' || !macEqual(mac, auditMac(body))) throw tamper();
       prev = mac;
     }
     return prev;
   }
+  async function tailMac() {
+    let fh; try { fh = await open(auditFile, 'r'); } catch (e) { if (e.code === 'ENOENT') return 'genesis'; throw e; }
+    try {
+      const { size } = await fh.stat(); if (size === 0) return 'genesis';
+      const len = Math.min(size, 16384); const buf = Buffer.alloc(len);
+      await fh.read(buf, 0, len, size - len);
+      const lines = buf.toString('utf8').split('\n').filter(Boolean);
+      try { return JSON.parse(lines[lines.length - 1]).mac ?? 'broken'; } catch { return 'broken'; }
+    } finally { await fh.close(); }
+  }
+  async function ensureAuditHead() {
+    if (auditBroken) throw auditBroken;
+    try {
+      if (auditHead === null || now() - auditVerifiedAt > 5 * 60_000) { auditHead = await verifyAuditChain(); auditVerifiedAt = now(); }
+      else if ((await tailMac()) !== auditHead) throw tamper();
+    } catch (e) { if (e.code === 'AUDIT_TAMPERED') auditBroken = e; throw e; }
+  }
+  // The queue RECOVERS after a transient I/O error: the failure is reported to the caller of THAT append only.
+  function enqueueAudit(job) { const p = auditQueue.catch(() => {}).then(job); auditQueue = p.catch(() => {}); return p; }
   function audit(event, fields = {}) {
     log({ audit: event, ...fields });
     if (!auditKey) return Promise.resolve();
-    auditQueue = auditQueue.then(async () => {
-      const prev = await lastAuditMac();
-      const body = { ts: new Date(now()).toISOString(), event, ...fields, prev };
-      await appendFile(auditFile, JSON.stringify({ ...body, mac: auditMac(body) }) + '\n', { mode: 0o600 });
+    return enqueueAudit(async () => {
+      await ensureAuditHead();
+      const body = { ts: new Date(now()).toISOString(), event, ...fields, prev: auditHead };
+      const mac = auditMac(body);
+      await appendFile(auditFile, JSON.stringify({ ...body, mac }) + '\n', { mode: 0o600 });
+      auditHead = mac;
     });
-    return auditQueue;
   }
   const auditThrottled = (key, event, fields, everyMs = 60_000) => {
     const t = now(); if (t - (lastAuditKey.get(key) ?? 0) < everyMs) return Promise.resolve();
     lastAuditKey.set(key, t); return audit(event, fields).catch(() => {});
   };
+  // unauthenticated / high-volume events: counters only
+  const agg = new Map(); let aggFlushedAt = now();
+  function flushAgg() {
+    const t = now(); aggFlushedAt = t;
+    if (!agg.size) return Promise.resolve();
+    const counts = Object.fromEntries(agg); agg.clear();
+    return audit('unauth_summary', { counts }).catch(() => {});
+  }
+  function noteEvent(type) {
+    if (!agg.has(type) && agg.size >= 32) return;                       // bounded key space
+    agg.set(type, (agg.get(type) ?? 0) + 1);
+    if (now() - aggFlushedAt >= 60_000) flushAgg();
+  }
   const ipHash = (ip) => createHash('sha256').update('ip\n' + ip).digest('hex').slice(0, 10);
 
   // ---- proposals listing ---------------------------------------------------------------------------------------
