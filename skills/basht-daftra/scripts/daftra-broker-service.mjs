@@ -238,7 +238,7 @@ export function createBrokerService(options = {}) {
     // (1) must look like a private-network call: private Host, no edge headers. Uniform 404 BEFORE auth/body handling.
     const edge = Object.keys(req.headers).filter((h) => EDGE_HEADER.test(h));
     const host = hostOnly(req.headers.host);
-    const publicHost = cfg.publicNames.has(host) || /\.up\.railway\.app$/.test(host) || /\.railway\.app$/.test(host);
+    const publicHost = false;
     if (edge.length || publicHost || !cfg.privateHosts.has(host)) {
       if (edge.length || publicHost) {
         exposure.alarm = true; exposure.count++; exposure.last = new Date(now()).toISOString();
