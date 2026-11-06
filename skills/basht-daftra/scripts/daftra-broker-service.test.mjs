@@ -75,7 +75,7 @@ test('AGENT CLI in service mode: propose/show/status work, execute/resolve do no
     // duplicates go through the service too
     await assert.rejects(run(['duplicate', 'expenses', '3', '--input', '{"date":"2025-03-01"}'], { env: agentEnv }), /source/i);
     // misconfiguration fails closed
-    await assert.rejects(run(['propose', 'sales_invoice', '--input', '{}'], { env: { ...agentEnv, DAFTRA_BROKER_TOKEN: undefined } }), /needs both/);
+    await assert.rejects(run(['propose', 'sales_invoice', '--input', '{}'], { env: { ...agentEnv, DAFTRA_BROKER_TOKEN: undefined } }), /Incomplete service-mode configuration/);
     await assert.rejects(run(['propose', 'sales_invoice', '--input', '{}'], { env: { ...agentEnv, DAFTRA_BROKER_SOCKET: '/tmp/x.sock' } }), /only one of/);
     await assert.rejects(run(['status', 'prop_x'], { env: { DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: 'k' } }), /only available in service mode/);
   } finally { await c.stop(); }

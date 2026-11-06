@@ -7,9 +7,14 @@
 //   - replay    : a monotonically increasing "last accepted time step" is persisted (HMAC-protected). A code can be used
 //                 once; the code that logged you in can never also authorise an approval.
 //   - step-up   : every approve / reject / resolve needs a FRESH code (step > last used).
-//   - throttling: per-client and global failure counters. INVALID attempts are serialised, delayed and, after a few, refused
-//                 for at most 60 s; VALID credentials (password + fresh code) are never refused because of a lock, so an
-//                 unauthenticated flood can slow only itself. Counters are persisted lazily (HMAC-protected).
+//   - throttling: a locked client (or an exhausted anonymous-attempt budget) is refused WITHOUT evaluating password/TOTP, so
+//                 lockouts really limit guessing. Failures are serialised, delayed, and locks never exceed 60 s. Once any
+//                 failure has happened, at most ANON_EVAL_CAP anonymous login/enroll attempts per minute are evaluated at all.
+//   - device    : after a successful login+TOTP the browser receives an HMAC "trusted device" cookie (30 days, revocable via an
+//                 epoch). Its holder is exempt from per-client locks and from the anonymous attempt cap (still needs password +
+//                 a fresh code) but has its OWN failure cap, so a stolen cookie buys at most DEVICE_FAIL_CAP guesses / 10 min.
+//   - form token: the login-form token is STATELESS (timestamp + nonce + HMAC), so anonymous traffic can never evict the
+//                 operator's token; single use is enforced by a small bounded used-nonce set filled only when a token is used.
 //   - sessions  : server-side, random 256-bit ids, 10 min idle / 30 min absolute, new id on login, CSRF token per session.
 import { createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstat, readFile, rename, writeFile, rm } from 'node:fs/promises';
@@ -20,7 +25,14 @@ export const TOTP_PERIOD = 30;
 export const SESSION_IDLE_MS = 10 * 60_000;
 export const SESSION_ABSOLUTE_MS = 30 * 60_000;
 const MAX_SESSIONS = 20;
-const MAX_PRE_TOKENS = 1000;
+const PRE_TTL_MS = 10 * 60_000;
+const MAX_USED_PRE = 5000;
+export const ANON_EVAL_CAP = 6;          // evaluated anonymous login/enroll attempts per minute once any failure has occurred
+const ANON_WINDOW_MS = 60_000;
+export const DEVICE_FAIL_CAP = 10;         // evaluated failures per trusted device per 10 minutes
+const DEVICE_WINDOW_MS = 10 * 60_000;
+export const DEVICE_TTL_MS = 30 * 86_400_000;
+const SESSION_STEPUP_FAIL_CAP = 5;
 const FREE_FAILS = 4;                  // failures allowed before lockout starts
 const LOCK_BASE_MS = 5_000;
 export const LOCK_MAX_MS = 60_000;        // an invalid-credential lock can never exceed a minute
@@ -86,8 +98,14 @@ export function createOperatorAuth(opts) {
   const stateKey = configured ? createHash('sha256').update('state-key\n' + seed).digest() : null;
   const macOf = (obj) => createHmac('sha256', stateKey).update(JSON.stringify(obj)).digest('hex');
   const sessions = new Map();
-  const pre = new Map();
-  let state = { last_step: 0, global: { fails: 0, until: 0 }, clients: {} };
+  const usedPre = new Map();                                  // nonce -> expiry (only tokens that were USED)
+  const preKey = configured ? createHash('sha256').update('pre-key\n' + seed).digest() : null;
+  const deviceSecret = opts.deviceSecret ?? env.DAFTRA_APPROVAL_SECRET ?? null;
+  const deviceKey = configured && deviceSecret ? createHash('sha256').update('device-key\n' + deviceSecret).digest() : null;
+  let state = { last_step: 0, global: { fails: 0, until: 0 }, clients: {}, epoch: 1 };
+  let anonEvals = [];                                         // timestamps of evaluated anonymous attempts (in memory)
+  const deviceFails = new Map();                              // device id -> failure timestamps (in memory)
+  const stats = { evaluated: 0, refused_locked: 0, refused_cap: 0, refused_device_cap: 0 };
   let loaded = false; let broken = null; let writing = Promise.resolve(); let dirty = false; let saveTimer = null;
 
   async function load() {
@@ -102,7 +120,7 @@ export function createOperatorAuth(opts) {
     try {
       const { mac, ...body } = JSON.parse(raw);
       if (typeof mac !== 'string' || mac.length !== 64 || !timingSafeEqual(Buffer.from(mac), Buffer.from(macOf(body)))) throw new Error('mac');
-      state = body;
+      state = { epoch: 1, ...body };
       // Self-heal: a lock is never longer than LOCK_MAX_MS and counters decay, so stale persisted locks are dropped at start.
       const t0 = now();
       for (const rec of [state.global, ...Object.values(state.clients ?? {})]) if (rec && (rec.until ?? 0) - t0 > LOCK_MAX_MS) rec.until = t0 + LOCK_MAX_MS;
@@ -133,14 +151,17 @@ export function createOperatorAuth(opts) {
   // Operator may reset a corrupted state (OPERATOR_STATE_RESET=1): the file is moved aside, and codes of past steps stay dead.
   async function reset() {
     try { await rename(stateFile, stateFile + '.corrupt-' + now()); } catch { /* absent */ }
-    state = { last_step: stepAt(now()), global: { fails: 0, until: 0 }, clients: {} };
+    state = { last_step: stepAt(now()), global: { fails: 0, until: 0 }, clients: {}, epoch: (state.epoch ?? 1) + 1 };   // epoch bump revokes every trusted-device cookie
+    anonEvals = []; deviceFails.clear();
     broken = null; await save();
   }
-  // Break-glass for a lockout: clears every lock/failure counter but NEVER the replay high-water mark.
+  // Break-glass for a lockout: clears every lock/failure counter, revokes every trusted-device cookie (epoch bump), but NEVER
+  // lowers the replay high-water mark.
   async function clearLocks() {
     await load();
     if (broken) return false;
-    state.clients = {}; state.global = { fails: 0, until: 0 };
+    state.clients = {}; state.global = { fails: 0, until: 0 }; state.epoch = (state.epoch ?? 1) + 1;
+    anonEvals = []; deviceFails.clear();
     await save(); return true;
   }
 
@@ -183,7 +204,71 @@ export function createOperatorAuth(opts) {
   function reap() {
     const t = now();
     for (const [id, s] of sessions) if (t - s.last > SESSION_IDLE_MS || t - s.created > SESSION_ABSOLUTE_MS) sessions.delete(id);
-    for (const [id, exp] of pre) if (exp < t) pre.delete(id);
+    for (const [id, exp] of usedPre) if (exp < t) usedPre.delete(id);
+  }
+
+  // ---- stateless form token: <issued-ms base36>.<nonce>.<hmac>. Anonymous issuance stores NOTHING. ---------------------------
+  const preMac = (ts, nonce) => createHmac('sha256', preKey).update('pre\n' + ts + '\n' + nonce).digest('base64url');
+  function issuePre() {
+    if (!preKey) return '';
+    const ts = now().toString(36); const nonce = randomBytes(12).toString('base64url');
+    return ts + '.' + nonce + '.' + preMac(ts, nonce);
+  }
+  function consumePre(token) {
+    if (!preKey || typeof token !== 'string' || token.length > 200) return false;
+    const parts = token.split('.'); if (parts.length !== 3) return false;
+    const [ts, nonce, mac] = parts;
+    if (!/^[0-9a-z]{6,12}$/.test(ts) || !/^[A-Za-z0-9_-]{16}$/.test(nonce)) return false;
+    const given = Buffer.from(mac); const want = Buffer.from(preMac(ts, nonce));
+    if (given.length !== want.length || !timingSafeEqual(given, want)) return false;
+    const issued = parseInt(ts, 36); const t = now();
+    if (!Number.isFinite(issued) || t - issued > PRE_TTL_MS || issued - t > 60_000) return false;
+    reap();
+    if (usedPre.has(nonce)) return false;                   // single use
+    if (usedPre.size >= MAX_USED_PRE) usedPre.delete(usedPre.keys().next().value);
+    usedPre.set(nonce, issued + PRE_TTL_MS + 60_000);
+    return true;
+  }
+
+  // ---- trusted-device cookie: <id>.<issued-ms base36>.<epoch>.<hmac>; revoked by bumping state.epoch -------------------------
+  const deviceMac = (id, ts, epoch) => createHmac('sha256', deviceKey).update('device\n' + id + '\n' + ts + '\n' + epoch).digest('base64url');
+  function mintDevice() {
+    if (!deviceKey) return null;
+    const id = randomBytes(12).toString('base64url'); const ts = now().toString(36); const epoch = String(state.epoch ?? 1);
+    return id + '.' + ts + '.' + epoch + '.' + deviceMac(id, ts, epoch);
+  }
+  // -> device id (string) when the cookie is authentic, current-epoch and unexpired; else null. Needs the state to be loaded.
+  function deviceId(cookie) {
+    if (!deviceKey || typeof cookie !== 'string' || cookie.length > 200) return null;
+    const parts = cookie.split('.'); if (parts.length !== 4) return null;
+    const [id, ts, epoch, mac] = parts;
+    if (!/^[A-Za-z0-9_-]{16}$/.test(id) || !/^[0-9a-z]{6,12}$/.test(ts) || !/^[0-9]{1,6}$/.test(epoch)) return null;
+    const given = Buffer.from(mac); const want = Buffer.from(deviceMac(id, ts, epoch));
+    if (given.length !== want.length || !timingSafeEqual(given, want)) return null;
+    if (Number(epoch) !== (state.epoch ?? 1)) return null;
+    const issued = parseInt(ts, 36); const t = now();
+    if (!Number.isFinite(issued) || t - issued > DEVICE_TTL_MS || issued - t > 60_000) return null;
+    return id;
+  }
+  const recentDeviceFails = (id) => { const t = now(); const arr = (deviceFails.get(id) ?? []).filter((x) => t - x < DEVICE_WINDOW_MS); deviceFails.set(id, arr); return arr; };
+  function noteDeviceFail(id) {
+    const arr = recentDeviceFails(id); arr.push(now()); deviceFails.set(id, arr);
+    if (deviceFails.size > 200) deviceFails.delete(deviceFails.keys().next().value);
+  }
+
+  // ---- gate: decide BEFORE any credential is evaluated ---------------------------------------------------------------------
+  // -> null (go ahead; an anonymous attempt has reserved its budget slot) | 429 (refused, nothing evaluated)
+  function gate({ ip, dev, anonymousBudget }) {
+    const t = now();
+    if (dev) { if (recentDeviceFails(dev).length >= DEVICE_FAIL_CAP) { stats.refused_device_cap++; return 429; } return null; }
+    if (lockedUntil(ip) > t) { stats.refused_locked++; return 429; }
+    if (anonymousBudget) {
+      anonEvals = anonEvals.filter((x) => t - x < ANON_WINDOW_MS);
+      const failureSeen = (state.global.fails ?? 0) > 0 && t - (state.global.last ?? 0) < FAIL_DECAY_MS;
+      if (failureSeen && anonEvals.length >= ANON_EVAL_CAP) { stats.refused_cap++; return 429; }
+      anonEvals.push(t);
+    }
+    return null;
   }
 
   return {
@@ -194,35 +279,41 @@ export function createOperatorAuth(opts) {
     totpBase32: () => (configured ? totpBase32(seed) : null),
     checkPassword: (given) => configured && constantTimeEqual(given ?? '', password),
 
-    // Single-use pre-login form tokens (login CSRF).
-    issuePre() { reap(); if (pre.size >= MAX_PRE_TOKENS) pre.delete(pre.keys().next().value); const id = unique(); pre.set(id, now() + SESSION_IDLE_MS); return id; },
-    consumePre(id) { reap(); const ok = typeof id === 'string' && pre.has(id); if (ok) pre.delete(id); return ok; },
+    issuePre, consumePre,
+    deviceValid: (cookie) => deviceId(cookie) !== null,
 
-    // -> { ok:true, session } | { ok:false, status:401|429|503 }.  Uniform failure for password/code/format.
-    // Valid credentials (password + a code newer than any accepted one) are NEVER refused because of a lock/counter.
-    async login({ password: pw, code, ip }) {
+    // -> { ok:true, session, device? } | { ok:false, status:401|429|503 }.  Uniform failure for password/code/format.
+    // A locked client / exhausted anonymous budget is refused WITHOUT evaluating the credentials (so locks really limit guessing).
+    // `device` = the raw trusted-device cookie, if the browser sent one.
+    async login({ password: pw, code, ip, device }) {
       await load();
       if (!configured) return { ok: false, status: 503 };
       if (broken) return { ok: false, status: 503, broken };
+      const dev = deviceId(device);
+      const refused = gate({ ip, dev, anonymousBudget: true });
+      if (refused) return { ok: false, status: refused };
+      stats.evaluated++;
       const pwOk = constantTimeEqual(pw ?? '', password);                // always evaluate both factors
       const step = matchTotp(secret, code, now());
       if (pwOk && step !== null && step > state.last_step) {
         state.last_step = step; await success(ip); await save();
         reap();
         if (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
-        const id = unique(); const s = { id, csrf: unique(), created: now(), last: now(), short: createHash('sha256').update(id).digest('hex').slice(0, 8) };
+        const id = unique(); const s = { id, csrf: unique(), created: now(), last: now(), stepFails: 0, short: createHash('sha256').update(id).digest('hex').slice(0, 8) };
         sessions.set(id, s);
-        return { ok: true, session: s };
+        return { ok: true, session: s, device: dev ? undefined : mintDevice() ?? undefined };
       }
-      if (lockedUntil(ip) > now()) return { ok: false, status: 429 };    // invalid + locked: cheap refusal, not counted again
+      if (dev) noteDeviceFail(dev);
       await penalise(ip); return { ok: false, status: 401 };
     },
-    // Password-only proof used by /enroll (no session is created, nothing but the setup key is revealed).
+    // Password-only proof used by /enroll (no session is created, nothing but the setup key is revealed). Same gating rules.
     async verifyPasswordOnly({ password: pw, ip }) {
       await load();
       if (!configured) return { ok: false, status: 503 };
+      const refused = gate({ ip, dev: null, anonymousBudget: true });
+      if (refused) return { ok: false, status: refused };
+      stats.evaluated++;
       if (constantTimeEqual(pw ?? '', password)) return { ok: true };
-      if (lockedUntil(ip) > now()) return { ok: false, status: 429 };
       await penalise(ip); return { ok: false, status: 401 };
     },
     session(id) {
@@ -231,18 +322,29 @@ export function createOperatorAuth(opts) {
       if (!s) return null;
       s.last = now(); return s;
     },
+    // cheap, side-effect free lookup (used by the pre-auth limiter): does NOT extend the idle timer
+    peekSession(id) { const s = typeof id === 'string' ? sessions.get(id) : undefined; if (!s) return null; const t = now(); return t - s.last > SESSION_IDLE_MS || t - s.created > SESSION_ABSOLUTE_MS ? null : s; },
     logout(id) { sessions.delete(id); },
-    // Fresh code required for an action. The code must be newer than any code ever accepted. A valid fresh code is never refused by a lock.
-    async stepUp({ ip, code }) {
+    // Fresh code required for approve/resolve. The code must be newer than any code ever accepted. A locked client is refused without
+    // evaluation unless it presents a valid trusted-device cookie. `session` (optional) gets its OWN failure cap: after
+    // SESSION_STEPUP_FAIL_CAP wrong codes the session is destroyed (a stolen session cannot be used to guess codes).
+    async stepUp({ ip, code, device, session }) {
       await load();
       if (!configured || broken) return { ok: false, status: 503 };
+      if (session && (session.stepFails ?? 0) >= SESSION_STEPUP_FAIL_CAP) { sessions.delete(session.id); return { ok: false, status: 401, revoked: true }; }
+      const dev = deviceId(device);
+      const refused = gate({ ip, dev, anonymousBudget: false });
+      if (refused) return { ok: false, status: refused };
+      stats.evaluated++;
       const step = matchTotp(secret, code, now());
-      if (step !== null && step > state.last_step) { state.last_step = step; await success(ip); await save(); return { ok: true, step }; }
-      if (lockedUntil(ip) > now()) return { ok: false, status: 429 };
-      await penalise(ip); return { ok: false, status: 401 };
+      if (step !== null && step > state.last_step) { state.last_step = step; await success(ip); await save(); if (session) session.stepFails = 0; return { ok: true, step }; }
+      if (dev) noteDeviceFail(dev);
+      if (session) { session.stepFails = (session.stepFails ?? 0) + 1; if (session.stepFails >= SESSION_STEPUP_FAIL_CAP) sessions.delete(session.id); }
+      await penalise(ip); return { ok: false, status: 401, revoked: session ? !sessions.has(session.id) : undefined };
     },
     sessionCount: () => sessions.size,
     _state: () => state,
+    _stats: () => ({ ...stats }),
   };
 }
 export async function removeStateFile(stateDir) { await rm(join(stateDir, 'operator-state.json'), { force: true }); }

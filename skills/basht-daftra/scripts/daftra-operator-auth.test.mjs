@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, symlink, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { base32Encode, deriveTotpSecret, totpBase32, totpCode, stepAt, matchTotp, otpauthUri, createOperatorAuth, constantTimeEqual, SESSION_IDLE_MS, SESSION_ABSOLUTE_MS, LOCK_MAX_MS } from './daftra-operator-auth.mjs';
+import { base32Encode, deriveTotpSecret, totpBase32, totpCode, stepAt, matchTotp, otpauthUri, createOperatorAuth, constantTimeEqual, SESSION_IDLE_MS, SESSION_ABSOLUTE_MS, LOCK_MAX_MS, DEVICE_TTL_MS } from './daftra-operator-auth.mjs';
 
 const PW = 'correct horse battery staple 42'; const SEED = 'totp-seed-0123456789-0123456789-0123456789-abcdef';
 const T0 = Date.UTC(2026, 10, 6, 12, 0, 5);
 async function mk(over = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'basht-oa-')); const clock = { t: T0 };
-  const make = () => createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED, OPERATOR_FAIL_DELAY_MS: '0', ...over }, stateDir: dir, now: () => clock.t });
+  const make = () => createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED, OPERATOR_FAIL_DELAY_MS: '0', DAFTRA_APPROVAL_SECRET: 'approval-secret-for-tests-0123456789-abcdef', ...over }, stateDir: dir, now: () => clock.t });
   return { dir, clock, make, auth: make(), done: () => rm(dir, { recursive: true, force: true }) };
 }
 const code = (clock, off = 0) => totpCode(deriveTotpSecret(SEED), stepAt(clock.t) + off);
@@ -78,21 +78,29 @@ test('REPLAY: a code works once, the login code never authorises a step-up, olde
 
 const BAD = { password: 'wrong'.repeat(6), code: '000000' };
 
-test('LOCKOUT: invalid attempts get locked (<= 60 s), VALID credentials are NEVER refused because of a lock, locks persist across restart', async () => {
+test('LOCKOUT: a locked client is refused WITHOUT evaluating credentials (even the right ones), locks persist across restart, a trusted device is exempt', async () => {
   const m = await mk();
   try {
+    const first = await m.auth.login({ password: PW, code: code(m.clock), ip: 'dev-ip' });          // the operator's first login: issues the trusted-device cookie
+    assert.equal(first.ok, true); assert.ok(first.device, 'a trusted-device cookie is issued');
+    m.clock.t += 30_000;
     for (let i = 0; i < 5; i++) assert.equal((await m.auth.login({ ...BAD, ip: '9.9.9.9' })).status, 401);       // the 5th failure starts the lock
-    assert.equal((await m.auth.login({ ...BAD, ip: '9.9.9.9' })).status, 429, 'invalid + locked = cheap refusal');
-    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).ok, true, 'valid credentials are never refused by a lock');
-    // restart: the persisted lock still throttles INVALID attempts from that client
-    for (let i = 0; i < 6; i++) await m.auth.login({ ...BAD, ip: '5.5.5.5' });
+    const evaluated = m.auth._stats().evaluated;
+    assert.equal((await m.auth.login({ ...BAD, ip: '9.9.9.9' })).status, 429, 'invalid + locked = refusal');
+    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).status, 429, 'the RIGHT credentials are refused too while locked (they are not even evaluated)');
+    assert.equal(m.auth._stats().evaluated, evaluated, 'the verifier was never run for locked requests');
+    assert.equal(m.auth.sessionCount(), 1, 'and no session was created');
+    // restart: the persisted lock still refuses that client
     await m.auth.flush();
     const restarted = m.make();
-    assert.equal((await restarted.login({ ...BAD, ip: '5.5.5.5' })).status, 429, 'lock survives a restart');
-    m.clock.t += 31_000;
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '5.5.5.5' })).ok, true);
-    // a quiet client is unaffected by someone else's failures
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '8.8.8.8' })).status, 401, 'same step: replay is dead for everyone (not a lock)');
+    assert.equal((await restarted.login({ ...BAD, ip: '9.9.9.9' })).status, 429, 'lock survives a restart');
+    // the TRUSTED DEVICE (valid cookie) is exempt from the per-client lock: password + fresh code still required
+    m.clock.t += 30_000;
+    const viaDevice = await restarted.login({ password: PW, code: code(m.clock), ip: '9.9.9.9', device: first.device });
+    assert.equal(viaDevice.ok, true, 'device holder logs in despite the lock on its IP');
+    assert.equal(viaDevice.device, undefined, 'an existing device cookie is kept, not re-issued');
+    m.clock.t += 61_000;                                                                         // a lock never exceeds a minute
+    assert.equal((await restarted.login({ ...BAD, ip: '9.9.9.9' })).status, 401, 'lock expired: evaluated again');
   } finally { await m.done(); }
 });
 
@@ -106,8 +114,16 @@ test('LOCKOUT is capped: no failure pattern can lock anyone out for more than a 
     // the e2 scenario: one failure just after each lock expired never reaches an hour-long lock
     for (let i = 0; i < 12; i++) { m.clock.t = Math.max(m.clock.t, s.global.until) + 1; await m.auth.login({ ...BAD, ip: 'x' }); }
     assert.ok(m.auth._state().global.until - m.clock.t <= LOCK_MAX_MS);
-    // the operator signs in right through all of it
-    m.clock.t += 31_000;
+    // one evaluated failure per minute from the same client for 14 minutes: the failure counter keeps growing (it decays only after 15 quiet minutes)
+    // but every lock is measured right after it was set and may never exceed LOCK_MAX_MS
+    for (let i = 0; i < 14; i++) {
+      m.clock.t += 61_000; await m.auth.login({ ...BAD, ip: 'steady' });
+      const st = m.auth._state(); const longest = Math.max(st.global.until ?? 0, ...Object.values(st.clients).map((c) => c.until ?? 0)) - m.clock.t;
+      assert.ok(longest <= LOCK_MAX_MS, 'failure #' + (i + 1) + ' set a lock of ' + longest + ' ms');
+    }
+    assert.ok(Object.values(m.auth._state().clients).some((c) => c.fails >= 10), 'the counter really did grow past the escalation point');
+    // the attack stopped: once the anonymous budget window has passed the operator signs in
+    m.clock.t += 61_000;
     assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: 'op' })).ok, true);
     // 16 quiet minutes later counters are forgotten
     m.clock.t += 16 * 60_000;
@@ -116,15 +132,17 @@ test('LOCKOUT is capped: no failure pattern can lock anyone out for more than a 
   } finally { await m.done(); }
 });
 
-test('failures are SERIALISED and DELAYED with a bounded queue; valid logins never wait behind them', async () => {
+test('failures are SERIALISED and DELAYED with a bounded queue; a trusted-device login never waits behind them', async () => {
   const m = await mk();
   try {
     const sleeps = []; let release; const gate = new Promise((ok) => { release = ok; });
-    const auth = createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED }, stateDir: m.dir, now: () => m.clock.t, failDelayMs: 100, sleep: async (ms) => { sleeps.push(ms); await gate; } });
+    const env = { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED, DAFTRA_APPROVAL_SECRET: 'approval-secret-for-tests-0123456789-abcdef' };
+    const auth = createOperatorAuth({ env, stateDir: m.dir, now: () => m.clock.t, failDelayMs: 100, sleep: async (ms) => { sleeps.push(ms); await gate; } });
+    const first = await auth.login({ password: PW, code: code(m.clock), ip: 'op0' }); m.clock.t += 30_000;   // establishes the trusted device
     const flood = Array.from({ length: 60 }, (_, i) => auth.login({ ...BAD, ip: 'f' + i }));
     await new Promise((ok) => setTimeout(ok, 30));
     const t0 = Date.now();
-    const ok = await auth.login({ password: PW, code: code(m.clock), ip: 'operator' });          // must not queue behind the flood
+    const ok = await auth.login({ password: PW, code: code(m.clock), ip: 'operator', device: first.device });   // must not queue behind the flood
     assert.equal(ok.ok, true); assert.ok(Date.now() - t0 < 500);
     release(); const results = await Promise.all(flood);
     assert.ok(results.every((r) => r.status === 401 || r.status === 429));
@@ -160,14 +178,18 @@ test('the state write chain RECOVERS after a transient I/O error (no sticky 500s
   } finally { await m.done(); }
 });
 
-test('enrollment proof is password-only, never refused for the right password, throttled for wrong ones, and creates no session', async () => {
+test('enrollment proof is password-only, follows the same lock/budget rules (locked = refused unevaluated), and creates no session', async () => {
   const m = await mk();
   try {
     assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'a' })).ok, true);
     assert.equal(m.auth.sessionCount(), 0);
-    for (let i = 0; i < 6; i++) await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' });
+    for (let i = 0; i < 5; i++) assert.equal((await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' })).status, 401);
+    const evaluated = m.auth._stats().evaluated;
     assert.equal((await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' })).status, 429);
-    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'b' })).ok, true, 'the right password is never refused');
+    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'b' })).status, 429, 'the right password is refused while the client is locked');
+    assert.equal(m.auth._stats().evaluated, evaluated, 'not evaluated');
+    m.clock.t += 61_000;
+    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'b' })).ok, true, 'fine again once the lock expired');
   } finally { await m.done(); }
 });
 
@@ -215,5 +237,17 @@ test('sessions: new id per login, idle and absolute expiry, logout, cap; pre-log
     m.clock.t += SESSION_ABSOLUTE_MS; for (let k = 0; k < 3; k++) { m.clock.t -= SESSION_IDLE_MS - 1; m.auth.session(c.id); }
     m.clock.t += SESSION_ABSOLUTE_MS; assert.equal(m.auth.session(c.id), null);
     const p = m.auth.issuePre(); assert.equal(m.auth.consumePre(p), true); assert.equal(m.auth.consumePre(p), false); assert.equal(m.auth.consumePre('x'), false);
+    const old = m.auth.issuePre(); m.clock.t += 11 * 60_000; assert.equal(m.auth.consumePre(old), false, 'form token expires after 10 minutes');
+  } finally { await m.done(); }
+});
+
+test('trusted-device cookie: signed, epoch-bound, expires after DEVICE_TTL_MS, and a cookie from the future is refused', async () => {
+  const m = await mk();
+  try {
+    const r = await m.auth.login({ password: PW, code: code(m.clock), ip: 'op' }); assert.equal(r.ok, true); assert.ok(r.device);
+    assert.equal(m.auth.deviceValid(r.device), true);
+    m.clock.t += DEVICE_TTL_MS - 1000; assert.equal(m.auth.deviceValid(r.device), true, 'still valid just before the TTL');
+    m.clock.t += 2000; assert.equal(m.auth.deviceValid(r.device), false, 'expired after DEVICE_TTL_MS');
+    m.clock.t -= DEVICE_TTL_MS + 2000 + 120_000; assert.equal(m.auth.deviceValid(r.device), false, 'a cookie issued in the future is refused');
   } finally { await m.done(); }
 });

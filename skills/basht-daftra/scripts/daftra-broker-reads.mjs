@@ -11,7 +11,11 @@
 import { ENTITIES, REPORTS, buildQuery } from './daftra-entities.mjs';
 import { config, pdfUrl, assertPdfBytes } from './daftra-readonly.mjs';
 
-export const MAX_GET_RESPONSE = 16 * 1024 * 1024;
+// Response caps: list/single-record reads 6 MiB (a page is <= 500 rows), reports 16 MiB (single response, no pagination).
+export const MAX_LIST_RESPONSE = 6 * 1024 * 1024;
+export const MAX_REPORT_RESPONSE = 16 * 1024 * 1024;
+export const MAX_GET_RESPONSE = MAX_REPORT_RESPONSE;
+export const MAX_LIMIT = 500;                       // page size clamp: bigger pages only stall the event loop
 export const MAX_PDF = 20 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
@@ -44,7 +48,9 @@ export function validateGet(body) {
   let m;
   if ((m = LIST_RE.exec(path))) {
     const spec = ENTITY_BY_PATH.get(m[1]);
-    return { path, kind: 'list', name: m[1], search: guardedQuery(spec.params, rawQuery) };
+    const search = guardedQuery(spec.params, rawQuery);
+    if (search.has('limit') && Number(search.get('limit')) > MAX_LIMIT) search.set('limit', String(MAX_LIMIT));   // clamp (fetchAll's pageSize is <= 500)
+    return { path, kind: 'list', name: m[1], search };
   }
   if ((m = ONE_RE.exec(path))) {
     if (Object.keys(rawQuery).length) throw new BadRead('A single-record read takes no query');
@@ -97,7 +103,7 @@ export async function performGet(validated, { env, fetcher = fetch }) {
     try { await response.body?.cancel?.(); } catch { /* ignore */ }
     return { status, body: null, retry_after: Number.isFinite(ra) && ra >= 0 ? Math.min(ra, 10) : undefined };
   }
-  const raw = await readCapped(response, MAX_GET_RESPONSE);
+  const raw = await readCapped(response, validated.kind === 'report' ? MAX_REPORT_RESPONSE : MAX_LIST_RESPONSE);   // size guard BEFORE JSON.parse
   let json = null; try { json = JSON.parse(raw.toString('utf8')); } catch { /* not JSON */ }
   if (status >= 200 && status < 300) {
     if (json === null) return { status: 502, body: null, message: 'Upstream returned non-JSON content' };

@@ -150,7 +150,7 @@ export function createBrokerService(options = {}) {
   };
   const writesEnabled = () => configured && cfg.writesEnabled;
 
-  const auth = createOperatorAuth({ env, stateDir: cfg.stateDir, now });
+  const auth = createOperatorAuth({ env, stateDir: cfg.stateDir, now, deviceSecret: cfg.secret });
   const exposure = { alarm: false, count: 0, last: null };
   const lastAuditKey = new Map();
 
@@ -214,18 +214,31 @@ export function createBrokerService(options = {}) {
     const t = now(); if (t - (lastAuditKey.get(key) ?? 0) < everyMs) return Promise.resolve();
     lastAuditKey.set(key, t); return audit(event, fields).catch(() => {});
   };
-  // unauthenticated / high-volume events: counters only
-  const agg = new Map(); let aggFlushedAt = now();
+  // unauthenticated / high-volume events: counters only. Each summary line also carries the top peer hashes (and their counts), so an
+  // attack leaves a trail without one line per request. Agent reads are logged to stdout once a minute as {entity, hash-of-request, n}.
+  const agg = new Map(); const aggPeers = new Map(); const readLog = new Map(); let aggFlushedAt = now();
   function flushAgg() {
     const t = now(); aggFlushedAt = t;
-    if (!agg.size) return Promise.resolve();
+    if (readLog.size) {
+      const reads = [...readLog.values()].sort((x, y) => y.n - x.n).slice(0, 50); readLog.clear();
+      log({ event: 'agent_reads', reads });
+    }
+    if (!agg.size) { aggPeers.clear(); return Promise.resolve(); }
     const counts = Object.fromEntries(agg); agg.clear();
-    return audit('unauth_summary', { counts }).catch(() => {});
+    const top_peers = [...aggPeers].sort((x, y) => y[1] - x[1]).slice(0, 5).map(([peer, n]) => ({ peer, n })); aggPeers.clear();
+    return audit('unauth_summary', { counts, top_peers }).catch(() => {});
   }
-  function noteEvent(type) {
-    if (!agg.has(type) && agg.size >= 32) return;                       // bounded key space
+  function noteEvent(type, peer) {
+    if (!agg.has(type) && agg.size >= 128) return;                      // bounded key space (event names come from fixed sets)
     agg.set(type, (agg.get(type) ?? 0) + 1);
+    if (peer) { const h = ipHash(peer); if (aggPeers.has(h) || aggPeers.size < 64) aggPeers.set(h, (aggPeers.get(h) ?? 0) + 1); }
     if (now() - aggFlushedAt >= 60_000) flushAgg();
+  }
+  function noteRead(v) {
+    noteEvent('agent_get:' + v.name);
+    const h = createHash('sha256').update(v.path + '?' + v.search.toString()).digest('hex').slice(0, 10);
+    const key = v.name + '|' + h;
+    if (readLog.has(key)) readLog.get(key).n++; else if (readLog.size < 200) readLog.set(key, { entity: v.name, h, n: 1 });
   }
   const ipHash = (ip) => createHash('sha256').update('ip\n' + ip).digest('hex').slice(0, 10);
 
@@ -293,23 +306,34 @@ export function createBrokerService(options = {}) {
   };
   const perMin = Number(env.BROKER_RATE_PER_MIN) > 0 ? Number(env.BROKER_RATE_PER_MIN) : 60;
   const getPerMin = Number(env.BROKER_GET_PER_MIN) > 0 ? Number(env.BROKER_GET_PER_MIN) : 300;
-  const getConcurrency = Number(env.BROKER_GET_CONCURRENCY) > 0 ? Number(env.BROKER_GET_CONCURRENCY) : 4;
+  const getConcurrency = Number(env.BROKER_GET_CONCURRENCY) > 0 ? Number(env.BROKER_GET_CONCURRENCY) : 2;
   let getInflight = 0;
   // Pre-auth limiter (token bucket per PEER SOCKET ADDRESS + one global bucket) in front of BOTH listeners. It uses the socket
   // address, never X-Real-IP, so a caller on the private network cannot rotate buckets by spoofing a header.
-  function makeLimiter({ perPeerRps, burst, globalRps, globalBurst, maxPeers = 2000 }) {
-    const peers = new Map(); const g = { tokens: globalBurst, last: Date.now() };
-    const take = (b, rps, cap, t) => { b.tokens = Math.min(cap, b.tokens + ((t - b.last) / 1000) * rps); b.last = t; if (b.tokens < 1) return false; b.tokens -= 1; return true; };
-    return (peer) => {
+  // Order matters: the PER-PEER bucket is charged first and the GLOBAL bucket only for requests that passed it, so one hostile peer is
+  // throttled by its own bucket and can never drain the global one by itself. Requests of a logged-in operator (valid session cookie)
+  // have their own sane bucket and are exempt from the global ANONYMOUS bucket; health checks are exempt from the global bucket too
+  // (a drained bucket must never make Railway think the service is down).
+  function makeLimiter({ perPeerRps, burst, globalRps, globalBurst, maxPeers = 2000, sessionRps = 20, sessionBurst = 60, coarseRps = 0 }) {
+    const peers = new Map(); const coarse = new Map(); const sess = new Map(); const g = { tokens: globalBurst, last: Date.now() };
+    const take = (b, r, cap, t) => { b.tokens = Math.min(cap, b.tokens + ((t - b.last) / 1000) * r); b.last = t; if (b.tokens < 1) return false; b.tokens -= 1; return true; };
+    const bucketFor = (map, key, cap, t) => {
+      let b = map.get(key);
+      if (!b) { if (map.size >= maxPeers) map.delete(map.keys().next().value); b = { tokens: cap, last: t }; map.set(key, b); }
+      else { map.delete(key); map.set(key, b); }                          // LRU
+      return b;
+    };
+    return (peer, { session, socket, health } = {}) => {
       const t = Date.now();
-      let b = peers.get(peer);
-      if (!b) { if (peers.size >= maxPeers) peers.delete(peers.keys().next().value); b = { tokens: burst, last: t }; peers.set(peer, b); }
-      else { peers.delete(peer); peers.set(peer, b); }                 // LRU
-      return take(g, globalRps, globalBurst, t) && take(b, perPeerRps, burst, t);
+      if (!take(bucketFor(peers, peer, burst, t), perPeerRps, burst, t)) return false;
+      if (coarseRps && socket && !take(bucketFor(coarse, socket, coarseRps * 2, t), coarseRps, coarseRps * 2, t)) return false;
+      if (health) return true;
+      if (session) return take(bucketFor(sess, session, sessionBurst, t), sessionRps, sessionBurst, t);
+      return take(g, globalRps, globalBurst, t);
     };
   }
   const rps = Number(env.BROKER_PREAUTH_RPS) > 0 ? Number(env.BROKER_PREAUTH_RPS) : 50;
-  const publicLimiter = makeLimiter({ perPeerRps: rps, burst: rps * 2, globalRps: rps * 4, globalBurst: rps * 8 });
+  const publicLimiter = makeLimiter({ perPeerRps: rps, burst: rps * 2, globalRps: rps * 4, globalBurst: rps * 8, coarseRps: rps * 10 });
   const privateLimiter = makeLimiter({ perPeerRps: rps * 2, burst: rps * 4, globalRps: rps * 4, globalBurst: rps * 8 });
   const proposePerMin = Number(env.BROKER_PROPOSE_PER_MIN) > 0 ? Number(env.BROKER_PROPOSE_PER_MIN) : 10;
   const maxPending = Number(env.BROKER_MAX_PENDING) > 0 ? Number(env.BROKER_MAX_PENDING) : 20;
@@ -341,7 +365,7 @@ export function createBrokerService(options = {}) {
         exposure.alarm = true; exposure.count++; exposure.last = new Date(now()).toISOString();
         log({ level: 'ALERT', alert: 'PRIVATE_API_REACHABLE_VIA_PUBLIC_DOMAIN', edge_headers: edge.slice(0, 5), host: safeText(host).slice(0, 80) });
         auditThrottled('exposure', 'private_api_via_public', { host: safeText(host).slice(0, 80), edge: edge.slice(0, 5) });
-      } else noteEvent('private_api_bad_host');
+      } else noteEvent('private_api_bad_host', peer);
       return notFound(res);
     }
     // (2) method / route / content type
@@ -351,12 +375,12 @@ export function createBrokerService(options = {}) {
     if (req.method !== 'POST') return jsonReply(res, 405, { ok: false, error: 'Method not allowed' });
     // (3) bearer token (constant time, exactly one Authorization header)
     const authHeaders = []; for (let i = 0; i < req.rawHeaders.length; i += 2) if (req.rawHeaders[i].toLowerCase() === 'authorization') authHeaders.push(req.rawHeaders[i + 1]);
-    if (!hit('authfail:' + peer, 30)) { noteEvent('agent_auth_flood'); return jsonReply(res, 429, { ok: false, error: 'Too many requests', refused: 'RATE_LIMIT' }); }
+    if (!hit('authfail:' + peer, 30)) { noteEvent('agent_auth_flood', peer); return jsonReply(res, 429, { ok: false, error: 'Too many requests', refused: 'RATE_LIMIT' }); }
     const m = authHeaders.length === 1 ? /^Bearer ([^\s]{1,512})$/.exec(authHeaders[0]) : null;
     const given = m ? createHash('sha256').update(m[1]).digest() : null;
     let okToken = false; let matchedIndex = -1;
     tokenDigests.forEach((d, i) => { if (given && timingSafeEqual(d, given)) { okToken = true; matchedIndex = i; } });
-    if (!okToken) { noteEvent('agent_auth_failed'); return jsonReply(res, 401, { ok: false, error: 'Unauthorized', refused: 'UNAUTHORIZED' }); }
+    if (!okToken) { noteEvent('agent_auth_failed', peer); return jsonReply(res, 401, { ok: false, error: 'Unauthorized', refused: 'UNAUTHORIZED' }); }
     rate.delete('authfail:' + peer);
     const isRead = READ_CMDS.has(cmd);
     if (isRead) {
@@ -426,7 +450,7 @@ export function createBrokerService(options = {}) {
     try {
       if (cmd === 'get') {
         const v = validateGet(body);
-        noteEvent('agent_get');
+        noteEvent('agent_get'); noteRead(v);
         let result;
         try { result = await performGet(v, { env: brokerEnv, fetcher }); }
         catch (e) { if (e instanceof BadRead) throw e; result = { status: 502, body: null, message: 'Upstream unreachable' }; }
@@ -484,6 +508,8 @@ export function createBrokerService(options = {}) {
     + '<button type="submit">Sign in / دخول</button></form>' + (env.OPERATOR_ENROLLMENT === '1' ? '<p><a href="/enroll">Enroll authenticator / تسجيل المصادقة</a></p>' : '');
 
   const cookieAttrs = '; Path=/; Secure; HttpOnly; SameSite=Strict';
+  const deviceCookie = (value) => '__Host-bdev=' + value + cookieAttrs + '; Max-Age=2592000';
+  const deviceOf = (req) => parseCookies(req.headers.cookie)['__Host-bdev'];
   const sessionCookie = (id, maxAgeSec) => '__Host-bsess=' + id + cookieAttrs + '; Max-Age=' + maxAgeSec;
 
   async function sessionOf(req) {
@@ -516,6 +542,7 @@ export function createBrokerService(options = {}) {
     const nav = pages > 1 ? '<p>' + (pg > 1 ? '<a href="/console?page=' + (pg - 1) + '">← Newer</a> ' : '') + 'Page ' + pg + '/' + pages + (pg < pages ? ' <a href="/console?page=' + (pg + 1) + '">Older →</a>' : '') + '</p>' : '';
     htmlA(res, 200, 'Console', '<h1>Awaiting approval / بانتظار الاعتماد (' + pending.length + ')</h1>' + pendingHtml + nav
       + '<h2>Recent / الأحدث</h2>' + (rows.join('') || '<p>—</p>')
+      + (pending.length ? '<form method="post" action="/console/reject_all"><input type="hidden" name="csrf" value="' + esc(session.csrf) + '"><button class="danger" type="submit">Reject ALL ' + pending.length + ' pending / رفض الكل (no code needed)</button></form>' : '')
       + '<form method="post" action="/logout"><input type="hidden" name="csrf" value="' + esc(session.csrf) + '"><button class="ghost">Sign out / خروج</button></form>');
   }
 
@@ -533,11 +560,32 @@ export function createBrokerService(options = {}) {
     if (canDecide && writesEnabled()) {
       actions += '<form method="post" action="/proposal/' + esc(p.id) + '/approve">' + csrf + codeField + '<button type="submit">APPROVE &amp; SEND to Daftra / اعتماد وإرسال</button></form>';
     } else if (canDecide) actions += '<div class="warn">Approval disabled: writes are off on this service.</div>';
-    if (canDecide) actions += '<form method="post" action="/proposal/' + esc(p.id) + '/reject">' + csrf + codeField + '<button class="danger" type="submit">Reject / رفض</button></form>';
+    if (canDecide) actions += '<form method="post" action="/proposal/' + esc(p.id) + '/reject">' + csrf + '<button class="danger" type="submit">Reject / رفض (no code needed)</button></form>';
     if (canResolve) actions += '<h2>Ambiguous outcome / نتيجة غير مؤكدة</h2><p>Check Daftra, then record what happened.</p><form method="post" action="/proposal/' + esc(p.id) + '/resolve">' + csrf
       + '<select name="created"><option value="false">NOT created in Daftra / لم يُنشأ</option><option value="true">Created in Daftra / أُنشئ</option></select><input name="record_id" inputmode="numeric" maxlength="15" placeholder="record id (optional)">' + codeField + '<button class="danger" type="submit">Record decision / تسجيل</button></form>';
     htmlA(res, 200, 'Proposal', (message ? '<div class="' + kind + '">' + esc(message) + '</div>' : '') + '<h1>Review / مراجعة</h1><p><b>' + esc(outcome) + '</b></p><pre>' + reviewLines(p).map((l) => esc(l)).join('\n') + '</pre>'
       + '<p>Request hash: <code class="dyn">' + esc(p.request_hash) + '</code></p>' + actions + '<p><a href="/console">← Back</a></p>');
+  }
+
+  // Declines every live pending proposal at once (session + CSRF only): junk flooded by a compromised agent is cleared in one tap.
+  async function rejectAll(req, res, session) {
+    let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
+    if (!sameOrigin(req) || !csrfOk(session, form)) { audit('csrf_rejected', { id: 'reject_all' }).catch(() => {}); return textReply(res, 403, 'Forbidden'); }
+    if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
+    let n = 0; const actor = 'operator:' + session.short;
+    for (const id of pendingIds()) {
+      if (busy.has(id)) continue;
+      busy.add(id);
+      try {
+        const p = await loadProposal(id, brokerEnv);
+        if (outcomeOf(p) !== 'pending_operator_approval') continue;
+        if (!(await acquireLock(brokerEnv, p.id + '.claim'))) continue;
+        await updateProposal(p.id, { status: 'DECLINED', approved_by: actor, approved_at: new Date(now()).toISOString() }, brokerEnv);
+        declined.set(p.request_hash, now() + declineTtlMs); n++;
+      } catch { /* an unreadable/tampered file is left for the integrity view */ } finally { busy.delete(id); await indexRefresh(id).catch(() => {}); }
+    }
+    await audit('operator_reject_all', { count: n, session: session.short }).catch(() => {});
+    return htmlA(res, 200, 'Rejected', '<div class="ok">Rejected ' + n + ' proposal(s) — nothing was sent. / تم رفض ' + n + '</div><a href="/console">← Back</a>');
   }
 
   const busy = new Set();
@@ -565,13 +613,20 @@ export function createBrokerService(options = {}) {
         if (!['ambiguous', 'submitting'].includes(ledgerState)) return htmlA(res, 409, 'Not ambiguous', '<div class="warn">This proposal is not awaiting a decision.</div>');
       } else if (outcome !== 'pending_operator_approval') return htmlA(res, 409, 'Not pending', '<div class="warn">This proposal is not pending (' + esc(outcome) + ').</div><a href="' + proposalLink(id) + '">← Back</a>');
       if (action === 'approve' && !writesEnabled()) return htmlA(res, 409, 'Writes disabled', '<div class="bad">Writes are disabled on this service. Nothing was sent.</div>');
-      const su = await auth.stepUp({ ip, code });
-      if (!su.ok) {
-        audit('stepup_failed', { id, action, status: su.status, ip: ipHash(ip), session: session.short }).catch(() => {});
-        return htmlA(res, su.status === 429 ? 429 : su.status === 503 ? 503 : 401, 'Code rejected', '<div class="bad">Code rejected' + (su.status === 429 ? ' — locked out, try later' : '') + '. Wait for a NEW code and retry. / الرمز مرفوض</div><a href="' + proposalLink(id) + '">← Back</a>');
+      // Rejecting is always safe, so it needs only the authenticated session + CSRF (the operator can always clear junk quickly);
+      // approve / resolve need a FRESH single-use authenticator code.
+      let step = null;
+      if (action !== 'reject') {
+        const su = await auth.stepUp({ ip, code, device: deviceOf(req), session });
+        if (!su.ok) {
+          audit('stepup_failed', { id, action, status: su.status, ip: ipHash(ip), session: session.short, revoked: su.revoked === true }).catch(() => {});
+          if (su.revoked) return redirect(res, '/', { 'Set-Cookie': '__Host-bsess=deleted' + cookieAttrs + '; Max-Age=0' });
+          return htmlA(res, su.status === 429 ? 429 : su.status === 503 ? 503 : 401, 'Code rejected', '<div class="bad">Code rejected' + (su.status === 429 ? ' — locked out, try later' : '') + '. Wait for a NEW code and retry. / الرمز مرفوض</div><a href="' + proposalLink(id) + '">← Back</a>');
+        }
+        step = su.step;
       }
       const actor = 'operator:' + session.short;
-      await audit('operator_' + action, { id, hash: p.request_hash.slice(0, 12), step: su.step, session: session.short });     // audit BEFORE acting: tamper/IO failure => nothing happens
+      await audit('operator_' + action, { id, hash: p.request_hash.slice(0, 12), step, session: session.short });     // audit BEFORE acting: tamper/IO failure => nothing happens
       if (action === 'approve') {
         let result;
         try { result = await executeProposal({ id, phrase: approvalPhrase(brokerEnv, p), actor }, { env: brokerEnv, fetcher, now: now() }); }
@@ -619,13 +674,15 @@ export function createBrokerService(options = {}) {
       if (!sameOrigin(req)) return textReply(res, 403, 'Forbidden');
       if (!configured) return html(res, 503, 'BASHT Daftra', '<p>Service unavailable / الخدمة غير متاحة</p>');
       if (!auth.consumePre(form.get('pre'))) return html(res, 400, 'Sign in', loginForm(auth.issuePre(), 'Form expired — try again / انتهت صلاحية النموذج'));
-      const r = await auth.login({ password: form.get('password') ?? '', code: form.get('code') ?? '', ip });
+      const r = await auth.login({ password: form.get('password') ?? '', code: form.get('code') ?? '', ip, device: deviceOf(req) });
       if (!r.ok) {
-        noteEvent('login_failed');
+        noteEvent('login_failed', ip);
         return html(res, r.status, 'Sign in', loginForm(auth.issuePre(), r.status === 429 ? 'Too many attempts — try later / محاولات كثيرة' : r.status === 503 ? 'Unavailable' : 'Invalid credentials / بيانات غير صحيحة'));
       }
-      audit('login_ok', { ip: ipHash(ip), session: r.session.short }).catch(() => {});
-      return redirect(res, '/console', { 'Set-Cookie': sessionCookie(r.session.id, 1800) });
+      await flushAgg();                                     // failures that preceded this success must appear BEFORE it in the audit chain
+      await audit('login_ok', { ip: ipHash(ip), session: r.session.short, device: r.device ? 'issued' : 'presented' }).catch(() => {});
+      const cookies = [sessionCookie(r.session.id, 1800)]; if (r.device) cookies.push(deviceCookie(r.device));
+      return redirect(res, '/console', { 'Set-Cookie': cookies });
     }
     if (path === '/enroll') {
       if (env.OPERATOR_ENROLLMENT !== '1' || !configured || enrollShown) return textReply(res, 404, 'Not Found');   // one successful display per start
@@ -634,7 +691,7 @@ export function createBrokerService(options = {}) {
         let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
         if (!sameOrigin(req) || !auth.consumePre(form.get('pre'))) return textReply(res, 403, 'Forbidden');
         const r = await auth.verifyPasswordOnly({ password: form.get('password') ?? '', ip });
-        if (!r.ok) { noteEvent('enroll_failed'); return html(res, r.status, 'Enroll', '<div class="bad">Invalid / غير صحيح</div>'); }
+        if (!r.ok) { noteEvent('enroll_failed', ip); return html(res, r.status, 'Enroll', '<div class="bad">Invalid / غير صحيح</div>'); }
         if (enrollShown) return textReply(res, 404, 'Not Found');
         enrollShown = true;                                                              // auto-disable: the key is shown ONCE per process start
         await audit('enroll_shown', { ip: ipHash(ip) }).catch(() => {});
@@ -650,9 +707,10 @@ export function createBrokerService(options = {}) {
       auth.logout(session.id); audit('logout', { session: session.short }).catch(() => {});
       return redirect(res, '/', { 'Set-Cookie': '__Host-bsess=deleted' + cookieAttrs + '; Max-Age=0' });
     }
-    if (path === '/console' || path.startsWith('/proposal/')) {
+    if (path === '/console' || path === '/console/reject_all' || path.startsWith('/proposal/')) {
       if (!session) return redirect(res, '/');
       if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
+      if (path === '/console/reject_all') return method === 'POST' ? rejectAll(req, res, session) : textReply(res, 405, 'Method Not Allowed');
       if (method === 'GET' && path === '/console') return consolePage(res, session, Number(url.searchParams.get('page')) || 1);
       const m = /^\/proposal\/(prop_[0-9a-f]{16})(?:\/(approve|reject|resolve))?$/.exec(path);
       if (!m) return textReply(res, 404, 'Not Found');
@@ -664,14 +722,25 @@ export function createBrokerService(options = {}) {
   }
 
   // ---- servers ----------------------------------------------------------------------------------------------
-  const guard = (fn, limiter) => (req, res) => {
+  const guard = (fn, limiter, keyOf) => (req, res) => {
     // global + per-peer pre-auth limiter: refuses BEFORE any parsing, auth, audit or state access
-    if (!limiter(req.socket.remoteAddress ?? 'unknown')) { noteEvent('preauth_rate_limited'); res.writeHead(429, { 'Retry-After': '1', 'Content-Length': 0, Connection: 'close' }); res.end(); return; }
+    const k = keyOf(req);
+    if (!limiter(k.peer, k.opts)) { noteEvent('preauth_rate_limited', k.peer); res.writeHead(429, { 'Retry-After': '1', 'Content-Length': 0, Connection: 'close' }); res.end(); return; }
     fn(req, res).catch((e) => {
       log({ level: 'error', error: scrub(e?.message ?? 'error').slice(0, 200) });
       if (!res.headersSent) { try { res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' }); res.end('Internal error'); } catch { /* closed */ } }
     });
   };
+  // PUBLIC limiter key: the trusted client IP (validated X-Real-IP only when BROKER_TRUST_PROXY=1, else the socket address), a coarse
+  // bucket on the socket address (bounds header-rotation from one source), the operator's session cookie (cheap lookup), health checks.
+  const publicKey = (req) => {
+    const socket = req.socket.remoteAddress ?? 'unknown';
+    const sid = parseCookies(req.headers.cookie)['__Host-bsess'];
+    const session = sid && auth.peekSession(sid) ? sid.slice(0, 16) : undefined;
+    const health = req.method === 'GET' && (req.url === '/healthz' || req.url === '/setup/healthz');
+    return { peer: clientIp(req), opts: { session, socket, health } };
+  };
+  const privateKey = (req) => ({ peer: req.socket.remoteAddress ?? 'unknown', opts: {} });
   const timeouts = options.timeoutsMs ?? {};
   const harden = (s) => {
     s.headersTimeout = timeouts.headers ?? 10_000; s.requestTimeout = timeouts.request ?? 30_000;
@@ -683,8 +752,8 @@ export function createBrokerService(options = {}) {
   };
   // node enforces headersTimeout/requestTimeout only every `connectionsCheckingInterval` (constructor option; default 30 s)
   const serverOptions = { maxHeaderSize: 16384, headersTimeout: timeouts.headers ?? 10_000, requestTimeout: timeouts.request ?? 30_000, connectionsCheckingInterval: timeouts.check ?? 2_000 };
-  const publicServer = harden(http.createServer(serverOptions, guard(handleConsole, publicLimiter)));
-  const privateServer = harden(http.createServer(serverOptions, guard(handleApi, privateLimiter)));
+  const publicServer = harden(http.createServer(serverOptions, guard(handleConsole, publicLimiter, publicKey)));
+  const privateServer = harden(http.createServer(serverOptions, guard(handleApi, privateLimiter, privateKey)));
   const listenOn = (server, port, host) => new Promise((ok, fail) => { server.once('error', fail); server.listen(Number(port), host, () => { server.off('error', fail); ok(server.address()); }); });
 
   async function listen() {

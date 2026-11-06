@@ -22,9 +22,9 @@ export const T0 = Date.UTC(2026, 10, 6, 12, 0, 5);
 
 export const invoiceInput = { client_id: 4, date: '2025-03-01', items: [{ item: 'Diesel', quantity: '100', unit_price: '2', tax1: 1 }] };
 
-export function rawRequest({ port, host = '127.0.0.1', method = 'GET', path = '/', headers = {}, body, rawBody, timeout = 5000 }) {
+export function rawRequest({ port, host = '127.0.0.1', method = 'GET', path = '/', headers = {}, body, rawBody, timeout = 5000, localAddress }) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host, port, method, path, headers, timeout, setHost: false }, (res) => {
+    const req = http.request({ host, port, method, path, headers, timeout, setHost: false, ...(localAddress ? { localAddress, agent: false } : {}) }, (res) => {
       const chunks = []; res.on('data', (d) => chunks.push(d));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, rawHeaders: res.rawHeaders, text: Buffer.concat(chunks).toString('utf8') }));
     });
@@ -66,18 +66,19 @@ export async function startService({ env: over = {}, fake = new FakeDaftra(), cl
 }
 
 export class Operator {
-  constructor(ctx) { this.ctx = ctx; this.cookie = null; this.csrf = null; }
-  request(method, path, { form, origin = this.ctx.publicOrigin, headers = {}, cookie = this.cookie, host } = {}) {
+  constructor(ctx) { this.ctx = ctx; this.cookie = null; this.device = null; this.csrf = null; this.src = undefined; }
+  request(method, path, { form, origin = this.ctx.publicOrigin, headers = {}, cookie = this.cookie, device = this.device, host, src = this.src } = {}) {
+    const jar = [cookie, device].filter(Boolean).join('; ');
     const body = form ? new URLSearchParams(form).toString() : undefined;
-    return rawRequest({ port: this.ctx.publicPort, method, path, host: '127.0.0.1', headers: {
-      ...(host ? { Host: host } : { Host: '127.0.0.1:' + this.ctx.publicPort }), ...(origin ? { Origin: origin } : {}), ...(cookie ? { Cookie: cookie } : {}),
+    return rawRequest({ port: this.ctx.publicPort, method, path, host: '127.0.0.1', localAddress: src, headers: {
+      ...(host ? { Host: host } : { Host: '127.0.0.1:' + this.ctx.publicPort }), ...(origin ? { Origin: origin } : {}), ...(jar ? { Cookie: jar } : {}),
       ...(body ? { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } : {}), ...headers }, body });
   }
   async pre() { const r = await this.request('GET', '/'); return { r, pre: /name="pre" value="([^"]+)"/.exec(r.text)?.[1] }; }
   async login({ password = OPERATOR_PASSWORD, code, pre } = {}) {
     if (!pre) pre = (await this.pre()).pre;
     const r = await this.request('POST', '/login', { form: { pre, password, code: code ?? this.ctx.totp() }, cookie: null });
-    const sc = r.headers['set-cookie']?.[0]; if (sc) this.cookie = sc.split(';')[0];
+    for (const sc of r.headers['set-cookie'] ?? []) { const kv = sc.split(';')[0]; if (kv.startsWith('__Host-bdev=')) this.device = kv; else if (kv.startsWith('__Host-bsess=')) this.cookie = kv; }
     if (r.status === 303) await this.refreshCsrf();
     return r;
   }

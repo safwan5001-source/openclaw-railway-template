@@ -121,6 +121,10 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
   const serviceMode = Boolean(env.DAFTRA_BROKER_URL || env.DAFTRA_BROKER_TOKEN);
+  // Exactly one of the two service-mode variables is a misconfiguration: FAIL CLOSED for every command. Never fall back to
+  // talking to Daftra directly with a key that happens to be in the environment.
+  if (serviceMode && !(env.DAFTRA_BROKER_URL && env.DAFTRA_BROKER_TOKEN))
+    throw Error('Incomplete service-mode configuration: set BOTH DAFTRA_BROKER_URL and DAFTRA_BROKER_TOKEN (or neither, for single-process mode). Refusing to continue.');
   let serviceReadTarget = null;
   if (serviceMode && env.DAFTRA_BROKER_SOCKET) throw Error('Set only one of DAFTRA_BROKER_SOCKET (local broker) and DAFTRA_BROKER_URL (separate service)');
   if (serviceMode && SERVICE_COMMANDS.has(command)) {
@@ -149,7 +153,11 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
         env_warnings: serviceMode ? [
           ...DAFTRA_CREDENTIAL_ENV.filter((k) => env[k]).map((k) => k + ' is present in the agent environment. Daftra API-key roles are per ENTITY, not per method: any key that can read can also write, so the agent must hold NO Daftra credential (reads go through the broker; the key is ignored by this CLI but remains a bypass for any other process).'),
           ...OPERATOR_ONLY_ENV.filter((k) => env[k] && !DAFTRA_CREDENTIAL_ENV.includes(k)).map((k) => k + ' is present in the agent environment: operator/broker secrets must only be held by the broker service'),
-        ] : env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : [],
+        ] : [
+          ...(env.DAFTRA_BROKER_SOCKET ? ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'].filter((k) => env[k]).map((k) => k + ' is present in the agent environment: operator secrets must only be held by the broker') : []),
+          // Not service mode: a Daftra key in this environment is the credential this process (and anything else running here) uses directly.
+          ...DAFTRA_CREDENTIAL_ENV.filter((k) => env[k] && !(env.DAFTRA_BROKER_SOCKET && k.startsWith('DAFTRA_WRITE_API_KEY'))).map((k) => k + ' is present: single-process mode — this key can also WRITE (Daftra API-key roles are per entity, not per method). Production should use the separate broker service (DAFTRA_BROKER_URL) with NO Daftra key on the agent.'),
+        ],
         official_pdf: 'invoices only (invoice_pdf_url); every other PDF is a generated, non-official summary',
         duplicate_sources: Object.keys(DUP_SOURCES),
         not_implemented: ['edit/delete/cancel/refund of invoices, estimates, purchase invoices, expenses or payments', 'delete of any record (products, categories, clients, suppliers)', 'e-invoice (ZATCA) submission', 'delete/deactivate/suspend or bulk operations on customers and suppliers', 'customer/supplier portal passwords, notifications, opening balances, custom fields', 'stock/inventory changes (opening stock, store, tracking)', 'product bundles', 'product import/export and any bulk product operation (DEFERRED by the owner)', 'supplier statements'],

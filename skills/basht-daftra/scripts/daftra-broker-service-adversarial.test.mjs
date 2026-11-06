@@ -9,7 +9,7 @@ import { FakeDaftra } from './daftra-fake.test-helper.mjs';
 import { startService, proposeInvoice, rawRequest, ALL_SECRETS, AGENT_TOKEN, AGENT_TOKEN_PREVIOUS, READ_KEY, WRITE_KEY, OP_SECRET, OPERATOR_PASSWORD, TOTP_SEED, PRIVATE_HOST, PUBLIC_HOST, invoiceInput, T0 } from './daftra-broker-service.test-helper.mjs';
 import { readAudit, createBrokerService, loadServiceConfig } from './daftra-broker-service.mjs';
 import { createProposal } from './daftra-proposal.mjs';
-import { totpBase32, totpCode, deriveTotpSecret, stepAt } from './daftra-operator-auth.mjs';
+import { totpBase32, totpCode, deriveTotpSecret, stepAt, ANON_EVAL_CAP } from './daftra-operator-auth.mjs';
 
 const scan = (text, label) => { for (const s of ALL_SECRETS) assert.equal(String(text).includes(s), false, label + ' leaks a secret'); };
 const post = (c, id) => c.fake.posts.filter((p) => true).length;
@@ -201,39 +201,47 @@ test('LOGIN: both factors, uniform errors, security headers, form tokens are sin
   } finally { await c.stop(); }
 });
 
-test('LOCKOUT over HTTP: invalid attempts are throttled (<= 60 s, survives restart) but the OPERATOR with valid credentials is never locked out', async () => {
+test('LOCKOUT over HTTP: a locked peer is refused WITHOUT evaluation (<= 60 s, survives restart); the operator device cookie is exempt; the operator without it is back after the lock', async () => {
   const c = await startService();
   const keep = c.base;
   try {
+    const dev = c.operator(); assert.equal((await dev.login()).status, 303); assert.ok(dev.device, 'a trusted-device cookie is issued at the first good login');
     const op = c.operator();
     for (let i = 0; i < 5; i++) assert.equal((await op.login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 401);
+    const evaluated = c.service._auth._stats().evaluated;
     assert.equal((await op.login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 429, 'invalid attempt during the lock');
+    assert.equal((await op.login({ code: c.totp() })).status, 429, 'even CORRECT credentials from a locked peer are refused (otherwise the lock would be an oracle)');
+    assert.equal(c.service._auth._stats().evaluated, evaluated, 'locked attempts were never evaluated');
     await c.stop(false);
     const again = await startService({ keepState: keep, clock: c.clock });
     try {
       assert.equal((await again.operator().login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 429, 'the lock persisted across restart');
-      const ok = again.operator(); assert.equal((await ok.login({ code: again.totp() })).status, 303, 'valid credentials are accepted DESPITE the lock');
+      const trusted = again.operator(); trusted.device = dev.device;
+      assert.equal((await trusted.login({ code: again.freshCode() })).status, 303, 'the trusted device signs in DESPITE the lock');
       again.clock.t += 61_000;                                                     // a lock never exceeds a minute
-      assert.equal((await again.operator().login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 401, 'lock expired');
+      const back = again.operator();
+      assert.equal((await back.login({ code: again.freshCode() })).status, 303, 'operator without a cookie is back once the lock expired');
     } finally { await again.stop(false); }
   } finally { await rm(keep, { recursive: true, force: true }); }
 });
 
-test('REVIEW#2 (e2): unauthenticated global lock-out attack with rotating X-Real-IP can never keep the operator out, and no lock exceeds a minute', async () => {
-  const c = await startService({ env: { BROKER_TRUST_PROXY: '1', BROKER_PREAUTH_RPS: '2000' } });    // this test measures the LOGIN lock, not the pre-auth limiter
+test('REVIEW#2 (e2): unauthenticated lock-out attack with rotating X-Real-IP evaluates at most ANON_EVAL_CAP guesses a minute, no lock exceeds a minute, and the trusted device is never kept out', async () => {
+  const c = await startService({ env: { BROKER_TRUST_PROXY: '1', BROKER_PREAUTH_RPS: '2000' } });    // this test measures the LOGIN gate, not the pre-auth limiter
   try {
+    const dev = c.operator(); assert.equal((await dev.login()).status, 303);
     const op = c.operator();
-    const bad = async (ip) => { const { pre } = await op.pre(); return op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': ip }, cookie: null }); };
-    for (let i = 0; i < 40; i++) await bad('203.0.113.' + i);                      // enough to trip the GLOBAL counter
-    const st = c.service._auth._state(); assert.ok(st.global.until > c.clock.t, 'global lock is active');
-    assert.ok(st.global.until - c.clock.t <= 60_000, 'but never longer than a minute');
-    const { pre } = await op.pre();
-    const login = await op.request('POST', '/login', { form: { pre, password: OPERATOR_PASSWORD, code: c.totp() }, headers: { 'X-Real-IP': '198.51.100.99' }, cookie: null });
-    assert.equal(login.status, 303, 'the operator signs in with the right password and a fresh code');
+    const bad = async (ip) => { const { pre } = await op.pre(); return op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': ip }, cookie: null, device: null }); };
+    const before = c.service._auth._stats().evaluated;
+    for (let i = 0; i < 80; i++) await bad('203.0.113.' + i);
+    assert.ok(c.service._auth._stats().evaluated - before <= ANON_EVAL_CAP, 'rotating addresses evaluate at most ANON_EVAL_CAP guesses per minute');
+    const st = c.service._auth._state(); assert.ok(st.global.until - c.clock.t <= 60_000, 'no lock exceeds a minute');
+    const t = c.operator(); t.device = dev.device;
+    assert.equal((await t.login({ code: c.freshCode() })).status, 303, 'the trusted device signs in during the attack');
     // "one failure right after each lock expires" (the hourly-lock pattern) cannot escalate beyond a minute either
     for (let i = 0; i < 10; i++) { c.clock.t = Math.max(c.clock.t, c.service._auth._state().global.until) + 1; await bad('192.0.2.' + i); }
     assert.ok(c.service._auth._state().global.until - c.clock.t <= 60_000);
-    assert.equal((await c.operator().login({ code: c.freshCode() })).status, 303);
+    c.clock.t += 61_000;
+    assert.equal((await c.operator().login({ code: c.freshCode() })).status, 303, 'a minute later even a brand-new device gets in');
   } finally { await c.stop(); }
 });
 
@@ -251,6 +259,7 @@ test('X-Real-IP is trusted for throttling ONLY with BROKER_TRUST_PROXY=1 and onl
     for (let i = 0; i < 5; i++) await bad('198.51.100.7');
     assert.equal((await bad('198.51.100.7')).status, 429, 'that client is throttled');
     assert.equal((await bad('198.51.100.8')).status, 401, 'another real client is not');
+    t.clock.t += 61_000;
     const { pre } = await op.pre();
     // garbage X-Real-IP is ignored (falls back to the socket address) instead of being used as an identity
     const g = await op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': 'not-an-ip; DROP' }, cookie: null });
