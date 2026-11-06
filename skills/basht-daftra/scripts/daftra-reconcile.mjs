@@ -23,6 +23,11 @@ const POSITIVE_ID = /^[1-9][0-9]{0,14}$/;
 export const SUCCESS_STATUS = new Set(['1', 'completed', 'success', 'successful']);
 export const NOT_SUCCESS_STATUS = new Set(['0', 'failed', 'failure', 'cancelled', 'canceled', 'void', 'voided']);
 export const CLIENT_CREDIT_METHOD = 'client_credit';
+// payment_method is only trusted for classification when it is (a) exactly client_credit (the value seen on the live tenant) or
+// (b) one of the built-in methods that are unambiguously cash/bank. `credit` and `offline` are documented built-ins but their
+// meaning (customer credit? card? settlement outside the books?) is not established, and tenant-defined methods are unknown:
+// those stay UNCLASSIFIED rather than being guessed into cash/bank.
+export const CASH_BANK_METHODS = new Set(['cash', 'bank', 'cheque']);
 export const MAX_INVOICES = 300;
 export const MAX_INDIVIDUAL_GETS = 200;
 const isTrue = (v) => v === true || v === 1 || v === '1';
@@ -93,10 +98,20 @@ export function mergeObservations(observations) {
       if (seen.size > 1) conflicts.push({ field: f, values: [...seen.entries()].map(([k, srcs]) => ({ value: f === 'amount' ? format(BigInt(k)) : k, sources: [...new Set(srcs)] })) });
       values[f] = seen.size === 1 ? [...seen.keys()][0] : null;
     }
+    // Repeats inside ONE source (same endpoint and path) must be identical in every compared field and in the payment date;
+    // the cross-source comparison above already covers amount / invoice / status / method.
+    const groups = new Map();
+    for (const o of rec.observations) { if (!groups.has(o.source)) groups.set(o.source, []); groups.get(o.source).push(o); }
+    for (const [k, group] of groups) {
+      if (group.length < 2) continue;
+      const dates = new Set(group.map((o) => o.date ?? '(none)'));
+      if (dates.size > 1) conflicts.push({ field: 'date', within: k, values: [...dates].map((d) => ({ value: d, sources: [group[0].source] })) });
+    }
     const sources = [...new Set(rec.observations.map((o) => o.source))];
-    const duplicates = rec.observations.some((o, i) => rec.observations.findIndex((x) => x.source === o.source && x.path === o.path) !== i);
+    const duplicates = rec.observations.some((o, i) => rec.observations.findIndex((x) => x.source === o.source) !== i);
     const problems = [...new Set(rec.observations.flatMap((o) => o.problems))];
-    return { id: rec.id, sources, conflicts, duplicate_in_source: duplicates, problems, observations: rec.observations,
+    const duplicateIn = [...groups.entries()].filter(([, g]) => g.length > 1).map(([k, g]) => k + (g.some((o) => o.path) ? '[' + [...new Set(g.map((o) => o.path))].join(',') + ']' : '') + ' x' + g.length);
+    return { id: rec.id, sources, conflicts, duplicate_in_source: duplicates, duplicate_in: duplicateIn, problems, observations: rec.observations,
       amount: values.amount === null ? null : BigInt(values.amount), invoice_id: values.invoice_id, status: values.status, method: values.method,
       date: rec.observations.find((o) => o.date)?.date ?? null };
   });
@@ -151,27 +166,37 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     const failedGet = individual.get(m.id)?.error;
     if (m.conflicts.length) reasons.push('conflict:' + m.conflicts.map((c) => c.field).join('/'));
     if (m.problems.length) reasons.push(...m.problems);
-    if (failedGet) reasons.push('individual_get_failed');
     const crossChecked = m.sources.includes('individual') || m.sources.filter((s) => s !== 'individual').length >= 2;
-    if (!crossChecked && !failedGet) reasons.push('single_source_unverified');
+    if (!crossChecked) reasons.push('single_source_unverified');
     if (m.amount === null && !m.conflicts.some((c) => c.field === 'amount')) reasons.push('amount_missing');
     if (m.invoice_id === null && !m.conflicts.some((c) => c.field === 'invoice_id')) reasons.push('invoice_id_missing');
     // Each field that decides the outcome needs evidence from two sources, or from the single record itself. A value that only
     // ONE listing/detail supplies is not enough to count money.
     for (const f of ['amount', 'invoice_id', 'status']) {
       const providers = new Set(m.observations.filter((o) => (f === 'invoice_id' ? (o.claimed_invoice_id ?? o.invoice_id) : o[f]) !== null && (f === 'invoice_id' ? (o.claimed_invoice_id ?? o.invoice_id) : o[f]) !== undefined).map((o) => o.source));
-      if (!m.conflicts.some((c) => c.field === f) && providers.size < 2 && !providers.has('individual') && !failedGet) reasons.push('field_single_source:' + f);
+      if (!m.conflicts.some((c) => c.field === f) && providers.size < 2 && !providers.has('individual')) reasons.push('field_single_source:' + f);
     }
     const kind = classifyStatus(m.status);
     if (kind === 'unknown' && !m.conflicts.some((c) => c.field === 'status')) reasons.push('status_missing');
     if (kind === 'unrecognised') reasons.push('status_unrecognised:' + m.status);
     if (m.amount !== null && m.amount <= ZERO && kind === 'success') reasons.push('non_positive_amount');
+    // A failed single GET only matters when that GET was needed to prove amount / status / invoice link; a payment already
+    // proven by two sources is not discarded because an optional corroboration (e.g. of payment_method) failed.
+    if (failedGet && reasons.length) reasons.push('individual_get_failed');
     const resolved = reasons.length === 0;
     const state = resolved ? (kind === 'success' ? 'verified' : 'not_counted') : 'unresolved';
-    const category = m.method === null ? 'unclassified' : m.method === CLIENT_CREDIT_METHOD ? 'client_credit' : 'cash_bank';
+    // payment_method classification: only from a reliable, recognised value; never guessed.
+    const methodSources = new Set(m.observations.filter((o) => o.method !== null).map((o) => o.source));
+    let category; let classificationReason = null;
+    if (m.method === null) { category = 'unclassified'; classificationReason = m.conflicts.some((c) => c.field === 'method') ? 'method_conflict' : 'method_missing'; }
+    else if (!(methodSources.size >= 2 || methodSources.has('individual'))) { category = 'unclassified'; classificationReason = 'method_single_source'; }
+    else if (m.method === CLIENT_CREDIT_METHOD) category = 'client_credit';
+    else if (CASH_BANK_METHODS.has(m.method)) category = 'cash_bank';
+    else { category = 'unclassified'; classificationReason = 'method_unrecognised:' + m.method; }
     const candidateInvoices = [...new Set([m.invoice_id, ...m.conflicts.filter((c) => c.field === 'invoice_id').flatMap((c) => c.values.map((v) => v.value)), ...m.observations.flatMap((o) => [o.invoice_id, o.container])].filter(Boolean))];
     return {
-      id: m.id, invoice_id: m.invoice_id, candidate_invoices: candidateInvoices, amount: m.amount, status: m.status, method: m.method, category, date: m.date,
+      id: m.id, invoice_id: m.invoice_id, candidate_invoices: candidateInvoices, amount: m.amount, status: m.status, method: m.method, category, classification_reason: classificationReason, date: m.date,
+      duplicate_in: m.duplicate_in,
       sources: m.sources, in_list: m.sources.includes('list'), conflicts: m.conflicts, duplicate_in_source: m.duplicate_in_source, state, reasons,
       credit_source: category === 'client_credit' ? 'unverified' : undefined,
     };
@@ -211,7 +236,9 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     return {
       id, no: str(inv.no), date: normalizeDaftraDate(inv.date), state, reasons,
       evidence: state === 'matched' ? (counted.length ? 'payments_verified_by_id' : 'no_payments_claimed_and_none_found') : null,
-      credit_source_unverified: counted.some((p) => p.category === 'client_credit'),
+      credit_source_unverified: counted.some((p) => p.category === 'client_credit' || p.method === CLIENT_CREDIT_METHOD),
+      classification_complete: counted.every((p) => p.category !== 'unclassified'),
+      unclassified_payments: counted.filter((p) => p.category === 'unclassified').map((p) => ({ id: p.id, reason: p.classification_reason })),
       payments_paths: ds?.paths ?? [],
       summary_total: total === null ? null : format(total), summary_paid: paid === null ? null : format(paid), summary_unpaid: unpaid === null ? null : format(unpaid),
       proven_paid: format(proven), cash_bank: format(byCat.cash_bank), client_credit: format(byCat.client_credit), unclassified: format(byCat.unclassified),
@@ -242,10 +269,11 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
   };
   if (listMissing.length) warnings.push(listMissing.length + ' payment(s) are applied to invoices but ABSENT from the invoice_payments list (' + listMissing.map((p) => p.id + ' ' + p.category).join(', ') + '): a page-complete list does not cover every settlement type.');
   if (verified.some((p) => p.category === 'client_credit')) warnings.push('client_credit payments were found. They prove only that Daftra applied customer credit to the invoice; the SOURCE of that credit and its journal entry are NOT verified and need an independent check (client balance / ledger).');
-  if (verified.some((p) => p.category === 'unclassified')) warnings.push('Some verified payments have no payment_method, so they cannot be split between cash/bank and client_credit.');
+  const unclassified = verified.filter((p) => p.category === 'unclassified');
+  if (unclassified.length) warnings.push(unclassified.length + ' verified payment(s) could not be classified as cash/bank or client_credit and were NOT guessed (' + unclassified.map((p) => p.id + ': ' + p.classification_reason).join('; ') + '). They count as applied money only; their credit source is unknown.');
   if (skipped.length) warnings.push(skipped.length + ' document(s) in the period were skipped (drafts / non-invoice types): ' + skipped.map((s) => s.id + ' ' + s.reason).join('; '));
   if (unidentified.length) warnings.push(unidentified.length + ' payment record(s) have no stable id and cannot be merged or counted.');
-  if (payments.some((p) => p.duplicate_in_source)) warnings.push('The same payment id appears more than once in one source; it was counted once.');
+  if (payments.some((p) => p.duplicate_in_source)) warnings.push('The same payment id is repeated inside one source with identical data and was counted once: ' + payments.filter((p) => p.duplicate_in_source).map((p) => p.id + ' (' + p.duplicate_in.join(', ') + ')').join('; ') + '. A repeat with different data would have made the payment unresolved.');
   if (outside.length) warnings.push(outside.length + ' payment(s) of this client are not linked to a period invoice (other period or on-account) and were not counted.');
   if (!rows.length) warnings.push('No invoices were found for this client and period, so nothing could be reconciled.');
   warnings.push('Computed locally from Daftra reads; not an official statement and no accounting entry was made or checked.');
@@ -255,10 +283,12 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     listing_complete: listComplete === true,
     accounting_coverage: resolved ? 'complete' : 'unresolved',
     coverage_note: 'listing_complete only says every page of the lists was read. accounting_coverage is "complete" only when every invoice\'s summary_paid is explained by payments verified by id across independent sources, with no conflict, missing id or unreadable record.',
+    classification_complete: unclassified.length === 0,
     state_counts: stateCounts, totals,
     invoices: rows,
     payments: payments.map((p) => ({ id: p.id, invoice_id: p.invoice_id, candidate_invoices: p.candidate_invoices.length > 1 ? p.candidate_invoices : undefined, amount: p.amount === null ? null : format(p.amount), status: p.status, method: p.method, category: p.category, date: p.date,
-      sources: p.sources, in_list: p.in_list, state: p.state, reasons: p.reasons, conflicts: p.conflicts.length ? p.conflicts : undefined, credit_source: p.credit_source })),
+      sources: p.sources, in_list: p.in_list, state: p.state, reasons: p.reasons, conflicts: p.conflicts.length ? p.conflicts : undefined, credit_source: p.credit_source,
+      classification_reason: p.classification_reason ?? undefined, duplicate_in_source: p.duplicate_in_source ? p.duplicate_in : undefined })),
     unidentified_payments: unidentified, outside_period_payments: outside.map((p) => p.id), skipped_documents: skipped,
     warnings,
   };
@@ -305,7 +335,7 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
 
   // First pass without single GETs, to decide which payments need an independent confirmation.
   const first = reconcile({ clientId, from, to, invoices: invoicesPage.records, listPayments: paymentsPage.records, details, listComplete });
-  const need = first.payments.filter((p) => p.reasons.some((r) => r === 'single_source_unverified' || r.startsWith('field_single_source') || r.startsWith('conflict') || r === 'status_missing' || r === 'amount_missing' || r === 'invoice_id_missing')).map((p) => p.id);
+  const need = first.payments.filter((p) => p.classification_reason === 'method_single_source' || p.reasons.some((r) => r === 'single_source_unverified' || r.startsWith('field_single_source') || r.startsWith('conflict') || r === 'status_missing' || r === 'amount_missing' || r === 'invoice_id_missing')).map((p) => p.id);
   const individual = new Map();
   const todo = need.slice(0, MAX_INDIVIDUAL_GETS);
   for (const id of need.slice(MAX_INDIVIDUAL_GETS)) individual.set(id, { error: 'verification limit reached' });

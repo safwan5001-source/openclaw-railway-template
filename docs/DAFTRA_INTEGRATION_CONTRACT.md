@@ -92,7 +92,23 @@ Threat model: the agent controls CLI arguments and can read/write the workspace,
 
 ## 6. Not verified / needs the real tenant
 
-Live JSON shapes of each endpoint and report; whether the API key's role allows each entity; real `invoice_pdf_url` download; ZATCA/e-invoice side effects of final invoices; open/closed financial periods; tenant payment-method names; **payment reconciliation inputs**: the exact shape of payments embedded in `GET invoices/<id>` (read from `data.Payment[]`, `data.InvoicePayment[]` and `data.Invoice.InvoicePayment[]`, elements flat or wrapped in `InvoicePayment`; the last one and the `DD/MM/YYYY` detail date format come from the client-48 live test, the others are assumptions; re-verify each path and whether the detail repeats payments on several paths), the `invoice_payments.status` codes (only `1` is treated as successful, `0`/cancelled/failed as not counted, anything else as unresolved) and whether the single `GET invoice_payments/<id>` returns `data.InvoicePayment`; tax inclusive/exclusive rounding vs Daftra's own (the read-back catches differences); PDF Arabic fonts and Chromium inside the Railway image; delivery on iPhone.
+Live JSON shapes of each endpoint and report; whether the API key's role allows each entity; real `invoice_pdf_url` download; ZATCA/e-invoice side effects of final invoices; open/closed financial periods; tenant payment-method names; **payment reconciliation inputs** (§6.1); tax inclusive/exclusive rounding vs Daftra's own (the read-back catches differences); PDF Arabic fonts and Chromium inside the Railway image; delivery on iPhone.
+
+### 6.1 Payment reconciliation sources (`reconcile-payments`) — single reference
+
+`daftra-reconcile.mjs` reads payments from exactly these places. The code constant is `EMBEDDED_PATHS`; a test fails if this document or `SKILL.md` names another path.
+
+| Source | Path / endpoint | Evidence status |
+|---|---|---|
+| List | `GET /api2/invoice_payments.json?client_id=` (all pages, no status/date filter) | Documented list endpoint; known to omit some settlement types (e.g. `client_credit`). Page-complete ≠ accounting-complete. |
+| Detail, path 1 | `data.Payment` (array) of `GET /api2/invoices/<id>.json` | Already read by the document-copy code (`daftra-duplicate.mjs`); not live-verified for reconciliation. |
+| Detail, path 2 | `data.InvoicePayment` (array) | No live evidence; accepted as an alternative placement. |
+| Detail, path 3 | `data.Invoice.InvoicePayment` (array) | Reported by the client-48 live test (maintainer); not independently re-observed here. |
+| Single | `GET /api2/invoice_payments/<id>.json` → `data.InvoicePayment` | Used to corroborate; shape assumed from the documented model key. |
+
+The three detail paths are one source ("detail"): the same payment on several paths is a repeat inside one source (counted once only when identical, otherwise a conflict). Elements may be flat or wrapped in an `InvoicePayment` key. If none of the paths exists the invoice is `unresolved`.
+
+Other inputs still **not verified live**: the `invoice_payments.status` codes (only `1` counts as successful, `0`/cancelled/failed are not counted, anything else is `unresolved`); the detail date format `DD/MM/YYYY` (strictly normalised, always compared with the list's ISO date); and `payment_method` values: only `client_credit` and the built-ins `cash`, `bank`, `cheque` are classified, everything else is `unclassified`. The documented built-ins `credit` and `offline` are deliberately **not** treated as cash/bank because their accounting meaning is not established. A `client_credit` payment proves that Daftra applied customer credit to the invoice, not where that credit came from or that its journal entry is correct.
 
 ## 7. Acceptance gates before any production use
 

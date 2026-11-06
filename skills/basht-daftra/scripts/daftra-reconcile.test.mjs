@@ -1,7 +1,8 @@
 // Invoice <-> payment reconciliation. All data is SYNTHETIC; the fetcher is GET-only and records every call.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcileClientPayments, reconcile, normalizePayment, embeddedPayments } from './daftra-reconcile.mjs';
+import { readFile } from 'node:fs/promises';
+import { reconcileClientPayments, reconcile, normalizePayment, embeddedPayments, EMBEDDED_PATHS, CASH_BANK_METHODS } from './daftra-reconcile.mjs';
 import { normalizeDaftraDate } from './daftra-entities.mjs';
 import { run } from './daftra-cli.mjs';
 
@@ -10,7 +11,7 @@ const noSleep = async () => {};
 const R = (o) => reconcileClientPayments({ clientId: 48, from: '2026-10-01', to: '2026-11-06' }, env, o.fetcher, { sleep: noSleep });
 
 const inv = (id, total, paid, extra = {}) => ({ id, no: String(id), date: '2026-10-15', client_id: 48, type: 0, draft: 0, summary_total: total, summary_paid: paid, summary_unpaid: (Number(total) - Number(paid)).toFixed(2), ...extra });
-const pay = (id, invoice_id, amount, extra = {}) => ({ id, invoice_id, amount, status: 1, payment_method: 'bank_transfer', date: '2026-10-20', client_id: 48, ...extra });
+const pay = (id, invoice_id, amount, extra = {}) => ({ id, invoice_id, amount, status: 1, payment_method: 'bank', date: '2026-10-20', client_id: 48, ...extra });
 
 // world({ invoices, list, embedded: {invoiceId: [payments] | undefined}, singles: {paymentId: record | number(HTTP status)}, ... })
 function world({ invoices, list = [], embedded = {}, embeddedAt = {}, singles = {}, detailHeader = {}, detailFail = {}, listFail = null, listTotalOverride = null, invoiceListFail = null, pageSize }) {
@@ -88,7 +89,7 @@ test('the same payment id twice: identical copies count once; different copies a
   const p = pay(4001, 13, '300.00');
   let r = await R(world({ invoices: [inv(13, '300.00', '300.00')], list: [p], embedded: { 13: [p, p] } }));
   assert.equal(one(r, 13).state, 'matched'); assert.equal(r.totals.proven_paid, '300.00'); assert.equal(payment(r, 4001).conflicts, undefined);
-  assert.ok(r.warnings.some((x) => /more than once in one source/.test(x)));
+  assert.ok(r.warnings.some((x) => /repeated inside one source/.test(x)));
   r = await R(world({ invoices: [inv(13, '300.00', '300.00')], list: [p], embedded: { 13: [p, { ...p, amount: '310.00' }] }, singles: { 4001: p } }));
   assert.equal(one(r, 13).state, 'unresolved'); assert.equal(payment(r, 4001).state, 'unresolved'); assert.equal(r.totals.proven_paid, '0.00');
   // one payment id embedded under two different invoices
@@ -198,7 +199,7 @@ test('summary fields: inconsistent total/paid/unpaid or list-vs-detail disagreem
 test('payments with no payment_method are counted but reported as unclassified', async () => {
   const p = pay(8401, 70, '25.00', { payment_method: null });
   const r = await R(world({ invoices: [inv(70, '25.00', '25.00')], list: [p], embedded: { 70: [p] } }));
-  assert.equal(one(r, 70).unclassified, '25.00'); assert.equal(r.totals.proven_unclassified, '25.00'); assert.ok(r.warnings.some((x) => /no payment_method/.test(x)));
+  assert.equal(one(r, 70).unclassified, '25.00'); assert.equal(r.totals.proven_unclassified, '25.00'); assert.ok(r.warnings.some((x) => /could not be classified/.test(x) && /method_missing/.test(x)));
 });
 
 test('drafts and credit notes are skipped and reported, payments of other invoices are not counted', async () => {
@@ -216,7 +217,7 @@ function reported() {
   const add = (id, no, total, payment) => { invoices.push(inv(id, total, total, { no })); embedded[id] = [payment]; if (payment.payment_method !== 'client_credit') list.push(payment); else singles[payment.id] = payment; };
   add(84382, '007214', '20815.00', pay(84268, 84382, '20815.00', { payment_method: 'client_credit' }));
   add(89569, '007329', '18100.00', pay(89373, 89569, '18100.00', { payment_method: 'client_credit' }));
-  for (let i = 0; i < 16; i++) add(90000 + i, '0075' + String(i).padStart(2, '0'), '18000.00', pay(95000 + i, 90000 + i, '18000.00', { payment_method: i % 2 ? 'bank_transfer' : 'cash' }));
+  for (let i = 0; i < 16; i++) add(90000 + i, '0075' + String(i).padStart(2, '0'), '18000.00', pay(95000 + i, 90000 + i, '18000.00', { payment_method: i % 2 ? 'bank' : 'cash' }));
   add(90016, '007599', '19410.40', pay(95016, 90016, '19410.40'));
   return { invoices, list, embedded, singles };
 }
@@ -457,4 +458,117 @@ test('REAL DIFFERENCE: Daftra says paid/unpaid 0 but there is no payment evidenc
   const q = pay(10701, 193, '10.00', { payment_method: 'client_credit' });
   r = await R(world({ invoices: [inv(193, '10.00', '10.00')], list: [q], embedded: { 193: [q] } }));
   assert.equal(one(r, 193).evidence, 'payments_verified_by_id'); assert.equal(one(r, 193).credit_source_unverified, true);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review round: duplicates INSIDE one source, payment_method reliability, one documentation of the payment paths.
+
+const direct = ({ invoices, listPayments = [], details, individual = {} }) => reconcile({
+  clientId: 48, from: '2026-10-01', to: '2026-11-06', invoices, listPayments,
+  details: new Map(Object.entries(details)), individual: new Map(Object.entries(individual).map(([k, v]) => [k, normalizePayment(v, 'individual')])),
+});
+const detailOf = (invoice, rows, extra = {}) => ({ payload: { data: { Invoice: invoice, Payment: rows, ...extra } }, header: invoice });
+
+test('SAME-SOURCE DUPLICATES (identical): a payment repeated inside the list, inside data.Payment or across detail paths counts once, with the repeat reported', () => {
+  const i = inv(200, '100.00', '100.00'); const p = pay(11000, 200, '100.00');
+  const r = direct({ invoices: [i], listPayments: [p, p], details: { 200: detailOf(i, [p, p], { InvoicePayment: [p] }) } });
+  assert.equal(one(r, 200).state, 'matched'); assert.equal(r.totals.proven_paid, '100.00'); assert.equal(r.payments.length, 1);
+  assert.deepEqual(one(r, 200).payments, ['11000']);
+  assert.deepEqual(payment(r, 11000).sources, ['list', 'detail']);
+  assert.match(payment(r, 11000).duplicate_in_source.join(' '), /list x2/); assert.match(payment(r, 11000).duplicate_in_source.join(' '), /detail\[data\.Payment,data\.InvoicePayment\] x3/);
+  assert.ok(r.warnings.some((x) => /repeated inside one source with identical data and was counted once/.test(x)));
+  // a repeat that doubles the amount can never make a double-paid summary match
+  const d = direct({ invoices: [inv(201, '200.00', '200.00')], listPayments: [pay(11001, 201, '100.00'), pay(11001, 201, '100.00')], details: { 201: detailOf(inv(201, '200.00', '200.00'), [pay(11001, 201, '100.00'), pay(11001, 201, '100.00')]) } });
+  assert.equal(one(d, 201).state, 'mismatch'); assert.equal(one(d, 201).proven_paid, '100.00');
+});
+
+test('SAME-SOURCE DUPLICATES (conflicting): any difference between repeats makes the payment UNRESOLVED and nothing is counted, even if the single GET agrees with one copy', () => {
+  const i = inv(210, '100.00', '100.00'); const p = pay(11100, 210, '100.00', { date: '2026-10-20' });
+  const variants = { amount: { amount: '110.00' }, status: { status: 0 }, invoice_id: { invoice_id: 211 }, method: { payment_method: 'cash' }, date: { date: '2026-10-21' } };
+  for (const [field, change] of Object.entries(variants)) {
+    for (const where of ['list', 'detail', 'detail-two-paths']) {
+      const other = { ...p, ...change };
+      const args = { invoices: [i, inv(211, '5.00', '0.00')], individual: { 11100: p } };
+      if (where === 'list') args.listPayments = [p, other], args.details = { 210: detailOf(i, [p]), 211: detailOf(inv(211, '5.00', '0.00'), []) };
+      if (where === 'detail') args.listPayments = [p], args.details = { 210: detailOf(i, [p, other]), 211: detailOf(inv(211, '5.00', '0.00'), []) };
+      if (where === 'detail-two-paths') args.listPayments = [p], args.details = { 210: detailOf(i, [p], { InvoicePayment: [other] }), 211: detailOf(inv(211, '5.00', '0.00'), []) };
+      const r = direct(args);
+      const label = field + ' / ' + where;
+      assert.equal(payment(r, 11100).state, 'unresolved', label);
+      assert.ok(payment(r, 11100).conflicts.some((c) => c.field === field), label);
+      assert.equal(one(r, 210).state, 'unresolved', label);
+      assert.equal(r.totals.proven_paid, '0.00', label);                          // neither copy is counted
+      assert.equal(r.accounting_coverage, 'unresolved', label);
+    }
+  }
+});
+
+test('SAME-SOURCE DUPLICATES through the orchestrator: conflicting repeats in the invoice detail stay unresolved; a duplicated LIST id is refused outright', async () => {
+  const p = pay(11200, 220, '100.00');
+  const w = world({ invoices: [inv(220, '100.00', '100.00')], list: [p], embedded: { 220: [p, { ...p, amount: '90.00' }] }, embeddedAt: { 'Invoice.InvoicePayment': { 220: [p] } }, singles: { 11200: p } });
+  const r = await R(w);
+  assert.equal(one(r, 220).state, 'unresolved'); assert.equal(r.totals.proven_paid, '0.00');
+  assert.deepEqual(payment(r, 11200).conflicts.find((c) => c.field === 'amount').values.map((v) => v.value).sort(), ['100.00', '90.00']);
+  await assert.rejects(R(world({ invoices: [inv(220, '100.00', '100.00')], list: [p, { ...p, amount: '90.00' }], embedded: { 220: [p] } })), /duplicate record id|blocked/i);
+});
+
+test('PAYMENT_METHOD: only client_credit and the documented cash/bank built-ins are classified; everything else is UNCLASSIFIED with a reason, never guessed', async () => {
+  assert.deepEqual([...CASH_BANK_METHODS].sort(), ['bank', 'cash', 'cheque']);
+  const cases = [
+    ['client_credit', 'client_credit', null], ['CLIENT_CREDIT', 'client_credit', null], [' client_credit ', 'client_credit', null],
+    ['cash', 'cash_bank', null], ['Bank', 'cash_bank', null], ['cheque', 'cash_bank', null],
+    ['credit', 'unclassified', 'method_unrecognised:credit'], ['offline', 'unclassified', 'method_unrecognised:offline'],
+    ['bank_transfer', 'unclassified', 'method_unrecognised:bank_transfer'], ['client credit', 'unclassified', 'method_unrecognised:client credit'],
+    ['client-credit', 'unclassified', 'method_unrecognised:client-credit'], ['customer_credit', 'unclassified', 'method_unrecognised:customer_credit'],
+    ['ائتمان العميل', 'unclassified', 'method_unrecognised:ائتمان العميل'], ['7', 'unclassified', 'method_unrecognised:7'],
+    [null, 'unclassified', 'method_missing'], ['', 'unclassified', 'method_missing'],
+  ];
+  let n = 0;
+  for (const [method, category, reason] of cases) {
+    const id = 230 + n; const p = pay(11300 + n++, id, '10.00', { payment_method: method });
+    const r = await R(world({ invoices: [inv(id, '10.00', '10.00')], list: [p], embedded: { [id]: [p] }, singles: { [p.id]: p } }));
+    assert.equal(payment(r, p.id).category, category, JSON.stringify(method)); assert.equal(payment(r, p.id).classification_reason ?? null, reason, JSON.stringify(method));
+    assert.equal(one(r, id).state, 'matched', JSON.stringify(method));                      // the money is still proven by id/amount/status
+    assert.equal(one(r, id).classification_complete, category !== 'unclassified', JSON.stringify(method));
+    assert.equal(r.classification_complete, category !== 'unclassified', JSON.stringify(method));
+    const bucket = { client_credit: 'proven_client_credit', cash_bank: 'proven_cash_bank', unclassified: 'proven_unclassified' }[category];
+    assert.equal(r.totals[bucket], '10.00', JSON.stringify(method));
+    if (category === 'unclassified') assert.ok(r.warnings.some((x) => /NOT guessed/.test(x)), JSON.stringify(method));
+  }
+});
+
+test('PAYMENT_METHOD: a method that only ONE source supplies is corroborated by the single GET; if that cannot be done the payment stays counted but UNCLASSIFIED', async () => {
+  const credit = pay(11400, 240, '50.00', { payment_method: 'client_credit' });
+  const noMethod = { ...credit }; delete noMethod.payment_method;
+  // list says client_credit, detail has no method => single GET confirms => classified
+  let w = world({ invoices: [inv(240, '50.00', '50.00')], list: [credit], embedded: { 240: [noMethod] }, singles: { 11400: credit } });
+  let r = await R(w);
+  assert.deepEqual(singleGets(w), ['11400']); assert.equal(payment(r, 11400).category, 'client_credit'); assert.equal(one(r, 240).credit_source_unverified, true);
+  // single GET unavailable: amount/status/invoice are two-source proven, so the money counts, but the method is NOT trusted
+  w = world({ invoices: [inv(240, '50.00', '50.00')], list: [credit], embedded: { 240: [noMethod] }, singles: { 11400: 500 } });
+  r = await R(w);
+  assert.equal(payment(r, 11400).state, 'verified'); assert.equal(payment(r, 11400).category, 'unclassified'); assert.equal(payment(r, 11400).classification_reason, 'method_single_source');
+  assert.equal(one(r, 240).state, 'matched'); assert.equal(one(r, 240).classification_complete, false); assert.equal(r.totals.proven_unclassified, '50.00');
+  assert.equal(one(r, 240).credit_source_unverified, true);               // a source CLAIMS credit: surfaced, never hidden by the missing corroboration
+  // single GET disagrees with the claimed method => conflict => unresolved
+  w = world({ invoices: [inv(240, '50.00', '50.00')], list: [credit], embedded: { 240: [noMethod] }, singles: { 11400: { ...credit, payment_method: 'cash' } } });
+  r = await R(w);
+  assert.equal(payment(r, 11400).state, 'unresolved'); assert.ok(payment(r, 11400).conflicts.some((c) => c.field === 'method'));
+});
+
+test('PAYMENT_METHOD: methods that disagree between sources are a conflict: unresolved, no category', async () => {
+  const a = pay(11500, 250, '20.00', { payment_method: 'cash' }); const b = { ...a, payment_method: 'client_credit' };
+  const r = await R(world({ invoices: [inv(250, '20.00', '20.00')], list: [a], embedded: { 250: [b] }, singles: { 11500: a } }));
+  assert.equal(payment(r, 11500).state, 'unresolved'); assert.equal(payment(r, 11500).category, 'unclassified'); assert.equal(payment(r, 11500).classification_reason, 'method_conflict');
+  assert.equal(one(r, 250).state, 'unresolved'); assert.equal(r.totals.proven_cash_bank, '0.00'); assert.equal(r.totals.proven_client_credit, '0.00');
+});
+
+test('DOCS: SKILL.md and the integration contract list exactly the three payment paths the code reads', async () => {
+  assert.deepEqual([...EMBEDDED_PATHS], ['data.Payment', 'data.InvoicePayment', 'data.Invoice.InvoicePayment']);
+  const docs = { skill: await readFile(new URL('../SKILL.md', import.meta.url), 'utf8'), contract: await readFile(new URL('../../../docs/DAFTRA_INTEGRATION_CONTRACT.md', import.meta.url), 'utf8') };
+  for (const [name, text] of Object.entries(docs)) {
+    for (const path of EMBEDDED_PATHS) assert.ok(text.includes('`' + path + '`'), name + ' documents ' + path);
+    const mentioned = new Set(text.match(/data\.(?:Invoice\.)?(?:InvoicePayment|Payment)\b/g) ?? []);
+    for (const m of mentioned) assert.ok(EMBEDDED_PATHS.includes(m), name + ' mentions an undocumented path ' + m);
+  }
 });
