@@ -17,7 +17,8 @@ export const ENTITIES = Object.freeze({
   expenses: Object.freeze({ path: 'expenses', model: 'Expense', doc: '40881055e0', params: Object.freeze(['limit', 'page', 'sort', 'direction', 'id', 'expense_number', 'date_from', 'date_to', 'created_from', 'created_to', 'amount_from', 'amount_to', 'note', 'expense_category_id', 'vendor', 'client_id', 'journal_account_id', 'status', 'work_order_id', 'recurring_expense_id', 'creation_method', 'staff_id', 'is_mileage']) }),
   purchase_invoices: Object.freeze({ path: 'purchase_invoices', model: 'PurchaseOrder', doc: '15115351e0', params: Object.freeze(['limit', 'page', 'keywords', 'payment_status', 'work_order_id', 'source_type', 'source_id']) }),
   product_categories: Object.freeze({ path: 'product_categories', model: 'ProductCategory', singleModel: 'Category', doc: '15115374e0', params: Object.freeze(['limit', 'page', 'parent_id', 'id']) }),
-  taxes: Object.freeze({ path: 'taxes', model: 'Tax', doc: '15115346e0', params: Object.freeze(['is_active']) }),
+  // unpaginated: the endpoint takes NO page/limit (sending either is rejected by Daftra/broker). See extractUnpaged().
+  taxes: Object.freeze({ path: 'taxes', model: 'Tax', doc: '15115346e0', unpaginated: true, params: Object.freeze(['is_active']) }),
   treasuries: Object.freeze({ path: 'treasuries', model: 'Treasury', doc: '15115371e0', params: Object.freeze(['limit', 'page']) }),
 });
 

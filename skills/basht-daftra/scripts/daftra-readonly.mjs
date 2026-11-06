@@ -3,7 +3,7 @@
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { ENTITIES, REPORTS, buildQuery } from './daftra-entities.mjs';
-import { extractList, extractOne, extractPage } from './daftra-normalize.mjs';
+import { extractList, extractOne, extractPage, extractUnpaged } from './daftra-normalize.mjs';
 
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_JSON_BYTES = 50 * 1024 * 1024;
@@ -107,6 +107,7 @@ export async function listInvoices(env, fetcher) {
 
 // A single page, validated, with an honest `complete` flag.
 export async function listPage(entity, query, env, fetcher, extra) {
+  if (entitySpec(entity).unpaginated) return extractUnpaged(await listRecords(entity, env, fetcher, query, extra), entity);
   return extractList(await listRecords(entity, env, fetcher, query, extra), entity);
 }
 
@@ -120,8 +121,14 @@ export async function getOne(entity, id, env, fetcher) {
 // and the number of rows collected equals total_results.
 export async function fetchAllRecords(entity, options = {}, env = process.env, fetcher = fetch) {
   const { query = {}, pageSize = 100, maxPages = 500, maxRecords = 50000, sleep = defaultSleep } = options;
-  entitySpec(entity);
+  const spec = entitySpec(entity);
   if (Object.hasOwn(query, 'page') || Object.hasOwn(query, 'limit')) throw new Error('page and limit are managed by fetchAllRecords');
+  if (spec.unpaginated) {
+    // Single request, no page/limit. Only returned when the response proves completeness; otherwise blocked.
+    const page = extractUnpaged(await listRecords(entity, env, fetcher, query, { sleep }), entity);
+    if (!page.complete) throw new Error('Export blocked: ' + page.warning);
+    return Object.freeze({ records: page.records, entity, complete: true, count: page.count, total: page.total, pages: 1, warning: null, fetched_at: new Date().toISOString() });
+  }
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500) throw new Error('pageSize must be 1-500');
   let lastError;
   for (let attempt = 0; attempt < 2; attempt++) {

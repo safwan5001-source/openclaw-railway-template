@@ -70,6 +70,44 @@ export function extractList(payload, entity) {
   });
 }
 
+// Unpaginated collections (entity spec `unpaginated: true`, e.g. taxes). Source: Daftra docs 15115346e0 ("GET All Taxes"):
+// "Results are not paginated - every tax is returned in a single response; the `pagination` object is included only for
+// envelope consistency". Therefore completeness is proven by the RESPONSE CONTRACT, never by pagination counters:
+//   - envelope: object; code === 200; result, when present, is a success string ('success' / 'successful', case-insensitive)
+//   - data: array (may be empty); each element has the model key with a unique positive-integer id (name, if present, is a non-empty string)
+//   - value: numeric string/number; is_active (if present): 0 or 1
+// `pagination` is ignored (any values, including contradictory ones, are not an error for this endpoint).
+// Body completeness (not truncated) is enforced by the transport: readResponse() parses the full body as JSON.
+const SUCCESS_RESULT = /^success(ful)?$/i;
+const POSITIVE_ID = /^[1-9][0-9]{0,14}$/;
+
+export function extractUnpaged(payload, entity) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw Error('Invalid Daftra response: envelope is not an object');
+  if (!Object.hasOwn(ENTITIES, entity)) throw Error('Unsupported entity');
+  const key = ENTITIES[entity].model;
+  const code = payload.code;
+  if (!(code === 200 || code === '200')) throw Error('Invalid Daftra response: envelope code is ' + String(code).slice(0, 20));
+  // `result` is informational: some envelopes (and the offline fake) omit it. When present it must say success.
+  if (payload.result !== undefined && (typeof payload.result !== 'string' || !SUCCESS_RESULT.test(payload.result))) throw Error('Invalid Daftra response: envelope result is not success');
+  if (!Array.isArray(payload.data)) throw Error('Unrecognised list response: expected data array');
+  const seen = new Set();
+  const records = payload.data.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw Error('Invalid row');
+    const model = entry[key];
+    if (!model || typeof model !== 'object' || Array.isArray(model)) throw Error('Missing model ' + key);
+    const id = String(model.id ?? '');
+    if (!POSITIVE_ID.test(id)) throw Error('Invalid ' + key + ' id');
+    if (seen.has(id)) throw Error('Duplicate ' + key + ' id ' + id + ' in one response');
+    seen.add(id);
+    if (model.name !== undefined && (typeof model.name !== 'string' || model.name.trim() === '')) throw Error('Invalid ' + key + ' name for id ' + id);
+    if (!(typeof model.value === 'string' || typeof model.value === 'number') || !/^\d{1,3}(\.\d{1,4})?$/.test(String(model.value)))
+      throw Error('Invalid ' + key + ' value for id ' + id);
+    if (model.is_active !== undefined && !['0', '1', 0, 1].includes(model.is_active)) throw Error('Invalid ' + key + ' is_active for id ' + id);
+    return model;
+  });
+  return Object.freeze({ records, entity, complete: true, count: records.length, total: records.length, warning: null });
+}
+
 // GET /api2/<entity>/<id>.json -> { data: { <Model>: {...}, ... } }
 export function extractOne(payload, entity) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw Error('Invalid Daftra response');
