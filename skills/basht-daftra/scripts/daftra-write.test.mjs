@@ -268,6 +268,48 @@ test('rate limit stops runaway writes', async () => {
   } finally { await done(); }
 });
 
+test('approved draft invoice goes out offline: draft:1 + is_offline:1, no email/send field, no query, no client/party write', async () => {
+  const seed = { post: () => ({ status: 202, json: { code: 202, result: 'successful', id: 5001 } }) };
+  const { env, fake, done } = await setup(seed);
+  try {
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const p = await createProposal('sales_invoice', invoiceInput, { env, fetcher: fake.fetch });
+    assert.equal(p.request.body.Invoice.is_offline, 1);
+    await executeProposal(approve(p), { env, fetcher: fake.fetch });
+    assert.equal(fake.posts.length, 1);
+    const post = fake.posts[0];
+    assert.equal(post.path, '/api2/invoices.json');
+    assert.equal(post.search, '');
+    const sent = JSON.parse(post.body);
+    assert.equal(sent.Invoice.draft, 1);
+    assert.equal(sent.Invoice.is_offline, 1);
+    assert.deepEqual(Object.keys(sent).sort(), ['Invoice', 'InvoiceItem']);
+    assert.equal(/email|send_to|mail/i.test(post.body), false);
+    assert.ok(fake.posts.every((c) => c.path === '/api2/invoices.json'));
+  } finally { await done(); }
+});
+
+test('approved FINAL invoice keeps its existing body: draft:0, no is_offline', async () => {
+  const seed = { post: () => ({ status: 202, json: { code: 202, result: 'successful', id: 5001 } }) };
+  const { env, fake, done } = await setup(seed);
+  try {
+    fake.created.invoices = { 5001: { id: 5001, summary_total: '230.00' } };
+    const p = await createProposal('sales_invoice', { ...invoiceInput, finalize: true }, { env, fetcher: fake.fetch });
+    assert.equal(p.mode, 'final');
+    await executeProposal(approve(p), { env, fetcher: fake.fetch });
+    const sent = JSON.parse(fake.posts[0].body);
+    assert.deepEqual(sent.Invoice, { client_id: 4, draft: 0, date: '2025-03-01' });
+  } finally { await done(); }
+});
+
+test('write gate refuses a tampered invoice body (is_offline on final, wrong value, email fields) before any request', () => {
+  const line = [{ item: 'x', quantity: '1', unit_price: '1', tax1: 0, tax2: 0 }];
+  const req = (Invoice) => ({ method: 'POST', path: '/api2/invoices.json', query: '', body: { Invoice: { client_id: 4, date: '2025-03-01', ...Invoice }, InvoiceItem: line } });
+  assert.doesNotThrow(() => assertWriteAllowed('sales_invoice', req({ draft: 1, is_offline: 1 })));
+  for (const bad of [{ draft: 0, is_offline: 1 }, { draft: 1, is_offline: 0 }, { draft: 1, is_offline: '1' }, { draft: 1, is_offline: 1, send_email: 1 }])
+    assert.throws(() => assertWriteAllowed('sales_invoice', req(bad)), (e) => e instanceof WriteRefused && e.code === 'BODY_DENIED', JSON.stringify(bad));
+});
+
 test('route allowlist: POST create endpoints + PUT for products/categories/clients/suppliers only; PATCH/DELETE and foreign paths are impossible', () => {
   assert.deepEqual(Object.entries(WRITE_ROUTES).filter(([, r]) => r.method !== 'POST').map(([k]) => k).sort(), ['category_update', 'client_update', 'product_update', 'supplier_update']);
   assert.ok(Object.values(WRITE_ROUTES).every((r) => ['POST', 'PUT'].includes(r.method)));

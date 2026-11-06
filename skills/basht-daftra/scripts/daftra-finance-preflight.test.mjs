@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { prepareFinancialAction, hashRequest, canonicalJson } from './daftra-finance-preflight.mjs';
+import { prepareFinancialAction, assertBodyShape, hashRequest, canonicalJson } from './daftra-finance-preflight.mjs';
 import { listRecords, getRecord, pdfUrl } from './daftra-readonly.mjs';
 
 const env = { DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: 'dummy' };
@@ -70,12 +70,13 @@ test('rejects malformed amounts, dates, ids and lines', () => {
 
 test('request bodies follow the documented Daftra shapes', () => {
   const inv = prepareFinancialAction('sales_invoice', base, { taxes });
-  assert.deepEqual(inv.request.body.Invoice, { client_id: 4, draft: 1, date: '2025-03-01' });
+  assert.deepEqual(inv.request.body.Invoice, { client_id: 4, draft: 1, is_offline: 1, date: '2025-03-01' });
   assert.deepEqual(inv.request.body.InvoiceItem[0], { item: 'Diesel', quantity: '1000', unit_price: '1.89', tax1: 1, tax2: 0 });
   assert.equal(inv.request.path, '/api2/invoices.json');
   assert.equal(inv.mode, 'draft');
   const fin = prepareFinancialAction('sales_invoice', { ...base, finalize: true }, { taxes });
   assert.equal(fin.request.body.Invoice.draft, 0);
+  assert.equal(Object.hasOwn(fin.request.body.Invoice, 'is_offline'), false);
   assert.ok(fin.effects.includes('may_trigger_e_invoice_submission'));
   const po = prepareFinancialAction('purchase_invoice', { supplier_id: 7, date: '2025-03-01', items: [{ item: 'Oil', quantity: '2', unit_price: '10', tax1: 0 }] }, { taxes });
   assert.equal(po.request.path, '/api2/purchase_invoices.json');
@@ -125,4 +126,37 @@ test('PDF URL retains official path and rejects other origins', () => {
   const url = pdfUrl({data:{Invoice:{invoice_pdf_url:'https://nepras.daftra.com/invoices/view/2621.pdf?hash=abc'}}},env);
   assert.equal(url.pathname, '/invoices/view/2621.pdf');
   assert.throws(() => pdfUrl({data:{Invoice:{invoice_pdf_url:'https://evil.example/a.pdf'}}},env));
+});
+
+test('sales-invoice draft is created offline (is_offline:1, draft:1); final invoice and estimate are unchanged', () => {
+  const draft = prepareFinancialAction('sales_invoice', base, { taxes });
+  assert.equal(draft.mode, 'draft');
+  assert.equal(draft.request.body.Invoice.draft, 1);
+  assert.equal(draft.request.body.Invoice.is_offline, 1);
+  assert.equal(draft.request.query, '');
+  assert.doesNotThrow(() => assertBodyShape('sales_invoice', draft.request.body));
+  const final = prepareFinancialAction('sales_invoice', { ...base, finalize: true }, { taxes });
+  assert.equal(final.mode, 'final');
+  assert.deepEqual(final.request.body.Invoice, { client_id: 4, draft: 0, date: '2025-03-01' });
+  assert.ok(final.effects.includes('may_trigger_e_invoice_submission'));
+  const est = prepareFinancialAction('estimate', base, { taxes });
+  assert.equal(Object.hasOwn(est.request.body.Invoice, 'is_offline'), false);
+  // input cannot influence the flag
+  assert.equal(prepareFinancialAction('sales_invoice', { ...base, is_offline: 0 }, { taxes }).request.body.Invoice.is_offline, 1);
+  assert.equal(Object.hasOwn(prepareFinancialAction('sales_invoice', { ...base, finalize: true, is_offline: 1 }, { taxes }).request.body.Invoice, 'is_offline'), false);
+});
+
+test('body allowlist: is_offline must be integer 1 on a draft only; email/send fields and other values are refused', () => {
+  const items = [{ item: 'x', quantity: '1', unit_price: '1', tax1: 0, tax2: 0 }];
+  const body = (Invoice) => ({ Invoice: { client_id: 4, date: '2025-03-01', ...Invoice }, InvoiceItem: items });
+  assert.doesNotThrow(() => assertBodyShape('sales_invoice', body({ draft: 1, is_offline: 1 })));
+  assert.doesNotThrow(() => assertBodyShape('sales_invoice', body({ draft: 0 })));
+  for (const bad of [
+    { draft: 1, is_offline: 0 }, { draft: 1, is_offline: '1' }, { draft: 1, is_offline: true }, { draft: 1, is_offline: 2 },
+    { draft: 1, is_offline: null }, { draft: 0, is_offline: 1 }, { draft: '1', is_offline: 1 }, { draft: 2 },
+    { draft: 1, is_offline: 1, send_email: 1 }, { draft: 1, is_offline: 1, email: 'a@b.c' }, { draft: 1, is_offline: 1, send_to_client: 1 },
+    { draft: 1, is_offline: 1, is_online: 1 }, { draft: 1, is_offline: 1, no: 'X-1' },
+  ]) assert.throws(() => assertBodyShape('sales_invoice', body(bad)), /Invoice/, JSON.stringify(bad));
+  // is_offline is not part of any other document's allowlist
+  assert.throws(() => assertBodyShape('estimate', body({ draft: 1, is_offline: 1 })), /unexpected fields/);
 });
