@@ -475,9 +475,16 @@ export function createBrokerService(options = {}) {
   }
   function sameOrigin(req) {
     const origin = req.headers.origin;
-    if (typeof origin !== 'string') return false;
-    if (env.BROKER_PUBLIC_ORIGIN) return origin === env.BROKER_PUBLIC_ORIGIN;
-    try { return new URL(origin).host === req.headers.host; } catch { return false; }
+    if (typeof origin === 'string') {
+      if (env.BROKER_PUBLIC_ORIGIN) return origin === env.BROKER_PUBLIC_ORIGIN;
+      try { return new URL(origin).host === req.headers.host; } catch { return false; }
+    }
+    // Safari can omit Origin on same-origin HTML form POSTs. Accept its browser-supplied
+    // Fetch Metadata ONLY when Origin is absent, the public host matches exactly, and
+    // the form's single-use HMAC pre-token / session CSRF token still verifies.
+    // Reject Origin:null, cross-site and same-site subdomain requests.
+    if (origin !== undefined || req.headers['sec-fetch-site'] !== 'same-origin' || !env.BROKER_PUBLIC_ORIGIN) return false;
+    try { return req.headers.host === new URL(env.BROKER_PUBLIC_ORIGIN).host; } catch { return false; }
   }
 
   // Banners (exposure alarm, writes disabled, not configured) are shown ONLY on authenticated pages: an anonymous visitor
