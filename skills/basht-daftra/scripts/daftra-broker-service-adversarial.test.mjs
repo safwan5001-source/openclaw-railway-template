@@ -82,7 +82,10 @@ test('TOKEN CONFUSION: read key, write key, approval secret, operator password, 
     try { assert.equal((await rotated.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { token: AGENT_TOKEN })).status, 401); } finally { await rotated.stop(); }
     // a short agent token disables the API entirely (service not configured), no token configured => everything 401
     const short = await startService({ env: { BROKER_AGENT_TOKEN: 'short' } });
-    try { assert.equal(short.service.configured, false); assert.equal((await short.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { token: 'short' })).status, 503); } finally { await short.stop(); }
+    try { assert.equal(short.service.configured, false); assert.equal((await short.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { token: 'short' })).status, 401, 'a short token is never accepted'); } finally { await short.stop(); }
+    // the PREVIOUS token must be strong too: a short one makes the service unconfigured and is never accepted
+    const weakPrev = await startService({ env: { BROKER_AGENT_TOKEN_PREVIOUS: 'abc' } });
+    try { assert.equal(weakPrev.service.configured, false); assert.ok(weakPrev.service.issues.some((i) => /BROKER_AGENT_TOKEN_PREVIOUS must be at least 32/.test(i))); assert.equal((await weakPrev.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { token: 'abc' })).status, 401); } finally { await weakPrev.stop(); }
     const none = await startService({ env: { BROKER_AGENT_TOKEN: undefined } });
     try { assert.equal((await none.agent('/v1/status', { id: 'prop_0123456789abcdef' }, { token: '' })).status, 401); assert.equal((await none.agent('/v1/status', {}, { token: 'undefined' })).status, 401); } finally { await none.stop(); }
   } finally { await c.stop(); }
@@ -96,8 +99,11 @@ test('AUTH FAILURE FLOOD is rate limited per peer and audited; valid requests st
     assert.equal(last.status, 429);
     c.clock.t += 61_000;
     assert.notEqual((await c.agent('/v1/status', { id: 'prop_0123456789abcdef' })).status, 401);
+    await c.service._flushAggregates();
     const audit = await readAudit({ stateDir: c.stateDir, secret: OP_SECRET });
-    assert.ok(audit.some((a) => a.event === 'agent_auth_failed'));
+    const summary = audit.filter((a) => a.event === 'unauth_summary');
+    assert.equal(audit.filter((a) => a.event === 'agent_auth_failed').length, 0, 'unauthenticated failures are NOT audited line by line');
+    assert.ok(summary.length >= 1 && summary.some((s) => (s.counts.agent_auth_failed ?? 0) + (s.counts.agent_auth_flood ?? 0) >= 30), 'but they are counted in an aggregate line');
     scan(JSON.stringify(audit), 'audit');
   } finally { await c.stop(); }
 });
@@ -195,35 +201,56 @@ test('LOGIN: both factors, uniform errors, security headers, form tokens are sin
   } finally { await c.stop(); }
 });
 
-test('LOCKOUT over HTTP: brute force locks the client even with correct credentials, and survives a service restart', async () => {
+test('LOCKOUT over HTTP: invalid attempts are throttled (<= 60 s, survives restart) but the OPERATOR with valid credentials is never locked out', async () => {
   const c = await startService();
   const keep = c.base;
   try {
     const op = c.operator();
     for (let i = 0; i < 5; i++) assert.equal((await op.login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 401);
-    assert.equal((await op.login({ code: c.totp() })).status, 429);
+    assert.equal((await op.login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 429, 'invalid attempt during the lock');
     await c.stop(false);
     const again = await startService({ keepState: keep, clock: c.clock });
-    try { assert.equal((await again.operator().login({ code: again.totp() })).status, 429, 'lockout persisted across restart'); } finally { await again.stop(false); }
+    try {
+      assert.equal((await again.operator().login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 429, 'the lock persisted across restart');
+      const ok = again.operator(); assert.equal((await ok.login({ code: again.totp() })).status, 303, 'valid credentials are accepted DESPITE the lock');
+      again.clock.t += 61_000;                                                     // a lock never exceeds a minute
+      assert.equal((await again.operator().login({ password: 'wrong-password-wrong-password', code: '000000' })).status, 401, 'lock expired');
+    } finally { await again.stop(false); }
   } finally { await rm(keep, { recursive: true, force: true }); }
 });
 
-test('X-Real-IP is trusted for throttling ONLY with BROKER_TRUST_PROXY=1 and only when it is a valid IP; otherwise rotating it cannot evade lockout', async () => {
+test('REVIEW#2 (e2): unauthenticated global lock-out attack with rotating X-Real-IP can never keep the operator out, and no lock exceeds a minute', async () => {
+  const c = await startService({ env: { BROKER_TRUST_PROXY: '1', BROKER_PREAUTH_RPS: '2000' } });    // this test measures the LOGIN lock, not the pre-auth limiter
+  try {
+    const op = c.operator();
+    const bad = async (ip) => { const { pre } = await op.pre(); return op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': ip }, cookie: null }); };
+    for (let i = 0; i < 40; i++) await bad('203.0.113.' + i);                      // enough to trip the GLOBAL counter
+    const st = c.service._auth._state(); assert.ok(st.global.until > c.clock.t, 'global lock is active');
+    assert.ok(st.global.until - c.clock.t <= 60_000, 'but never longer than a minute');
+    const { pre } = await op.pre();
+    const login = await op.request('POST', '/login', { form: { pre, password: OPERATOR_PASSWORD, code: c.totp() }, headers: { 'X-Real-IP': '198.51.100.99' }, cookie: null });
+    assert.equal(login.status, 303, 'the operator signs in with the right password and a fresh code');
+    // "one failure right after each lock expires" (the hourly-lock pattern) cannot escalate beyond a minute either
+    for (let i = 0; i < 10; i++) { c.clock.t = Math.max(c.clock.t, c.service._auth._state().global.until) + 1; await bad('192.0.2.' + i); }
+    assert.ok(c.service._auth._state().global.until - c.clock.t <= 60_000);
+    assert.equal((await c.operator().login({ code: c.freshCode() })).status, 303);
+  } finally { await c.stop(); }
+});
+
+test('X-Real-IP is trusted for throttling ONLY with BROKER_TRUST_PROXY=1 and only when it is a valid IP; otherwise rotating it cannot evade the throttle', async () => {
   const c = await startService();
   try {
     const op = c.operator();
     for (let i = 0; i < 6; i++) await op.request('POST', '/login', { form: { pre: (await op.pre()).pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': '10.0.0.' + i }, cookie: null });
-    assert.equal((await op.request('POST', '/login', { form: { pre: (await op.pre()).pre, password: OPERATOR_PASSWORD, code: c.totp() }, headers: { 'X-Real-IP': '10.9.9.9' }, cookie: null })).status, 429, 'rotating X-Real-IP did not help');
+    assert.equal((await op.request('POST', '/login', { form: { pre: (await op.pre()).pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': '10.9.9.9' }, cookie: null })).status, 429, 'rotating X-Real-IP did not help the guesser');
   } finally { await c.stop(); }
   const t = await startService({ env: { BROKER_TRUST_PROXY: '1' } });
   try {
     const op = t.operator();
-    const fail = (ip) => op.request('POST', '/login', { form: { pre: null, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': ip }, cookie: null });
-    const login = async (ip) => { const { pre } = await op.pre(); return op.request('POST', '/login', { form: { pre, password: OPERATOR_PASSWORD, code: t.totp() }, headers: { 'X-Real-IP': ip }, cookie: null }); };
-    for (let i = 0; i < 5; i++) { const { pre } = await op.pre(); await op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': '198.51.100.7' }, cookie: null }); }
-    assert.equal((await login('198.51.100.7')).status, 429, 'that client is locked');
-    assert.equal((await login('198.51.100.8')).status, 303, 'another real client is not');
-    void fail;
+    const bad = async (ip) => { const { pre } = await op.pre(); return op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': ip }, cookie: null }); };
+    for (let i = 0; i < 5; i++) await bad('198.51.100.7');
+    assert.equal((await bad('198.51.100.7')).status, 429, 'that client is throttled');
+    assert.equal((await bad('198.51.100.8')).status, 401, 'another real client is not');
     const { pre } = await op.pre();
     // garbage X-Real-IP is ignored (falls back to the socket address) instead of being used as an identity
     const g = await op.request('POST', '/login', { form: { pre, password: 'w'.repeat(30), code: '000000' }, headers: { 'X-Real-IP': 'not-an-ip; DROP' }, cookie: null });

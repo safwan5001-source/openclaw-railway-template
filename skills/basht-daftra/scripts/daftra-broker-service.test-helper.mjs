@@ -44,7 +44,7 @@ export async function startService({ env: over = {}, fake = new FakeDaftra(), cl
   const env = {
     DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_WRITE_API_KEY: WRITE_KEY, DAFTRA_APPROVAL_SECRET: OP_SECRET,
     BROKER_AGENT_TOKEN: AGENT_TOKEN, OPERATOR_PASSWORD, OPERATOR_TOTP_SEED: TOTP_SEED, DAFTRA_WRITES_ENABLED: '1',
-    BROKER_STATE_DIR: stateDir, RAILWAY_PRIVATE_DOMAIN: PRIVATE_HOST, RAILWAY_PUBLIC_DOMAIN: PUBLIC_HOST, ...over,
+    BROKER_STATE_DIR: stateDir, RAILWAY_PRIVATE_DOMAIN: PRIVATE_HOST, RAILWAY_PUBLIC_DOMAIN: PUBLIC_HOST, OPERATOR_FAIL_DELAY_MS: '0', ...over,
   };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
   const service = createBrokerService({ env, fetcher: fake.fetch, now: () => clock.t, log: (l) => logs.push(l), publicHost: '127.0.0.1', privateHost: '127.0.0.1', publicPort: 0, privatePort: 0, timeoutsMs });

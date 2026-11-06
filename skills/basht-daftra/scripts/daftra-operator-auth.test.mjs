@@ -1,15 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, readFile, symlink } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, symlink, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { base32Encode, deriveTotpSecret, totpBase32, totpCode, stepAt, matchTotp, otpauthUri, createOperatorAuth, constantTimeEqual, SESSION_IDLE_MS, SESSION_ABSOLUTE_MS } from './daftra-operator-auth.mjs';
+import { base32Encode, deriveTotpSecret, totpBase32, totpCode, stepAt, matchTotp, otpauthUri, createOperatorAuth, constantTimeEqual, SESSION_IDLE_MS, SESSION_ABSOLUTE_MS, LOCK_MAX_MS } from './daftra-operator-auth.mjs';
 
 const PW = 'correct horse battery staple 42'; const SEED = 'totp-seed-0123456789-0123456789-0123456789-abcdef';
 const T0 = Date.UTC(2026, 10, 6, 12, 0, 5);
 async function mk(over = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'basht-oa-')); const clock = { t: T0 };
-  const make = () => createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED, ...over }, stateDir: dir, now: () => clock.t });
+  const make = () => createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED, OPERATOR_FAIL_DELAY_MS: '0', ...over }, stateDir: dir, now: () => clock.t });
   return { dir, clock, make, auth: make(), done: () => rm(dir, { recursive: true, force: true }) };
 }
 const code = (clock, off = 0) => totpCode(deriveTotpSecret(SEED), stepAt(clock.t) + off);
@@ -76,25 +76,98 @@ test('REPLAY: a code works once, the login code never authorises a step-up, olde
   } finally { await m.done(); }
 });
 
-test('LOCKOUT: exponential, per client and global, persisted across restart', async () => {
+const BAD = { password: 'wrong'.repeat(6), code: '000000' };
+
+test('LOCKOUT: invalid attempts get locked (<= 60 s), VALID credentials are NEVER refused because of a lock, locks persist across restart', async () => {
   const m = await mk();
   try {
-    for (let i = 0; i < 4; i++) assert.equal((await m.auth.login({ password: 'wrong'.repeat(6), code: '000000', ip: '9.9.9.9' })).status, 401);
-    assert.equal((await m.auth.login({ password: 'wrong'.repeat(6), code: '000000', ip: '9.9.9.9' })).status, 401);   // 5th failure triggers the lock
-    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).status, 429, 'even correct credentials are refused while locked');
+    for (let i = 0; i < 5; i++) assert.equal((await m.auth.login({ ...BAD, ip: '9.9.9.9' })).status, 401);       // the 5th failure starts the lock
+    assert.equal((await m.auth.login({ ...BAD, ip: '9.9.9.9' })).status, 429, 'invalid + locked = cheap refusal');
+    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).ok, true, 'valid credentials are never refused by a lock');
+    // restart: the persisted lock still throttles INVALID attempts from that client
+    for (let i = 0; i < 6; i++) await m.auth.login({ ...BAD, ip: '5.5.5.5' });
+    await m.auth.flush();
     const restarted = m.make();
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).status, 429, 'lock survives a restart');
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '8.8.8.8' })).ok, true, 'another client is not locked');
+    assert.equal((await restarted.login({ ...BAD, ip: '5.5.5.5' })).status, 429, 'lock survives a restart');
     m.clock.t += 31_000;
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '9.9.9.9' })).ok, true, 'lock expires');
-    // escalation: 5th failure locks 30 s, the next failure after it expires locks 60 s
-    for (let i = 0; i < 5; i++) await restarted.login({ password: 'wrong'.repeat(6), code: '000000', ip: '7.7.7.7' });
+    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '5.5.5.5' })).ok, true);
+    // a quiet client is unaffected by someone else's failures
+    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '8.8.8.8' })).status, 401, 'same step: replay is dead for everyone (not a lock)');
+  } finally { await m.done(); }
+});
+
+test('LOCKOUT is capped: no failure pattern can lock anyone out for more than a minute, and counters decay', async () => {
+  const m = await mk();
+  try {
+    for (let i = 0; i < 200; i++) { await m.auth.login({ ...BAD, ip: 'r' + (i % 40) }); m.clock.t += 700; }
+    const t = m.clock.t; const s = m.auth._state();
+    assert.ok((s.global.until ?? 0) - t <= LOCK_MAX_MS, 'global lock <= ' + LOCK_MAX_MS);
+    for (const c of Object.values(s.clients)) assert.ok((c.until ?? 0) - t <= LOCK_MAX_MS);
+    // the e2 scenario: one failure just after each lock expired never reaches an hour-long lock
+    for (let i = 0; i < 12; i++) { m.clock.t = Math.max(m.clock.t, s.global.until) + 1; await m.auth.login({ ...BAD, ip: 'x' }); }
+    assert.ok(m.auth._state().global.until - m.clock.t <= LOCK_MAX_MS);
+    // the operator signs in right through all of it
     m.clock.t += 31_000;
-    assert.equal((await restarted.login({ password: 'wrong'.repeat(6), code: '000000', ip: '7.7.7.7' })).status, 401);   // fails again => 60 s lock
+    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: 'op' })).ok, true);
+    // 16 quiet minutes later counters are forgotten
+    m.clock.t += 16 * 60_000;
+    await m.auth.login({ ...BAD, ip: 'q' });
+    assert.equal(m.auth._state().clients[Object.keys(m.auth._state().clients).at(-1)].fails, 1);
+  } finally { await m.done(); }
+});
+
+test('failures are SERIALISED and DELAYED with a bounded queue; valid logins never wait behind them', async () => {
+  const m = await mk();
+  try {
+    const sleeps = []; let release; const gate = new Promise((ok) => { release = ok; });
+    const auth = createOperatorAuth({ env: { OPERATOR_PASSWORD: PW, OPERATOR_TOTP_SEED: SEED }, stateDir: m.dir, now: () => m.clock.t, failDelayMs: 100, sleep: async (ms) => { sleeps.push(ms); await gate; } });
+    const flood = Array.from({ length: 60 }, (_, i) => auth.login({ ...BAD, ip: 'f' + i }));
+    await new Promise((ok) => setTimeout(ok, 30));
+    const t0 = Date.now();
+    const ok = await auth.login({ password: PW, code: code(m.clock), ip: 'operator' });          // must not queue behind the flood
+    assert.equal(ok.ok, true); assert.ok(Date.now() - t0 < 500);
+    release(); const results = await Promise.all(flood);
+    assert.ok(results.every((r) => r.status === 401 || r.status === 429));
+    assert.ok(sleeps.length <= 20, 'at most 20 queued delays (got ' + sleeps.length + ')');
+    assert.ok(sleeps.every((ms) => ms >= 100 && ms <= 2000));
+  } finally { await m.done(); }
+});
+
+test('BREAK-GLASS clearLocks() removes every lock but NEVER the replay high-water mark', async () => {
+  const m = await mk();
+  try {
+    const first = code(m.clock);
+    assert.equal((await m.auth.login({ password: PW, code: first, ip: 'a' })).ok, true);
+    for (let i = 0; i < 30; i++) await m.auth.login({ ...BAD, ip: 'z' });
+    assert.equal((await m.auth.login({ ...BAD, ip: 'z' })).status, 429);
+    assert.equal(await m.auth.clearLocks(), true);
+    assert.equal((await m.auth.login({ ...BAD, ip: 'z' })).status, 401, 'no lock any more');
+    assert.equal((await m.auth.login({ password: PW, code: first, ip: 'z' })).status, 401, 'the used code stays dead');
+    assert.equal(m.auth._state().last_step, stepAt(m.clock.t));
+  } finally { await m.done(); }
+});
+
+test('the state write chain RECOVERS after a transient I/O error (no sticky 500s)', async () => {
+  const m = await mk();
+  try {
+    await m.auth.ready();
+    const moved = m.dir + '-away';
+    await rename(m.dir, moved);
+    await assert.rejects(m.auth.login({ password: PW, code: code(m.clock), ip: 'a' }));      // save() fails: the error reaches THIS caller
+    await rename(moved, m.dir);
     m.clock.t += 31_000;
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '7.7.7.7' })).status, 429, 'second lock is longer than the first');
-    m.clock.t += 30_000;
-    assert.equal((await restarted.login({ password: PW, code: code(m.clock), ip: '7.7.7.7' })).ok, true);
+    assert.equal((await m.auth.login({ password: PW, code: code(m.clock), ip: 'a' })).ok, true, 'next login works');
+  } finally { await m.done(); }
+});
+
+test('enrollment proof is password-only, never refused for the right password, throttled for wrong ones, and creates no session', async () => {
+  const m = await mk();
+  try {
+    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'a' })).ok, true);
+    assert.equal(m.auth.sessionCount(), 0);
+    for (let i = 0; i < 6; i++) await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' });
+    assert.equal((await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' })).status, 429);
+    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'b' })).ok, true, 'the right password is never refused');
   } finally { await m.done(); }
 });
 
@@ -142,15 +215,5 @@ test('sessions: new id per login, idle and absolute expiry, logout, cap; pre-log
     m.clock.t += SESSION_ABSOLUTE_MS; for (let k = 0; k < 3; k++) { m.clock.t -= SESSION_IDLE_MS - 1; m.auth.session(c.id); }
     m.clock.t += SESSION_ABSOLUTE_MS; assert.equal(m.auth.session(c.id), null);
     const p = m.auth.issuePre(); assert.equal(m.auth.consumePre(p), true); assert.equal(m.auth.consumePre(p), false); assert.equal(m.auth.consumePre('x'), false);
-  } finally { await m.done(); }
-});
-
-test('enrollment proof is password-only, throttled, and creates no session', async () => {
-  const m = await mk();
-  try {
-    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'a' })).ok, true);
-    assert.equal(m.auth.sessionCount(), 0);
-    for (let i = 0; i < 5; i++) await m.auth.verifyPasswordOnly({ password: 'nope'.repeat(8), ip: 'b' });
-    assert.equal((await m.auth.verifyPasswordOnly({ password: PW, ip: 'b' })).status, 429);
   } finally { await m.done(); }
 });

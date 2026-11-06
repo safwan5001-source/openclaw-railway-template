@@ -2,7 +2,7 @@
 
 Status: **implemented and tested offline; NOT deployed.** Nothing here touches Railway, the Gateway, the model, the OpenClaw
 service, its `/data` volume, the Dockerfile/entrypoint, or any variable. Code: `skills/basht-daftra/scripts/daftra-broker-service.mjs`,
-`daftra-operator-auth.mjs`, `daftra-broker-service-client.mjs` (agent side) and the service mode of `daftra-cli.mjs`.
+`daftra-operator-auth.mjs`, `daftra-broker-reads.mjs` (read-proxy core), `daftra-broker-service-client.mjs` (agent side, incl. the read shim) and the service mode of `daftra-cli.mjs`.
 (Packaging — Dockerfile.broker, entrypoint, railway config, CI — is owned by the packaging work-stream.)
 
 ## 1. Why a separate service
@@ -14,12 +14,12 @@ cannot read its environment, its files, or its `/proc`, and no variable of the b
 
 ```
  iPhone (operator, separate device/context)                    OpenClaw service (agent / Gateway)
-   Safari ──https──► PUBLIC console :PORT (8080)                 env: DAFTRA_BROKER_URL, DAFTRA_BROKER_TOKEN, DAFTRA_API_KEY(read)
-   password + TOTP, step-up TOTP per action                      NO write key, NO approval secret, NO operator credentials
+   Safari ──https──► PUBLIC console :PORT (8080)                 env: DAFTRA_BASE_URL, DAFTRA_BROKER_URL, DAFTRA_BROKER_TOKEN ONLY
+   password + TOTP, step-up TOTP per action                      NO Daftra credential of any kind (reads go through the broker)
                          │                                                  │  http://<broker>.railway.internal:8081
                   ┌──────┴───────────── BROKER SERVICE (own container, own volume /broker-data) ──────┴───────┐
                   │ public listener  PORT          : console (HTML) + /healthz + /setup/healthz              │
-                  │ private listener BROKER_PRIVATE_PORT (8081, bound to ::) : /v1/propose|propose_duplicate|show|status │
+                  │ private listener BROKER_PRIVATE_PORT (8081, bound to ::) : /v1/propose|propose_duplicate|show|status|get|invoice_pdf │
                   │ holds: DAFTRA_WRITE_API_KEY, DAFTRA_APPROVAL_SECRET (HMAC), OPERATOR_PASSWORD, OPERATOR_TOTP_SEED, │
                   │        BROKER_AGENT_TOKEN, state: proposals + HMAC ledger + HMAC audit + operator state            │
                   └──────────────► https://<tenant>.daftra.com (pinned, no redirects) ─────────────────────────────┘
@@ -36,7 +36,7 @@ There is no `execute`, `approve`, `resolve` or "enable writes" route for the age
 | Variable | Meaning |
 | --- | --- |
 | `DAFTRA_BASE_URL` | `https://<tenant>.daftra.com` — the only host the service ever contacts |
-| `DAFTRA_WRITE_API_KEY` (or `_FILE`) | write-capable Daftra key; exists nowhere else |
+| `DAFTRA_WRITE_API_KEY` (or `_FILE`) | the broker's ONLY Daftra key: it performs the agent's reads (GET only) and, after operator approval, the writes. Exists nowhere else. **Daftra API-key roles are per ENTITY ("Only Allow / Only Block" lists), not per method**, so any key that can read invoices can also create/edit/delete them: this is why the agent holds no key at all, and why the key's entity list should be limited to the entities the business needs |
 | `DAFTRA_APPROVAL_SECRET` (or `_FILE`) | ≥32 chars; HMAC key for proposals, ledger, audit |
 | `BROKER_AGENT_TOKEN` (+ `BROKER_AGENT_TOKEN_PREVIOUS` during rotation) | ≥32 chars; the agent-side credential (authentication only) |
 | `OPERATOR_PASSWORD` | ≥20 chars |
@@ -50,10 +50,18 @@ There is no `execute`, `approve`, `resolve` or "enable writes" route for the age
 | `OPERATOR_ENROLLMENT=1` (temporary) | enables `/enroll` once to show the derived authenticator key; remove afterwards |
 | `OPERATOR_STATE_RESET=1` (temporary) | one-shot recovery if the operator state file fails authentication |
 | `BROKER_MAX_PENDING` (20), `BROKER_PROPOSE_PER_MIN` (10), `BROKER_RATE_PER_MIN` (60), `DAFTRA_MAX_WRITES_PER_HOUR` (20) | quotas |
+| `BROKER_GET_PER_MIN` (120), `BROKER_GET_CONCURRENCY` (4) | per-token read budget (separate from the propose/status budget) and concurrent upstream reads |
+| `BROKER_PREAUTH_RPS` (50) | pre-authentication token buckets in front of BOTH listeners (per peer socket address = rps, burst 2×/4×; one global bucket 4×rps, burst 8×rps). Over the limit ⇒ `429`, no auth, no audit line, no state |
+| `BROKER_MAX_PROPOSALS` (500), `BROKER_MAX_BYTES` (64 MiB) | caps on the number / total size of stored proposal files (BLOCKED ones count). A single proposal larger than 96 KiB (or with a body larger than 48 KiB) is refused `PROPOSAL_TOO_LARGE` |
+| `BROKER_RETAIN_DAYS` (90) | executed proposals are kept this long; BLOCKED / DECLINED / REJECTED / expired ones are deleted 5 min after their 15-minute TTL |
+| `BROKER_DECLINE_TTL_MIN` (60) | after the operator rejects a request, the identical request (same hash) is answered `DECLINED` instead of being offered again |
+| `OPERATOR_FAIL_DELAY_MS` (300, max 2000) | serialised delay on invalid login/step-up attempts (valid credentials never wait behind them) |
+| `BROKER_CONSOLE_REQUIRE_EDGE=1` (optional) | the console answers a uniform 404 to requests without an edge header (i.e. calls from the private network). Enable only once you have checked that Railway's edge adds `X-Forwarded-*` / `X-Railway-*` headers on your domain |
 | `RAILWAY_PUBLIC_DOMAIN` (Railway-provided) / `BROKER_PUBLIC_DOMAINS` | names that identify "this is the public edge" for the exposure alarm |
 
-**Agent service (OpenClaw)** — exactly: `DAFTRA_BASE_URL`, `DAFTRA_API_KEY` (role-limited **read** key), `DAFTRA_BROKER_URL`
-(`http://<broker-service>.railway.internal:8081`), `DAFTRA_BROKER_TOKEN` (= broker's `BROKER_AGENT_TOKEN`). It must NOT hold: `DAFTRA_WRITE_API_KEY`,
+**Agent service (OpenClaw)** — exactly **three** variables: `DAFTRA_BASE_URL` (`https://<tenant>.daftra.com`, used only to validate/shape request URLs),
+`DAFTRA_BROKER_URL` (`http://<broker-service>.railway.internal:8081`), `DAFTRA_BROKER_TOKEN` (= broker's `BROKER_AGENT_TOKEN`). **No Daftra key.** In service mode the CLI
+replaces the credential with an inert placeholder and ignores (and warns about) any `DAFTRA_API_KEY` / `DAFTRA_WRITE_API_KEY` found in its environment. It must NOT hold: `DAFTRA_API_KEY`, `DAFTRA_WRITE_API_KEY`,
 `DAFTRA_APPROVAL_SECRET`, `DAFTRA_WRITES_ENABLED`, `OPERATOR_*`, `BROKER_AGENT_TOKEN*`, `BROKER_STATE_DIR`, any `RAILWAY_API_TOKEN`/`RAILWAY_TOKEN`
 (`capabilities` warns when any of these is present). Do not use Railway reference variables that expose broker secrets to the agent service.
 
@@ -62,6 +70,8 @@ There is no `execute`, `approve`, `resolve` or "enable writes" route for the age
 | Port | Route | Auth | Purpose |
 | --- | --- | --- | --- |
 | private | `POST /v1/propose`, `/v1/propose_duplicate`, `/v1/show`, `/v1/status` | Host in allowlist, no edge headers, `Authorization: Bearer <token>` | propose / read / poll. Replies never contain phrases, codes or MACs |
+| private | `POST /v1/get` `{path, query?}` | same | **read proxy**: an upstream **GET** of an allowlisted `/api2` path (regex built from the entity registry: list, single `/<id>.json` with `[1-9][0-9]{0,14}`, or `/reports/<name>`) with a query rebuilt by `buildQuery` (allowlist + per-key validation). Nothing is forwarded verbatim (no headers, URL, method, host); body keys other than `path`/`query` ⇒ 400; the broker's key, pinned tenant origin, `redirect:'manual'`, 15 s timeout, 16 MiB response cap, non-JSON ⇒ 502, 3xx ⇒ 502, `429/502/503/504` pass through with `Retry-After` (≤10 s), 4xx messages are sanitised |
+| private | `POST /v1/invoice_pdf` `{id}` | same | the invoice's official PDF: invoice read ⇒ `invoice_pdf_url` (same tenant, https, `*.pdf`, no credentials) ⇒ downloaded **without** the API key, `application/pdf` + `%PDF` + `%%EOF` checks, 20 MiB cap ⇒ base64 |
 | private | everything else (all other methods/paths, `/console`, `/login`, …) | — | 404/405 |
 | public | `GET /healthz`, `GET /setup/healthz` | none | plain `ok` (the repo's root `railway.toml` health path is `/setup/healthz`) |
 | public | `GET /`, `POST /login` | password + TOTP | sign-in (single-use form token, Origin check) |
@@ -84,7 +94,7 @@ API is therefore safe even if reachable from the internet:
 
 ## 5. Threat model → mitigation → test
 
-(Tests live in `daftra-broker-service.test.mjs` = E2E, `daftra-broker-service-adversarial.test.mjs` = ADV, `daftra-operator-auth.test.mjs` = AUTH.)
+(Tests live in `daftra-broker-service.test.mjs` = E2E, `daftra-broker-service-adversarial.test.mjs` = ADV, `daftra-operator-auth.test.mjs` = AUTH, `daftra-broker-reads.test.mjs` = READS, `daftra-broker-service-review.test.mjs` = REVIEW.)
 
 | STRIDE / Railway concern | Mitigation | Tests |
 | --- | --- | --- |
@@ -106,6 +116,15 @@ API is therefore safe even if reachable from the internet:
 | **DoS** | 256 KiB / 16 KiB body caps, header/request timeouts enforced every 2 s, `maxRequestsPerSocket`, per-peer/per-token rate limits, pending quota, session cap | ADV `PROTOCOL ABUSE…`, `RATE LIMITS…` |
 | **Elevation: enabling writes** | `DAFTRA_WRITES_ENABLED` read once from the service's own env; no route/header/body can change it; unconfigured service refuses writes | ADV `COMPROMISED AGENT…`; E2E `WRITES DISABLED by default…`, `NOT CONFIGURED…` |
 | **Leaked read key** | read key authenticates nothing on the broker (not a bearer, not accepted) and cannot write | ADV `TOKEN CONFUSION…` |
+| **A Daftra key on the agent can write** (roles are per entity, not per method) | the agent holds NO Daftra key; reads are proxied (GET only, strict path + query allowlist, pinned origin, no redirects, size caps); the CLI shim refuses any non-GET (`AGENT_CANNOT_WRITE`) and any URL outside the tenant `/api2/`; a real key in the agent env is ignored | READS `READ PROXY ADVERSARIAL…`, `KEYLESS END TO END…`, `real key in the agent environment is ignored`, `shim…`, `LEAKED AGENT TOKEN…`, `validateGet accepts only registry paths…` |
+| **Read-proxy abuse** (path traversal, encoded paths, other entities such as users/staff/journals, smuggled method/headers/host, query injection, SSRF through PDF links, oversize responses) | strict regexes + `buildQuery`; PDF link must be same-tenant https `*.pdf`; document fetched with no credentials and no redirects; caps | READS `invoice PDF safety table…`, `upstream response caps…`, `upstream passthrough…`, `READ QUOTAS…` |
+| **Audit-log amplification / DoS of the operator** (thousands of unauthenticated requests ⇒ thousands of audit appends ⇒ approvals queue behind them) | unauthenticated and high-volume events are **counted**, flushed as one `unauth_summary` line per minute; pre-auth token buckets on both listeners; cached audit head (stat-checked, full re-verify on any change); recovering audit queue | REVIEW `audit amplification…`, `pre-auth limiter protects BOTH listeners…` |
+| **Unbounded proposal store / hidden pending items** | caps on file count and bytes (BLOCKED counted), `PROPOSAL_TOO_LARGE`, pruning of dead proposals, console lists pending first and paginates | REVIEW `store bounds…`, `byte cap…` |
+| **Display ≠ sent** (secrets or look-alike text in a proposal) | proposals containing a broker secret are refused `SECRET_IN_REQUEST` (the page is never scrubbed, so what is shown is what is sent); Daftra-originated messages are scrubbed | REVIEW `display=sent…`; ADV `SECRETS never appear…` |
+| **Agent nagging with a rejected request** | declined-hash memory (`BROKER_DECLINE_TTL_MIN`) | REVIEW `declined memory…` |
+| **Anonymous reconnaissance** (exposure alarm, "writes disabled", missing variables) | banners only for authenticated operators; anonymous pages are generic; optional `BROKER_CONSOLE_REQUIRE_EDGE` | REVIEW `anonymous disclosure…`, `BROKER_CONSOLE_REQUIRE_EDGE…` |
+| **Lock-out DoS of the operator** | valid credentials are never refused because of a lock; locks ≤ 60 s and decay; failures serialised with a bounded queue | AUTH `LOCKOUT…`, `failures are SERIALISED…`; ADV `REVIEW#2 (e2)…` |
+| **Sticky I/O errors / enrollment** | write chains recover after a transient failure; `/enroll` shows the key once per process start | AUTH `the state write chain RECOVERS…`; REVIEW `sticky I/O…`, `enrollment shows the authenticator key ONCE…` |
 
 ## 6. Operator flow (iPhone, no shell)
 
@@ -128,9 +147,29 @@ amounts, or names.
 - **Anyone with Railway dashboard / variable access to the broker service** can read the write key, approval secret and operator credentials. Railway project-member access control is outside this code: limit it, and do not give the agent a Railway token.
 - **A compromised operator phone / Passwords app** (password + TOTP seed) = full approval power. A human who approves without reading the review defeats the gate.
 - **Private networking reaches every service of the Railway environment**: any other service you add can call the private API; only the bearer token + quotas stand between it and `propose`. Keep the environment minimal.
+- **A leaked agent token can READ everything the broker's Daftra key can read** (the read proxy is an allowlist of *entities and query shapes*, not of rows). It cannot write, approve or learn any secret. Mitigations: per-token read budget and concurrency cap, rotation via `BROKER_AGENT_TOKEN_PREVIOUS`, and — because Daftra roles are per entity — create the broker's key with an entity list (Only Allow) limited to the entities the business needs. Users/staff/journals/settings paths are not proxied at all.
+- **The broker key is a write-capable key** that also serves reads; the separation is enforced by the broker's code (GET-only primitive, mutation-tested), not by Daftra. A bug in `performGet` would be a write path: the sweep in section 9 is the evidence, not a proof.
+- **The approving TOTP is not cryptographically bound to the proposal**; what binds an approval to its content is the same-POST request-hash echo plus a fresh single-use code. A phished real-time relay (password + code) is not defeated.
+- **`/enroll`** (when `OPERATOR_ENROLLMENT=1`) shows the derived authenticator key with the password alone, once per process start; keep it off except during enrollment.
+- **The console port is reachable from the private network** (it only serves the login page without a session); `BROKER_CONSOLE_REQUIRE_EDGE=1` closes that once Railway's edge headers are confirmed.
 - **Plain http inside the private network** (Railway encrypts it with WireGuard; there is no extra TLS or mTLS here). The bearer token is therefore not secret from other services that can sniff nothing but is also not tied to a client identity.
 - **IP-based throttling** depends on Railway's proxy setting `X-Real-IP`; with `BROKER_TRUST_PROXY` unset, throttling buckets by the (proxy) socket address, which makes the lockout effectively global (safe but coarser).
 - **TOTP** is RFC 6238 SHA-1 (what authenticator apps support); no WebAuthn/passkey yet. A phished real-time (password + code) relay is not defeated.
 - **Single replica** (a volume forbids replicas); redeploys cause a short outage. Sessions and rate-limit counters are in memory (lost on restart; lockouts and replay counters are persisted).
 - The broker re-uses the existing proposal/ledger/write libraries: their documented limits (undocumented Daftra semantics, no tail-truncation detection of the ledger beyond the 15-minute TTL + claim locks) still apply.
 - Not proven here: behaviour of Railway's edge (header names it adds beyond those listed), real iOS enrollment UX, load behaviour.
+
+## 9. Mutation sweep (evidence for the new / changed guards)
+
+Method: for each guard the line was disabled in place, the whole suite (`node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs`, 273 tests, Node 22.23 and 26.13) was run, a non-zero exit counted as *killed*, and the file was restored. 44 mutants over `daftra-broker-reads.mjs`, `daftra-broker-service-client.mjs`, `daftra-broker-service.mjs`, `daftra-operator-auth.mjs`:
+**35 killed on the first run; 3 survivors were closed with a new test and re-run killed (upstream origin/`/api2` re-check inside `performGet`, declared oversize refused without reading the body, PDF output never overwritten); 6 equivalent mutants remain**, each shadowed by a second layer:
+
+| Survivor | Why it is equivalent |
+| --- | --- |
+| `path.includes('..')` / `path.includes('//')` in `validateGet` | the anchored regexes (`LIST_RE`, `ONE_RE`, `REPORT_RE`) can never match a path containing them; the checks are defence in depth |
+| `isPlain(rawQuery)` | `buildQuery` rejects non-objects itself |
+| `declined.set(...)` in the reject handler | `indexRefresh` → `indexSet` records every `DECLINED` proposal anyway |
+| second `if (enrollShown)` inside `POST /enroll` | the route-level check on the same flag runs first for both methods |
+| `agg.size >= 32` key bound | event names are string literals in the code; the key space is already bounded |
+
+Not proven: real Railway edge behaviour, real Daftra responses for roles/entity lists (offline fakes only), load behaviour beyond the in-test floods (1,500 requests), and the claim that no code path outside the reviewed ones reaches a non-GET upstream call (only exercised by the suite).

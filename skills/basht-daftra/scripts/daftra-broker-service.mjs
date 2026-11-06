@@ -184,10 +184,16 @@ export function createBrokerService(options = {}) {
       try { return JSON.parse(lines[lines.length - 1]).mac ?? 'broken'; } catch { return 'broken'; }
     } finally { await fh.close(); }
   }
+  // Steady state is O(1) (tail check). Any change to the file that this process did not make itself (size / mtime / inode differ
+  // from what the last append left behind) triggers a FULL chain verification, and so does a 5-minute timer.
+  let auditStat = null;
+  const statAudit = async () => { const s = await stat(auditFile).catch(() => null); return s ? { size: s.size, mtimeMs: s.mtimeMs, ino: s.ino } : null; };
+  const sameStat = (x, y) => (x === null && y === null) || (x !== null && y !== null && x.size === y.size && x.mtimeMs === y.mtimeMs && x.ino === y.ino);
   async function ensureAuditHead() {
     if (auditBroken) throw auditBroken;
     try {
-      if (auditHead === null || now() - auditVerifiedAt > 5 * 60_000) { auditHead = await verifyAuditChain(); auditVerifiedAt = now(); }
+      const cur = await statAudit();
+      if (auditHead === null || !sameStat(cur, auditStat) || Date.now() - auditVerifiedAt > 5 * 60_000) { auditHead = await verifyAuditChain(); auditVerifiedAt = Date.now(); auditStat = await statAudit(); }
       else if ((await tailMac()) !== auditHead) throw tamper();
     } catch (e) { if (e.code === 'AUDIT_TAMPERED') auditBroken = e; throw e; }
   }
@@ -201,7 +207,7 @@ export function createBrokerService(options = {}) {
       const body = { ts: new Date(now()).toISOString(), event, ...fields, prev: auditHead };
       const mac = auditMac(body);
       await appendFile(auditFile, JSON.stringify({ ...body, mac }) + '\n', { mode: 0o600 });
-      auditHead = mac;
+      auditHead = mac; auditStat = await statAudit();
     });
   }
   const auditThrottled = (key, event, fields, everyMs = 60_000) => {
@@ -223,24 +229,53 @@ export function createBrokerService(options = {}) {
   }
   const ipHash = (ip) => createHash('sha256').update('ip\n' + ip).digest('hex').slice(0, 10);
 
-  // ---- proposals listing ---------------------------------------------------------------------------------------
-  async function listProposalFiles(limit = 100) {
-    let names = [];
-    try { names = (await readdir(join(ledgerDir(brokerEnv), 'proposals'))).filter((n) => PROPOSAL_FILE.test(n)); } catch { return []; }
-    const withTime = [];
-    for (const n of names) { try { withTime.push([n, (await stat(join(ledgerDir(brokerEnv), 'proposals', n))).mtimeMs]); } catch { /* raced */ } }
-    return withTime.sort((a, b) => b[1] - a[1]).slice(0, limit).map(([n]) => n.slice(0, -5));
+  // ---- proposal index (in memory; advisory only — every action re-loads and re-authenticates the file) ------------
+  // Bounded: at most BROKER_MAX_PROPOSALS files / BROKER_MAX_BYTES bytes. BLOCKED, DECLINED, REJECTED and expired proposals are
+  // deleted once their 15-minute TTL has passed (+5 min); executed ones are kept BROKER_RETAIN_DAYS (default 90).
+  const proposalsDir = () => join(ledgerDir(brokerEnv), 'proposals');
+  const maxProposals = Number(env.BROKER_MAX_PROPOSALS) > 0 ? Number(env.BROKER_MAX_PROPOSALS) : 500;
+  const maxBytes = Number(env.BROKER_MAX_BYTES) > 0 ? Number(env.BROKER_MAX_BYTES) : 64 * 1024 * 1024;
+  const retainMs = (Number(env.BROKER_RETAIN_DAYS) > 0 ? Number(env.BROKER_RETAIN_DAYS) : 90) * 86_400_000;
+  const declineTtlMs = (Number(env.BROKER_DECLINE_TTL_MIN) > 0 ? Number(env.BROKER_DECLINE_TTL_MIN) : 60) * 60_000;
+  const index = new Map();                         // id -> { created, expires, status, bytes, hash }
+  const declined = new Map();                      // request_hash -> until (ms): the operator said no
+  let indexBytes = 0;
+  const TRANSIENT = new Set(['BLOCKED', 'DECLINED', 'REJECTED', 'RESOLVED_NOT_CREATED', 'EXPIRED']);
+  function indexSet(id, p, bytes) {
+    const prev = index.get(id); if (prev) indexBytes -= prev.bytes;
+    const entry = { created: Date.parse(p.created_at) || now(), expires: Date.parse(p.expires_at) || 0, status: p.status, bytes: bytes ?? prev?.bytes ?? 0, hash: p.request_hash };
+    index.set(id, entry); indexBytes += entry.bytes;
+    if (p.status === 'DECLINED' && p.request_hash) declined.set(p.request_hash, (Date.parse(p.approved_at) || entry.created) + declineTtlMs);
   }
-  async function pendingCount() {
-    let n = 0;
-    for (const id of await listProposalFiles(500)) {
-      try {
-        const p = JSON.parse(await readFile(join(ledgerDir(brokerEnv), 'proposals', id + '.json'), 'utf8'));
-        if (p.status === 'READY_FOR_APPROVAL' && Date.parse(p.expires_at) >= now()) n++;
-      } catch { /* unreadable: ignored for the quota */ }
+  async function indexRefresh(id) {
+    try {
+      const file = join(proposalsDir(), id + '.json');
+      const [raw, st] = await Promise.all([readFile(file, 'utf8'), stat(file)]);
+      indexSet(id, JSON.parse(raw), st.size);
+    } catch { const prev = index.get(id); if (prev) { indexBytes -= prev.bytes; index.delete(id); } }
+  }
+  async function indexLoad() {
+    index.clear(); indexBytes = 0;
+    let names = []; try { names = (await readdir(proposalsDir())).filter((n) => PROPOSAL_FILE.test(n)); } catch { return; }
+    for (const n of names) await indexRefresh(n.slice(0, -5));
+  }
+  async function removeProposal(id) {
+    const prev = index.get(id); if (prev) { indexBytes -= prev.bytes; index.delete(id); }
+    await unlink(join(proposalsDir(), id + '.json')).catch(() => {});
+    await unlink(join(ledgerDir(brokerEnv), 'locks', id + '.claim')).catch(() => {});
+  }
+  async function prune() {
+    const t = now();
+    for (const [h, until] of declined) if (until < t) declined.delete(h);
+    for (const [id, e] of [...index]) {
+      const dead = (TRANSIENT.has(e.status) || (e.status === 'READY_FOR_APPROVAL' && e.expires < t)) && t > e.expires + 5 * 60_000;
+      const old = t - e.created > retainMs;
+      if (dead || old) await removeProposal(id);
     }
-    return n;
   }
+  const pendingCount = () => { const t = now(); let n = 0; for (const e of index.values()) if (e.status === 'READY_FOR_APPROVAL' && e.expires >= t) n++; return n; };
+  const pendingIds = () => { const t = now(); return [...index].filter(([, e]) => e.status === 'READY_FOR_APPROVAL' && e.expires >= t).sort((a, b) => b[1].created - a[1].created).map(([id]) => id); };
+  const recentIds = (limit) => [...index].filter(([, e]) => !(e.status === 'READY_FOR_APPROVAL' && e.expires >= now())).sort((a, b) => b[1].created - a[1].created).slice(0, limit).map(([id]) => id);
   const outcomeOf = (p) => {
     if (p.status === 'READY_FOR_APPROVAL' && !(Date.parse(p.expires_at) >= now())) return 'expired';
     return STATUS_OUTCOME[p.status] ?? 'unknown';
@@ -257,11 +292,30 @@ export function createBrokerService(options = {}) {
     arr.push(t); rate.set(key, arr); if (rate.size > 5000) rate.delete(rate.keys().next().value); return true;
   };
   const perMin = Number(env.BROKER_RATE_PER_MIN) > 0 ? Number(env.BROKER_RATE_PER_MIN) : 60;
+  const getPerMin = Number(env.BROKER_GET_PER_MIN) > 0 ? Number(env.BROKER_GET_PER_MIN) : 300;
+  const getConcurrency = Number(env.BROKER_GET_CONCURRENCY) > 0 ? Number(env.BROKER_GET_CONCURRENCY) : 4;
+  let getInflight = 0;
+  // Pre-auth limiter (token bucket per PEER SOCKET ADDRESS + one global bucket) in front of BOTH listeners. It uses the socket
+  // address, never X-Real-IP, so a caller on the private network cannot rotate buckets by spoofing a header.
+  function makeLimiter({ perPeerRps, burst, globalRps, globalBurst, maxPeers = 2000 }) {
+    const peers = new Map(); const g = { tokens: globalBurst, last: Date.now() };
+    const take = (b, rps, cap, t) => { b.tokens = Math.min(cap, b.tokens + ((t - b.last) / 1000) * rps); b.last = t; if (b.tokens < 1) return false; b.tokens -= 1; return true; };
+    return (peer) => {
+      const t = Date.now();
+      let b = peers.get(peer);
+      if (!b) { if (peers.size >= maxPeers) peers.delete(peers.keys().next().value); b = { tokens: burst, last: t }; peers.set(peer, b); }
+      else { peers.delete(peer); peers.set(peer, b); }                 // LRU
+      return take(g, globalRps, globalBurst, t) && take(b, perPeerRps, burst, t);
+    };
+  }
+  const rps = Number(env.BROKER_PREAUTH_RPS) > 0 ? Number(env.BROKER_PREAUTH_RPS) : 50;
+  const publicLimiter = makeLimiter({ perPeerRps: rps, burst: rps * 2, globalRps: rps * 4, globalBurst: rps * 8 });
+  const privateLimiter = makeLimiter({ perPeerRps: rps * 2, burst: rps * 4, globalRps: rps * 4, globalBurst: rps * 8 });
   const proposePerMin = Number(env.BROKER_PROPOSE_PER_MIN) > 0 ? Number(env.BROKER_PROPOSE_PER_MIN) : 10;
   const maxPending = Number(env.BROKER_MAX_PENDING) > 0 ? Number(env.BROKER_MAX_PENDING) : 20;
 
-  function jsonReply(res, status, obj) {
-    const body = scrub(JSON.stringify(obj));
+  function jsonReply(res, status, obj, { raw = false } = {}) {
+    const body = raw ? JSON.stringify(obj) : scrub(JSON.stringify(obj));
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...(status === 413 || status === 400 ? { Connection: 'close' } : {}) });
     res.end(body);
   }
@@ -287,7 +341,7 @@ export function createBrokerService(options = {}) {
         exposure.alarm = true; exposure.count++; exposure.last = new Date(now()).toISOString();
         log({ level: 'ALERT', alert: 'PRIVATE_API_REACHABLE_VIA_PUBLIC_DOMAIN', edge_headers: edge.slice(0, 5), host: safeText(host).slice(0, 80) });
         auditThrottled('exposure', 'private_api_via_public', { host: safeText(host).slice(0, 80), edge: edge.slice(0, 5) });
-      } else auditThrottled('badhost:' + host, 'private_api_bad_host', { host: safeText(host).slice(0, 80) });
+      } else noteEvent('private_api_bad_host');
       return notFound(res);
     }
     // (2) method / route / content type
@@ -297,18 +351,17 @@ export function createBrokerService(options = {}) {
     if (req.method !== 'POST') return jsonReply(res, 405, { ok: false, error: 'Method not allowed' });
     // (3) bearer token (constant time, exactly one Authorization header)
     const authHeaders = []; for (let i = 0; i < req.rawHeaders.length; i += 2) if (req.rawHeaders[i].toLowerCase() === 'authorization') authHeaders.push(req.rawHeaders[i + 1]);
-    if (!hit('authfail:' + peer, 30) ) return jsonReply(res, 429, { ok: false, error: 'Too many requests', refused: 'RATE_LIMIT' });
+    if (!hit('authfail:' + peer, 30)) { noteEvent('agent_auth_flood'); return jsonReply(res, 429, { ok: false, error: 'Too many requests', refused: 'RATE_LIMIT' }); }
     const m = authHeaders.length === 1 ? /^Bearer ([^\s]{1,512})$/.exec(authHeaders[0]) : null;
     const given = m ? createHash('sha256').update(m[1]).digest() : null;
     let okToken = false; let matchedIndex = -1;
     tokenDigests.forEach((d, i) => { if (given && timingSafeEqual(d, given)) { okToken = true; matchedIndex = i; } });
-    if (!okToken) {
-      // count against a per-peer failure window (the successful path below does not consume it)
-      auditThrottled('tokfail:' + peer, 'agent_auth_failed', { peer: ipHash(peer) }, 30_000);
-      return jsonReply(res, 401, { ok: false, error: 'Unauthorized', refused: 'UNAUTHORIZED' });
-    }
+    if (!okToken) { noteEvent('agent_auth_failed'); return jsonReply(res, 401, { ok: false, error: 'Unauthorized', refused: 'UNAUTHORIZED' }); }
     rate.delete('authfail:' + peer);
-    if (!hit('tok:' + matchedIndex, perMin)) { auditThrottled('ratelimit', 'agent_rate_limited', { peer: ipHash(peer) }); return jsonReply(res, 429, { ok: false, error: 'Rate limit', refused: 'RATE_LIMIT' }); }
+    const isRead = READ_CMDS.has(cmd);
+    if (isRead) {
+      if (!hit('get:' + matchedIndex, getPerMin)) { noteEvent('agent_get_rate_limited'); return jsonReply(res, 429, { ok: false, error: 'Read rate limit', refused: 'RATE_LIMIT' }); }
+    } else if (!hit('tok:' + matchedIndex, perMin)) { noteEvent('agent_rate_limited'); return jsonReply(res, 429, { ok: false, error: 'Rate limit', refused: 'RATE_LIMIT' }); }
     if (!/^application\/json(\s*;\s*charset=utf-8)?$/i.test(String(req.headers['content-type'] ?? ''))) return jsonReply(res, 415, { ok: false, error: 'Content-Type must be application/json' });
     // (4) body
     let body;
@@ -320,6 +373,7 @@ export function createBrokerService(options = {}) {
     if (!configured) return jsonReply(res, 503, { ok: false, error: 'Broker service is not configured', refused: 'NOT_CONFIGURED' });
     try {
       let result;
+      if (isRead) return await handleRead(res, cmd, body);
       if (cmd === 'status') {
         if (Object.keys(body).some((k) => k !== 'id') || typeof body.id !== 'string' || !PROPOSAL_ID.test(body.id)) return jsonReply(res, 400, { ok: false, error: 'Invalid id', refused: 'BAD_REQUEST' });
         result = await apiStatus(body.id);
@@ -328,22 +382,63 @@ export function createBrokerService(options = {}) {
         if (cmd === 'show' && !PROPOSAL_ID.test(msg.id)) return jsonReply(res, 400, { ok: false, error: 'Invalid id', refused: 'BAD_REQUEST' });
         if (cmd === 'show') result = publicProposal(await loadProposal(msg.id, brokerEnv), { service: true });
         else {
-          if (!hit('propose:' + matchedIndex, proposePerMin)) { auditThrottled('proposerate', 'agent_propose_rate_limited', { peer: ipHash(peer) }); return jsonReply(res, 429, { ok: false, error: 'Propose rate limit', refused: 'RATE_LIMIT' }); }
-          if ((await pendingCount()) >= maxPending) { auditThrottled('pendingcap', 'agent_pending_cap', {}); return jsonReply(res, 429, { ok: false, error: 'Too many proposals awaiting operator approval', refused: 'PENDING_CAP' }); }
+          // A request that contains any secret of this service is refused outright (never stored, never displayed): what the
+          // operator reviews must be exactly what would be sent, so nothing is "redacted" behind their back.
+          if (containsSecret(JSON.stringify(body))) return jsonReply(res, 400, { ok: false, error: 'The request contains a value that must never appear in a proposal', refused: 'SECRET_IN_REQUEST' });
+          if (!hit('propose:' + matchedIndex, proposePerMin)) { noteEvent('agent_propose_rate_limited'); return jsonReply(res, 429, { ok: false, error: 'Propose rate limit', refused: 'RATE_LIMIT' }); }
+          await prune();
+          if (index.size >= maxProposals || indexBytes >= maxBytes) { noteEvent('agent_store_full'); return jsonReply(res, 429, { ok: false, error: 'Proposal store is full; wait for old proposals to expire', refused: 'STORE_FULL' }); }
+          if (pendingCount() >= maxPending) { noteEvent('agent_pending_cap'); return jsonReply(res, 429, { ok: false, error: 'Too many proposals awaiting operator approval', refused: 'PENDING_CAP' }); }
           const actor = 'agent:' + (msg.actor ?? 'unknown');
           const p = cmd === 'propose'
             ? await createProposal(msg.type, msg.input, { env: brokerEnv, fetcher, actor, now: now() })
             : await proposeDuplicate({ source: msg.source, id: msg.docId, overrides: msg.overrides }, { env: brokerEnv, fetcher, actor, now: now() });
-          result = publicProposal(p, { service: true });
-          audit('proposal_created', { id: p.id, type: p.type, status: p.status }).catch(() => {});
+          const file = join(proposalsDir(), p.id + '.json'); const size = (await stat(file).catch(() => ({ size: 0 }))).size;
+          if (size > MAX_PROPOSAL_BYTES || JSON.stringify(p.request).length > MAX_APPROVABLE_BODY) {
+            await removeProposal(p.id);
+            return jsonReply(res, 413, { ok: false, error: 'The proposal is too large to be reviewed by a person', refused: 'PROPOSAL_TOO_LARGE' });
+          }
+          indexSet(p.id, p, size);
+          let shown = p;
+          if (p.status === 'READY_FOR_APPROVAL' && (declined.get(p.request_hash) ?? 0) > now()) {       // the operator already said no to this exact request
+            const claimed = await acquireLock(brokerEnv, p.id + '.claim');
+            if (claimed) await updateProposal(p.id, { status: 'DECLINED', approved_by: 'operator:earlier-decision', approved_at: new Date(now()).toISOString() }, brokerEnv);
+            await indexRefresh(p.id);
+            shown = { ...p, status: 'DECLINED', blocking: ['Declined by the operator earlier; the identical request is refused until the decline expires'] };
+            noteEvent('agent_repeat_of_declined');
+          }
+          result = publicProposal(shown, { service: true });
+          audit('proposal_created', { id: p.id, type: p.type, status: shown.status }).catch(() => {});
         }
       }
       return jsonReply(res, 200, { ok: true, result });
     } catch (e) {
-      if (e?.constructor?.name === 'BadRequest') return jsonReply(res, 400, { ok: false, error: e.message, refused: 'BAD_REQUEST' });
+      if (e instanceof BadRead || e?.constructor?.name === 'BadRequest') return jsonReply(res, 400, { ok: false, error: e.message, refused: 'BAD_REQUEST' });
       const refused = typeof e?.code === 'string' ? e.code : undefined;
       return jsonReply(res, refused === 'LEDGER_TAMPERED' || refused === 'TAMPERED' || refused === 'CROSS_TENANT' ? 409 : 422, { ok: false, error: scrub(e?.message ?? 'Error').slice(0, 600), refused });
     }
+  }
+
+  // Keyless READ proxy (GET only, allowlisted path + query, the broker's own key). Reads are counted, never audited line by line.
+  async function handleRead(res, cmd, body) {
+    if (getInflight >= getConcurrency) { noteEvent('agent_get_concurrency'); return jsonReply(res, 429, { ok: false, error: 'Too many concurrent reads', refused: 'CONCURRENCY' }); }
+    getInflight++;
+    try {
+      if (cmd === 'get') {
+        const v = validateGet(body);
+        noteEvent('agent_get');
+        let result;
+        try { result = await performGet(v, { env: brokerEnv, fetcher }); }
+        catch (e) { if (e instanceof BadRead) throw e; result = { status: 502, body: null, message: 'Upstream unreachable' }; }
+        return jsonReply(res, 200, { ok: true, result });
+      }
+      const id = validateInvoicePdfRequest(body);
+      noteEvent('agent_invoice_pdf');
+      let result;
+      try { result = await fetchInvoicePdf(id, { env: brokerEnv, fetcher }); }
+      catch (e) { if (e instanceof BadRead) throw e; result = { status: 502, message: 'Upstream unreachable' }; }
+      return jsonReply(res, 200, { ok: true, result }, { raw: true });
+    } finally { getInflight--; }
   }
 
   // ===========================================================================================================
@@ -361,10 +456,12 @@ export function createBrokerService(options = {}) {
     try { return new URL(origin).host === req.headers.host; } catch { return false; }
   }
 
-  function html(res, status, title, bodyHtml, { headers = {} } = {}) {
-    const banner = (!configured ? '<div class="bad">⚠ Not configured / غير مهيأ</div>' : '')
+  // Banners (exposure alarm, writes disabled, not configured) are shown ONLY on authenticated pages: an anonymous visitor
+  // learns nothing about the configuration or state of this service.
+  function html(res, status, title, bodyHtml, { headers = {}, banner: showBanner = false } = {}) {
+    const banner = !showBanner ? '' : ((!configured ? '<div class="bad">⚠ Not configured / غير مهيأ</div>' : '')
       + (exposure.alarm ? '<div class="bad">⚠ PRIVATE API REACHABLE VIA PUBLIC DOMAIN — fix the domain target port NOW / الواجهة الخاصة متاحة عبر النطاق العام</div>' : '')
-      + (configured && !writesEnabled() ? '<div class="warn">Writes are DISABLED on this service (read-only) / الكتابة معطّلة</div>' : '');
+      + (configured && !writesEnabled() ? '<div class="warn">Writes are DISABLED on this service (read-only) / الكتابة معطّلة</div>' : ''));
     const page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
       + '<title>' + esc(title) + '</title><style>body{font:16px/1.5 system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:#f6f7f9;color:#111}main{max-width:720px;margin:auto}'
       + 'h1{font-size:20px}pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #ddd;padding:10px;border-radius:8px;unicode-bidi:plaintext}'
@@ -372,7 +469,8 @@ export function createBrokerService(options = {}) {
       + '.bad{background:#b42318;color:#fff;padding:10px;border-radius:8px;margin:8px 0;font-weight:600}.warn{background:#fff3cd;padding:10px;border-radius:8px;margin:8px 0}.ok{background:#d1fae5;padding:10px;border-radius:8px;margin:8px 0}'
       + 'a{color:#0a58ca}.card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0}.dyn{unicode-bidi:plaintext}</style></head><body><main>'
       + banner + bodyHtml + '</main></body></html>';
-    const out = scrub(page);
+    // NOT scrubbed: the page shows exactly what is stored/sent (everything is HTML-escaped). Proposals containing a secret are refused at creation.
+    const out = page;
     res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(out), ...headers });
     res.end(out);
   }
@@ -400,23 +498,31 @@ export function createBrokerService(options = {}) {
   }
 
   const proposalLink = (id) => '/proposal/' + esc(id);
+  const htmlA = (res, status, title, bodyHtml, o = {}) => html(res, status, title, bodyHtml, { ...o, banner: true });
 
-  async function consolePage(res, session) {
-    const ids = await listProposalFiles(40); const rows = [];
-    for (const id of ids) {
+  const PAGE_SIZE = 20;
+  async function consolePage(res, session, pageNo = 1) {
+    const rows = []; const card = async (id, pendingOnly) => {
       try {
         const p = await loadProposal(id, brokerEnv);
+        if (pendingOnly && outcomeOf(p) !== 'pending_operator_approval') { await indexRefresh(id); return; }
         rows.push('<div class="card"><a href="' + proposalLink(id) + '"><b>' + esc(p.type) + '</b> <span class="dyn">' + esc(id) + '</span></a><br>' + esc(outcomeOf(p)) + ' · ' + esc(p.expires_at) + '</div>');
       } catch (e) { rows.push('<div class="card bad">' + esc(id) + ': integrity check failed (' + esc(e.code ?? 'error') + ')</div>'); }
-    }
-    html(res, 200, 'Console', '<h1>Proposals / المقترحات</h1>' + (rows.join('') || '<p>No proposals / لا توجد مقترحات</p>')
+    };
+    const pending = pendingIds(); const pages = Math.max(1, Math.ceil(pending.length / PAGE_SIZE)); const pg = Math.min(Math.max(1, pageNo), pages);
+    for (const id of pending.slice((pg - 1) * PAGE_SIZE, pg * PAGE_SIZE)) await card(id, true);
+    const pendingHtml = rows.splice(0).join('') || '<p>Nothing awaiting approval / لا يوجد ما ينتظر الاعتماد</p>';
+    for (const id of recentIds(15)) await card(id, false);
+    const nav = pages > 1 ? '<p>' + (pg > 1 ? '<a href="/console?page=' + (pg - 1) + '">← Newer</a> ' : '') + 'Page ' + pg + '/' + pages + (pg < pages ? ' <a href="/console?page=' + (pg + 1) + '">Older →</a>' : '') + '</p>' : '';
+    htmlA(res, 200, 'Console', '<h1>Awaiting approval / بانتظار الاعتماد (' + pending.length + ')</h1>' + pendingHtml + nav
+      + '<h2>Recent / الأحدث</h2>' + (rows.join('') || '<p>—</p>')
       + '<form method="post" action="/logout"><input type="hidden" name="csrf" value="' + esc(session.csrf) + '"><button class="ghost">Sign out / خروج</button></form>');
   }
 
   async function proposalPage(res, session, id, { message, kind = 'warn' } = {}) {
     let p;
     try { p = await loadProposal(id, brokerEnv); }
-    catch (e) { audit('proposal_integrity_failure', { id: safeText(id).slice(0, 30), code: e.code ?? 'error' }).catch(() => {}); return html(res, 404, 'Proposal', '<div class="bad">Cannot show this proposal: ' + esc(e.code === 'ENOENT' || /not found/i.test(e.message) ? 'not found' : (e.code ?? 'integrity check failed')) + '</div><a href="/console">← Back</a>'); }
+    catch (e) { audit('proposal_integrity_failure', { id: safeText(id).slice(0, 30), code: e.code ?? 'error' }).catch(() => {}); return htmlA(res, 404, 'Proposal', '<div class="bad">Cannot show this proposal: ' + esc(e.code === 'ENOENT' || /not found/i.test(e.message) ? 'not found' : (e.code ?? 'integrity check failed')) + '</div><a href="/console">← Back</a>'); }
     const outcome = outcomeOf(p);
     const ledgerState = stateForHash(await readLedger(brokerEnv).catch(() => []), p.request_hash);
     const canDecide = outcome === 'pending_operator_approval';
@@ -430,38 +536,39 @@ export function createBrokerService(options = {}) {
     if (canDecide) actions += '<form method="post" action="/proposal/' + esc(p.id) + '/reject">' + csrf + codeField + '<button class="danger" type="submit">Reject / رفض</button></form>';
     if (canResolve) actions += '<h2>Ambiguous outcome / نتيجة غير مؤكدة</h2><p>Check Daftra, then record what happened.</p><form method="post" action="/proposal/' + esc(p.id) + '/resolve">' + csrf
       + '<select name="created"><option value="false">NOT created in Daftra / لم يُنشأ</option><option value="true">Created in Daftra / أُنشئ</option></select><input name="record_id" inputmode="numeric" maxlength="15" placeholder="record id (optional)">' + codeField + '<button class="danger" type="submit">Record decision / تسجيل</button></form>';
-    html(res, 200, 'Proposal', (message ? '<div class="' + kind + '">' + esc(message) + '</div>' : '') + '<h1>Review / مراجعة</h1><p><b>' + esc(outcome) + '</b></p><pre>' + reviewLines(p).map((l) => esc(l)).join('\n') + '</pre>'
+    htmlA(res, 200, 'Proposal', (message ? '<div class="' + kind + '">' + esc(message) + '</div>' : '') + '<h1>Review / مراجعة</h1><p><b>' + esc(outcome) + '</b></p><pre>' + reviewLines(p).map((l) => esc(l)).join('\n') + '</pre>'
       + '<p>Request hash: <code class="dyn">' + esc(p.request_hash) + '</code></p>' + actions + '<p><a href="/console">← Back</a></p>');
   }
 
   const busy = new Set();
+  let enrollShown = false;
   const ledgerOk = async () => { await readLedger(brokerEnv); };
 
   async function decide(req, res, session, id, action) {
     let form;
     try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
     if (!sameOrigin(req) || !csrfOk(session, form)) { audit('csrf_rejected', { id }).catch(() => {}); return textReply(res, 403, 'Forbidden'); }
-    if (!configured) return html(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
-    if (busy.has(id)) return html(res, 409, 'Busy', '<div class="warn">Another decision on this proposal is in progress.</div><a href="' + proposalLink(id) + '">← Back</a>');
+    if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
+    if (busy.has(id)) return htmlA(res, 409, 'Busy', '<div class="warn">Another decision on this proposal is in progress.</div><a href="' + proposalLink(id) + '">← Back</a>');
     busy.add(id);
     const ip = clientIp(req);
     try {
       let p;
       try { p = await loadProposal(id, brokerEnv); await ledgerOk(); }
-      catch (e) { audit('integrity_failure', { id, code: e.code ?? 'error' }).catch(() => {}); return html(res, 409, 'Integrity', '<div class="bad">Integrity check failed (' + esc(e.code ?? 'error') + '): nothing was done.</div>'); }
+      catch (e) { audit('integrity_failure', { id, code: e.code ?? 'error' }).catch(() => {}); return htmlA(res, 409, 'Integrity', '<div class="bad">Integrity check failed (' + esc(e.code ?? 'error') + '): nothing was done.</div>'); }
       const hash = String(form.get('hash') ?? '');
-      if (!/^[0-9a-f]{64}$/.test(hash) || hash !== p.request_hash) return html(res, 409, 'Changed', '<div class="bad">The request on this page is not the current request. Reload.</div>');
+      if (!/^[0-9a-f]{64}$/.test(hash) || hash !== p.request_hash) return htmlA(res, 409, 'Changed', '<div class="bad">The request on this page is not the current request. Reload.</div>');
       const code = String(form.get('code') ?? '').trim();
       const outcome = outcomeOf(p);
       if (action === 'resolve') {
         const ledgerState = stateForHash(await readLedger(brokerEnv), p.request_hash);
-        if (!['ambiguous', 'submitting'].includes(ledgerState)) return html(res, 409, 'Not ambiguous', '<div class="warn">This proposal is not awaiting a decision.</div>');
-      } else if (outcome !== 'pending_operator_approval') return html(res, 409, 'Not pending', '<div class="warn">This proposal is not pending (' + esc(outcome) + ').</div><a href="' + proposalLink(id) + '">← Back</a>');
-      if (action === 'approve' && !writesEnabled()) return html(res, 409, 'Writes disabled', '<div class="bad">Writes are disabled on this service. Nothing was sent.</div>');
+        if (!['ambiguous', 'submitting'].includes(ledgerState)) return htmlA(res, 409, 'Not ambiguous', '<div class="warn">This proposal is not awaiting a decision.</div>');
+      } else if (outcome !== 'pending_operator_approval') return htmlA(res, 409, 'Not pending', '<div class="warn">This proposal is not pending (' + esc(outcome) + ').</div><a href="' + proposalLink(id) + '">← Back</a>');
+      if (action === 'approve' && !writesEnabled()) return htmlA(res, 409, 'Writes disabled', '<div class="bad">Writes are disabled on this service. Nothing was sent.</div>');
       const su = await auth.stepUp({ ip, code });
       if (!su.ok) {
         audit('stepup_failed', { id, action, status: su.status, ip: ipHash(ip), session: session.short }).catch(() => {});
-        return html(res, su.status === 429 ? 429 : su.status === 503 ? 503 : 401, 'Code rejected', '<div class="bad">Code rejected' + (su.status === 429 ? ' — locked out, try later' : '') + '. Wait for a NEW code and retry. / الرمز مرفوض</div><a href="' + proposalLink(id) + '">← Back</a>');
+        return htmlA(res, su.status === 429 ? 429 : su.status === 503 ? 503 : 401, 'Code rejected', '<div class="bad">Code rejected' + (su.status === 429 ? ' — locked out, try later' : '') + '. Wait for a NEW code and retry. / الرمز مرفوض</div><a href="' + proposalLink(id) + '">← Back</a>');
       }
       const actor = 'operator:' + session.short;
       await audit('operator_' + action, { id, hash: p.request_hash.slice(0, 12), step: su.step, session: session.short });     // audit BEFORE acting: tamper/IO failure => nothing happens
@@ -470,61 +577,67 @@ export function createBrokerService(options = {}) {
         try { result = await executeProposal({ id, phrase: approvalPhrase(brokerEnv, p), actor }, { env: brokerEnv, fetcher, now: now() }); }
         catch (e) {
           await audit('approve_refused', { id, code: e.code ?? 'error' }).catch(() => {});
-          return html(res, 409, 'Refused', '<div class="bad">Refused (' + esc(e.code ?? 'error') + '): ' + esc(e.message) + '</div><a href="' + proposalLink(id) + '">← Back</a>');
+          return htmlA(res, 409, 'Refused', '<div class="bad">Refused (' + esc(e.code ?? 'error') + '): ' + esc(scrub(e.message)) + '</div><a href="' + proposalLink(id) + '">← Back</a>');
         }
         await audit('approve_result', { id, status: result.status, record_id: result.record_id ?? null, http: result.http_status ?? null }).catch(() => {});
         const good = result.ok === true;
-        return html(res, 200, 'Result', '<div class="' + (good ? 'ok' : 'bad') + '"><b>' + esc(result.status) + '</b>' + (result.record_id ? ' · record ' + esc(result.record_id) : '') + '<br>' + esc(result.message ?? '')
+        return htmlA(res, 200, 'Result', '<div class="' + (good ? 'ok' : 'bad') + '"><b>' + esc(result.status) + '</b>' + (result.record_id ? ' · record ' + esc(result.record_id) : '') + '<br>' + esc(scrub(result.message ?? ''))
           + (result.needs_review ? '<br><b>' + esc(result.needs_review) + '</b>' : '') + '</div><a href="/console">← Back</a>');
       }
       if (action === 'reject') {
         const claimed = await acquireLock(brokerEnv, p.id + '.claim');                      // consumes the proposal for good
-        if (!claimed) return html(res, 409, 'Already used', '<div class="warn">Already used.</div>');
-        await updateProposal(p.id, { status: 'DECLINED', approved_by: actor }, brokerEnv);
-        return html(res, 200, 'Rejected', '<div class="ok">Rejected — nothing was sent. / تم الرفض</div><a href="/console">← Back</a>');
+        if (!claimed) return htmlA(res, 409, 'Already used', '<div class="warn">Already used.</div>');
+        await updateProposal(p.id, { status: 'DECLINED', approved_by: actor, approved_at: new Date(now()).toISOString() }, brokerEnv);
+        declined.set(p.request_hash, now() + declineTtlMs);                                  // the agent cannot nag with the identical request
+        return htmlA(res, 200, 'Rejected', '<div class="ok">Rejected — nothing was sent. / تم الرفض</div><a href="/console">← Back</a>');
       }
       // resolve
       const created = form.get('created') === 'true'; const recordId = String(form.get('record_id') ?? '').trim();
-      if (recordId && !/^[0-9]{1,15}$/.test(recordId)) return html(res, 400, 'Invalid', '<div class="bad">Invalid record id.</div>');
+      if (recordId && !/^[0-9]{1,15}$/.test(recordId)) return htmlA(res, 400, 'Invalid', '<div class="bad">Invalid record id.</div>');
       try {
         await resolveProposal({ id, created, recordId: recordId || undefined, code: resolveCode(brokerEnv, id, created), actor }, { env: brokerEnv });
-      } catch (e) { return html(res, 409, 'Refused', '<div class="bad">Refused (' + esc(e.code ?? 'error') + '): ' + esc(e.message) + '</div>'); }
-      return html(res, 200, 'Recorded', '<div class="ok">Recorded. / تم التسجيل</div><a href="/console">← Back</a>');
-    } finally { busy.delete(id); }
+      } catch (e) { return htmlA(res, 409, 'Refused', '<div class="bad">Refused (' + esc(e.code ?? 'error') + '): ' + esc(scrub(e.message)) + '</div>'); }
+      return htmlA(res, 200, 'Recorded', '<div class="ok">Recorded. / تم التسجيل</div><a href="/console">← Back</a>');
+    } finally { busy.delete(id); await indexRefresh(id).catch(() => {}); }
   }
 
   async function handleConsole(req, res) {
     const url = new URL(req.url, 'http://x'); const path = url.pathname; const method = req.method;
     if (method === 'GET' && (path === '/healthz' || path === '/setup/healthz')) return textReply(res, 200, 'ok');
     if (path.startsWith('/v1/')) return textReply(res, 404, 'Not Found');
+    // Optional hardening: when Railway's edge is known to add its headers, a console request WITHOUT them did not come through the
+    // public edge (e.g. it came over the private network) and is refused. Off by default (the exact edge headers are not proven).
+    if (env.BROKER_CONSOLE_REQUIRE_EDGE === '1' && !Object.keys(req.headers).some((h) => EDGE_HEADER.test(h))) return textReply(res, 404, 'Not Found');
     const ip = clientIp(req);
     await auth.ready();
     if (method === 'GET' && path === '/') {
-      if (!configured) return html(res, 503, 'BASHT Daftra', '<h1>BASHT Daftra</h1><div class="bad">Service not configured / الخدمة غير مهيأة</div>');
+      if (!configured) return html(res, 503, 'BASHT Daftra', '<h1>BASHT Daftra</h1><p>Service unavailable / الخدمة غير متاحة</p>');
       return html(res, 200, 'Sign in', loginForm(auth.issuePre()));
     }
     if (method === 'POST' && path === '/login') {
       let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
       if (!sameOrigin(req)) return textReply(res, 403, 'Forbidden');
-      if (!configured) return html(res, 503, 'BASHT Daftra', '<div class="bad">Service not configured</div>');
+      if (!configured) return html(res, 503, 'BASHT Daftra', '<p>Service unavailable / الخدمة غير متاحة</p>');
       if (!auth.consumePre(form.get('pre'))) return html(res, 400, 'Sign in', loginForm(auth.issuePre(), 'Form expired — try again / انتهت صلاحية النموذج'));
       const r = await auth.login({ password: form.get('password') ?? '', code: form.get('code') ?? '', ip });
       if (!r.ok) {
-        audit('login_failed', { ip: ipHash(ip), status: r.status }).catch(() => {});
+        noteEvent('login_failed');
         return html(res, r.status, 'Sign in', loginForm(auth.issuePre(), r.status === 429 ? 'Too many attempts — try later / محاولات كثيرة' : r.status === 503 ? 'Unavailable' : 'Invalid credentials / بيانات غير صحيحة'));
       }
       audit('login_ok', { ip: ipHash(ip), session: r.session.short }).catch(() => {});
       return redirect(res, '/console', { 'Set-Cookie': sessionCookie(r.session.id, 1800) });
     }
     if (path === '/enroll') {
-      if (env.OPERATOR_ENROLLMENT !== '1' || !configured) return textReply(res, 404, 'Not Found');
+      if (env.OPERATOR_ENROLLMENT !== '1' || !configured || enrollShown) return textReply(res, 404, 'Not Found');   // one successful display per start
       if (method === 'GET') return html(res, 200, 'Enroll', '<h1>Authenticator enrollment / تسجيل المصادقة</h1><form method="post" action="/enroll"><input type="hidden" name="pre" value="' + esc(auth.issuePre()) + '"><label>Password<input type="password" name="password" required></label><button>Show setup key</button></form>');
       if (method === 'POST') {
         let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
         if (!sameOrigin(req) || !auth.consumePre(form.get('pre'))) return textReply(res, 403, 'Forbidden');
         const r = await auth.verifyPasswordOnly({ password: form.get('password') ?? '', ip });
-        if (!r.ok) { audit('enroll_failed', { ip: ipHash(ip), status: r.status }).catch(() => {}); return html(res, r.status, 'Enroll', '<div class="bad">Invalid / غير صحيح</div>'); }
-        audit('enroll_shown', { ip: ipHash(ip) }).catch(() => {});
+        if (!r.ok) { noteEvent('enroll_failed'); return html(res, r.status, 'Enroll', '<div class="bad">Invalid / غير صحيح</div>'); }
+        if (enrollShown) return textReply(res, 404, 'Not Found');
+        enrollShown = true;                                                              // auto-disable: the key is shown ONCE per process start
+        await audit('enroll_shown', { ip: ipHash(ip) }).catch(() => {});
         const b32 = totpBase32(env.OPERATOR_TOTP_SEED);
         return html(res, 200, 'Enroll', '<h1>Setup key / مفتاح الإعداد</h1><p>Add to your authenticator (iPhone: Passwords → verification code → Enter Setup Key). Type: time-based, 6 digits, 30 s, SHA-1.</p><pre>' + esc(b32) + '</pre><pre>' + esc(otpauthUri(b32)) + '</pre><div class="warn"><b>Now remove the OPERATOR_ENROLLMENT variable and redeploy.</b> / احذف المتغير OPERATOR_ENROLLMENT</div>');
       }
@@ -539,8 +652,8 @@ export function createBrokerService(options = {}) {
     }
     if (path === '/console' || path.startsWith('/proposal/')) {
       if (!session) return redirect(res, '/');
-      if (!configured) return html(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
-      if (method === 'GET' && path === '/console') return consolePage(res, session);
+      if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
+      if (method === 'GET' && path === '/console') return consolePage(res, session, Number(url.searchParams.get('page')) || 1);
       const m = /^\/proposal\/(prop_[0-9a-f]{16})(?:\/(approve|reject|resolve))?$/.exec(path);
       if (!m) return textReply(res, 404, 'Not Found');
       if (method === 'GET' && !m[2]) return proposalPage(res, session, m[1]);
@@ -551,7 +664,9 @@ export function createBrokerService(options = {}) {
   }
 
   // ---- servers ----------------------------------------------------------------------------------------------
-  const guard = (fn) => (req, res) => {
+  const guard = (fn, limiter) => (req, res) => {
+    // global + per-peer pre-auth limiter: refuses BEFORE any parsing, auth, audit or state access
+    if (!limiter(req.socket.remoteAddress ?? 'unknown')) { noteEvent('preauth_rate_limited'); res.writeHead(429, { 'Retry-After': '1', 'Content-Length': 0, Connection: 'close' }); res.end(); return; }
     fn(req, res).catch((e) => {
       log({ level: 'error', error: scrub(e?.message ?? 'error').slice(0, 200) });
       if (!res.headersSent) { try { res.writeHead(500, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' }); res.end('Internal error'); } catch { /* closed */ } }
@@ -560,14 +675,16 @@ export function createBrokerService(options = {}) {
   const timeouts = options.timeoutsMs ?? {};
   const harden = (s) => {
     s.headersTimeout = timeouts.headers ?? 10_000; s.requestTimeout = timeouts.request ?? 30_000;
-    s.connectionsCheckingInterval = timeouts.check ?? 2_000;      // node enforces the two timeouts only at this cadence (default 30 s) s.keepAliveTimeout = 5_000; s.maxRequestsPerSocket = 100;
+    s.connectionsCheckingInterval = timeouts.check ?? 2_000;      // node enforces the two timeouts only at this cadence (default 30 s)
+    s.keepAliveTimeout = 5_000;
+    s.maxRequestsPerSocket = 100;                                  // one connection can never serve unbounded requests
     s.on('clientError', (err, socket) => { try { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); else socket.destroy(); } catch { socket.destroy(); } });
     return s;
   };
   // node enforces headersTimeout/requestTimeout only every `connectionsCheckingInterval` (constructor option; default 30 s)
   const serverOptions = { maxHeaderSize: 16384, headersTimeout: timeouts.headers ?? 10_000, requestTimeout: timeouts.request ?? 30_000, connectionsCheckingInterval: timeouts.check ?? 2_000 };
-  const publicServer = harden(http.createServer(serverOptions, guard(handleConsole)));
-  const privateServer = harden(http.createServer(serverOptions, guard(handleApi)));
+  const publicServer = harden(http.createServer(serverOptions, guard(handleConsole, publicLimiter)));
+  const privateServer = harden(http.createServer(serverOptions, guard(handleApi, privateLimiter)));
   const listenOn = (server, port, host) => new Promise((ok, fail) => { server.once('error', fail); server.listen(Number(port), host, () => { server.off('error', fail); ok(server.address()); }); });
 
   async function listen() {
@@ -576,20 +693,30 @@ export function createBrokerService(options = {}) {
     if (!configured) log({ level: 'warn', msg: 'SERVICE NOT CONFIGURED: writes impossible', issues });
     else if (!writesEnabled()) log({ level: 'info', msg: 'writes are DISABLED (DAFTRA_WRITES_ENABLED is not 1)' });
     await auth.ready();
-    if (auth.broken && env.OPERATOR_STATE_RESET === '1') { await auth.reset(); await audit('operator_state_reset', {}).catch(() => {}); log({ level: 'warn', msg: 'operator state was reset (OPERATOR_STATE_RESET=1): unset it' }); }
+    if (configured) { await indexLoad(); await prune(); try { await ensureAuditHead(); } catch (e) { if (e.code === 'AUDIT_TAMPERED') log({ level: 'error', msg: 'audit chain failed verification: approvals are refused until the audit file is investigated' }); } }
+    if (env.OPERATOR_STATE_RESET === '1') {
+      // Break-glass: ALWAYS clears lock counters (never the replay high-water mark); a corrupt state file is replaced as well.
+      if (auth.broken) { await auth.reset(); await audit('operator_state_reset', {}).catch(() => {}); log({ level: 'warn', msg: 'operator state was reset (OPERATOR_STATE_RESET=1): unset it' }); }
+      else if (await auth.clearLocks()) { await audit('operator_locks_cleared', {}).catch(() => {}); log({ level: 'warn', msg: 'operator lockouts were cleared (OPERATOR_STATE_RESET=1): unset it' }); }
+    }
     else if (auth.broken) log({ level: 'error', msg: 'operator state failed authentication: logins refused. Set OPERATOR_STATE_RESET=1 once to recover.', reason: auth.broken });
     const pub = await listenOn(publicServer, pubPort, options.publicHost ?? env.BROKER_PUBLIC_HOST ?? '::');
     const priv = await listenOn(privateServer, privPort, options.privateHost ?? env.BROKER_PRIVATE_HOST ?? '::');
+    timer = setInterval(() => { flushAgg(); prune().catch(() => {}); }, 60_000); timer.unref?.();
     return { public: pub, private: priv };
   }
+  let timer = null;
   async function close() {
+    if (timer) { clearInterval(timer); timer = null; }
+    await flushAgg().catch(() => {});
+    await auth.flush().catch(() => {});
     await auditQueue.catch(() => {});                       // let in-flight audit appends finish before the volume is released
     await Promise.all([publicServer, privateServer].map((s) => new Promise((ok) => { s.close(() => ok()); s.closeAllConnections?.(); })));
   }
   return {
     listen, close, publicServer, privateServer, issues, configured, writesEnabled, exposure,
     publicAddress: () => publicServer.address(), privateAddress: () => privateServer.address(),
-    _auth: auth, _brokerEnv: brokerEnv, _stateDir: cfg.stateDir,
+    _auth: auth, _brokerEnv: brokerEnv, _stateDir: cfg.stateDir, _flushAggregates: flushAgg, _prune: prune, _indexSize: () => index.size, _indexBytes: () => indexBytes, _pendingCount: pendingCount,
   };
 }
 

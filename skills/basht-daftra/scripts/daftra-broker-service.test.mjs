@@ -53,7 +53,7 @@ test('END TO END: agent proposes over the private API, operator approves in the 
 test('AGENT CLI in service mode: propose/show/status work, execute/resolve do not exist, capabilities warns about operator secrets', async () => {
   const c = await startService({ env: { BROKER_ALLOW_LOOPBACK_HOST: '1' } });
   try {
-    const agentEnv = { DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: READ_KEY, DAFTRA_BROKER_URL: 'http://127.0.0.1:' + c.privatePort, DAFTRA_BROKER_TOKEN: AGENT_TOKEN, DAFTRA_BROKER_ALLOW_LOOPBACK: '1' };
+    const agentEnv = { DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_BROKER_URL: 'http://127.0.0.1:' + c.privatePort, DAFTRA_BROKER_TOKEN: AGENT_TOKEN, DAFTRA_BROKER_ALLOW_LOOPBACK: '1' };
     const p = await run(['propose', 'sales_invoice', '--input', JSON.stringify(invoiceInput), '--actor', 'bot'], { env: agentEnv, fetcher: async () => { throw Error('agent must not call Daftra for propose'); } });
     assert.equal(p.status, 'READY_FOR_APPROVAL');
     assert.equal(JSON.stringify(p).includes('APPROVE '), false);
@@ -63,7 +63,14 @@ test('AGENT CLI in service mode: propose/show/status work, execute/resolve do no
       await assert.rejects(run(cmd, { env: agentEnv }), (e) => e.code === 'AGENT_CANNOT_APPROVE' && /operator in the approval console/.test(e.message));
     const caps = await run(['capabilities'], { env: { ...agentEnv, DAFTRA_APPROVAL_SECRET: OP_SECRET, DAFTRA_WRITE_API_KEY: WRITE_KEY } });
     assert.equal(caps.broker_mode, 'service'); assert.equal(caps.writes_enabled, false);
+    assert.equal(caps.daftra_credentials_on_agent, true);
     assert.ok(caps.env_warnings.some((w) => /DAFTRA_APPROVAL_SECRET is present/.test(w)) && caps.env_warnings.some((w) => /DAFTRA_WRITE_API_KEY is present/.test(w)));
+    assert.ok(caps.env_warnings.some((w) => /per ENTITY, not per method/.test(w)));
+    const clean = await run(['capabilities'], { env: agentEnv });
+    assert.equal(clean.daftra_credentials_on_agent, false); assert.deepEqual(clean.env_warnings, []); assert.equal(clean.reads_via_broker, true);
+    const readKeyCaps = await run(['capabilities'], { env: { ...agentEnv, DAFTRA_API_KEY: READ_KEY } });
+    assert.equal(readKeyCaps.daftra_credentials_on_agent, true);
+    assert.ok(readKeyCaps.env_warnings.some((w) => /DAFTRA_API_KEY is present.*any key that can read can also write/.test(w)));
     assert.equal(c.fake.posts.length, 0);
     // duplicates go through the service too
     await assert.rejects(run(['duplicate', 'expenses', '3', '--input', '{"date":"2025-03-01"}'], { env: agentEnv }), /source/i);
@@ -97,7 +104,7 @@ test('NOT CONFIGURED is fail-closed: health + login page only, no proposals, no 
     assert.equal((await op.request('GET', '/healthz')).text, 'ok');
     assert.equal((await op.request('GET', '/setup/healthz')).text, 'ok');
     const home = await op.request('GET', '/');
-    assert.equal(home.status, 503); assert.match(home.text, /not configured/i);
+    assert.equal(home.status, 503); assert.match(home.text, /unavailable/i); assert.equal(/configured|writes|disabled/i.test(home.text), false, 'anonymous page says nothing about configuration');
     assert.equal(/OPERATOR_PASSWORD|DAFTRA_APPROVAL/.test(home.text), false, 'the public page does not reveal which variables are missing');
     assert.equal((await op.login({ pre: 'x' })).status, 503);
     const r = await proposeInvoice(c);
