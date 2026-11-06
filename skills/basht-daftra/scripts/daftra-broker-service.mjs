@@ -479,11 +479,12 @@ export function createBrokerService(options = {}) {
       if (env.BROKER_PUBLIC_ORIGIN) return origin === env.BROKER_PUBLIC_ORIGIN;
       try { return new URL(origin).host === req.headers.host; } catch { return false; }
     }
-    // Safari can omit Origin on same-origin HTML form POSTs. Accept its browser-supplied
-    // Fetch Metadata ONLY when Origin is absent, the public host matches exactly, and
-    // the form's single-use HMAC pre-token / session CSRF token still verifies.
-    // Reject Origin:null, cross-site and same-site subdomain requests.
-    if (origin !== undefined || req.headers['sec-fetch-site'] !== 'same-origin' || !env.BROKER_PUBLIC_ORIGIN) return false;
+    // Some iOS embedded browsers submit a same-origin HTML form with Origin: null,
+    // rather than omitting Origin. Trust that exceptional case ONLY with browser
+    // Fetch Metadata explicitly proving same-origin, an exact public Host match,
+    // and the existing one-use HMAC pre-token / authenticated CSRF verification.
+    // Cross-site, same-site (subdomains), and unmarked requests still fail closed.
+    if ((origin !== undefined && origin !== 'null') || req.headers['sec-fetch-site'] !== 'same-origin' || !env.BROKER_PUBLIC_ORIGIN) return false;
     try { return req.headers.host === new URL(env.BROKER_PUBLIC_ORIGIN).host; } catch { return false; }
   }
 
@@ -697,17 +698,18 @@ export function createBrokerService(options = {}) {
       if (method === 'POST') {
         let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
         if (!sameOrigin(req)) {
-          let originInfo = { originValidUrl: false, originHostMatchesConfigured: false, originSchemeHttps: false, requestHostMatchesConfigured: false };
+          let originInfo = { originValidUrl: false, originIsNull: req.headers.origin === 'null',
+            originHostMatchesConfigured: false, originSchemeHttps: false, requestHostMatchesConfigured: false };
           try {
             const configUrl = new URL(env.BROKER_PUBLIC_ORIGIN);
-            const originUrl = new URL(String(req.headers.origin ?? ''));
-            originInfo = {
-              originValidUrl: true,
-              originHostMatchesConfigured: originUrl.host === configUrl.host,
-              originSchemeHttps: originUrl.protocol === 'https:',
-              requestHostMatchesConfigured: req.headers.host === configUrl.host,
-            };
-          } catch { /* record only booleans, never raw attacker-controlled headers */ }
+            originInfo.requestHostMatchesConfigured = req.headers.host === configUrl.host;
+            try {
+              const originUrl = new URL(String(req.headers.origin ?? ''));
+              originInfo.originValidUrl = true;
+              originInfo.originHostMatchesConfigured = originUrl.host === configUrl.host;
+              originInfo.originSchemeHttps = originUrl.protocol === 'https:';
+            } catch { /* keep only safe classifications */ }
+          } catch { /* keep only safe classifications */ }
           log({ level: 'warn', msg: 'operator enrollment rejected: origin policy',
             originPresent: typeof req.headers.origin === 'string',
             sameSiteBrowserMetadata: req.headers['sec-fetch-site'] === 'same-origin',
