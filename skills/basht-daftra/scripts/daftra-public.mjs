@@ -32,6 +32,7 @@ export function formatMeta(meta) {
   if (meta.duplicate_of) {
     const d = meta.diff;
     out.push('DUPLICATE OF ' + safeText(meta.duplicate_of.entity) + '#' + safeText(meta.duplicate_of.id) + (d?.original?.number ? ' (no. ' + safeText(d.original.number) + ')' : '') + ' -> a NEW document (own id/number from Daftra)');
+    out.push('  !!! APPROVING AND EXECUTING THIS CREATES A NEW FINANCIAL DOCUMENT in Daftra. The source is not modified and is excluded from the duplicate scan; any other matching document blocks.');
     for (const h of d?.header ?? []) out.push('  header ' + safeText(h.field) + ': ' + money(h.original) + '  =>  ' + money(h.proposed));
     for (const l of d?.lines ?? []) {
       if (l.proposed === null) out.push('  line ' + l.n + ': REMOVED (' + safeText(l.original.item) + ')');

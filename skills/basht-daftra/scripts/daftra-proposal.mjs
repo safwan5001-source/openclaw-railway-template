@@ -8,6 +8,7 @@ import { canonicalJson } from './daftra-canonical.mjs';
 import { normName, normEmail, digitsOnly, normTax } from './daftra-parties.mjs';
 import { newProposalId, saveProposal, readLedger, isBlockedByLedger } from './daftra-ledger.mjs';
 import { parseDecimal, format } from './daftra-money.mjs';
+import { verifyDuplicateSource } from './daftra-duplicate-source.mjs';
 
 export const PROPOSAL_TTL_MS = 15 * 60 * 1000;
 
@@ -194,8 +195,21 @@ export async function collectChecks(type, preview, env, fetcher, acknowledged = 
     }
   }
   let duplicates = [];
+  // Explicit `duplicate` command only (meta is signed and set by proposeDuplicate, never by caller input): the SOURCE document
+  // is not a blocker for its own copy, but only while it is proven unchanged. Every OTHER match still blocks.
+  let sourceKey = null;
+  if (extra.duplicateOf || extra.sourceFingerprint) {
+    const src = await verifyDuplicateSource(extra.duplicateOf, type, extra.sourceFingerprint, env, fetcher);
+    check(src.ok, 'duplicate_source_unchanged', src.detail, true);
+    if (src.ok) sourceKey = src.entity + '#' + src.id;
+  }
   try {
     duplicates = await findDuplicates(type, preview, env, fetcher);
+    if (sourceKey) {
+      const ignored = duplicates.filter((d) => d.entity + '#' + d.id === sourceKey);
+      duplicates = duplicates.filter((d) => d.entity + '#' + d.id !== sourceKey);
+      if (ignored.length) check(true, 'duplicate_source_excluded', 'The source ' + sourceKey + ' is excluded from the duplicate scan because this is an explicit duplicate command; other matching documents still block');
+    }
     const open = duplicates.filter((d) => !acknowledged.has(d.entity + '#' + d.id));
     check(open.length === 0, 'no_remote_duplicate', open.length
       ? 'Possible duplicates already in Daftra: ' + open.map((d) => d.entity + '#' + d.id).join(', ') + ' (re-propose with acknowledge_duplicates to override)'
@@ -233,7 +247,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
     preview = prepareFinancialAction(type, input, { taxes, requireDate: true, idempotencyKey: 'basht-' + preview.request_hash.slice(0, 40) });
   }
   const acknowledged = new Set((input.acknowledge_duplicates ?? []).map(String));
-  const collected = await collectChecks(type, preview, env, fetcher, acknowledged, { snapshot });
+  const collected = await collectChecks(type, preview, env, fetcher, acknowledged, { snapshot, duplicateOf: meta?.duplicate_of, sourceFingerprint: meta?.source_fingerprint });
   const effective = [...preBlocking, ...extraBlocking, ...collected.blocking];
   const ledger = await readLedger(env);
   const ledgerState = isBlockedByLedger(ledger, preview.request_hash, { idempotent: preview.request.method === 'PUT' });

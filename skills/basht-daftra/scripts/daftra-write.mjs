@@ -128,7 +128,7 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     const limit = Number.isInteger(configured) && configured >= 1 ? configured : 20;
     if (writesInLastHour(ledger, now) >= limit) throw new WriteRefused('RATE_LIMIT', 'Write rate limit reached (' + limit + '/hour)');
     // fresh checks right before submitting (balance, duplicates, permissions may have changed)
-    const recheck = await collectChecks(proposal.type, previewFromRequest(proposal), env, fetcher, new Set(proposal.acknowledged_duplicates ?? []), { snapshot: proposal.meta?.snapshot });
+    const recheck = await collectChecks(proposal.type, previewFromRequest(proposal), env, fetcher, new Set(proposal.acknowledged_duplicates ?? []), { snapshot: proposal.meta?.snapshot, duplicateOf: proposal.meta?.duplicate_of, sourceFingerprint: proposal.meta?.source_fingerprint });
     if (recheck.blocking.length) throw new WriteRefused('RECHECK_FAILED', 'Pre-submit re-check failed: ' + recheck.blocking.join('; '));
 
     const { base, apiKey: readKey } = config(env);
