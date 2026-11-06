@@ -146,7 +146,7 @@ export function createBrokerService(options = {}) {
   const brokerEnv = {
     DAFTRA_BASE_URL: env.DAFTRA_BASE_URL, DAFTRA_API_KEY: cfg.writeKey, DAFTRA_APPROVAL_SECRET: cfg.secret,
     OPENCLAW_WORKSPACE_DIR: cfg.stateDir, DAFTRA_WRITES_ENABLED: cfg.writesEnabled && configured ? '1' : '0',
-    DAFTRA_MAX_WRITES_PER_HOUR: env.DAFTRA_MAX_WRITES_PER_HOUR,
+    DAFTRA_MAX_WRITES_PER_HOUR: env.DAFTRA_MAX_WRITES_PER_HOUR, DAFTRA_PDF_REDIRECT_HOSTS: env.DAFTRA_PDF_REDIRECT_HOSTS,   // non-secret exact hostnames
   };
   const writesEnabled = () => configured && cfg.writesEnabled;
 

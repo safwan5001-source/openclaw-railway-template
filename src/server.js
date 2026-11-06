@@ -13,6 +13,7 @@ import {
   describeGatewayHealth,
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
+import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
@@ -1701,6 +1702,9 @@ app.post(
     }
   },
 );
+
+// Official Daftra invoice PDFs created by the `pdf` command, behind the existing setup login.
+registerExportDownload(app, requireSetupAuth, WORKSPACE_DIR);
 
 app.get("/logs", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));

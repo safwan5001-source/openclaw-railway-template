@@ -9,7 +9,7 @@
 // strict regex built from the registry in daftra-entities.mjs and the query is rebuilt with buildQuery() (allowlist + per-key
 // validation), exactly as the in-process reader does.
 import { ENTITIES, REPORTS, buildQuery, buildReportQuery } from './daftra-entities.mjs';
-import { config, pdfUrl, assertPdfBytes } from './daftra-readonly.mjs';
+import { config, pdfUrl, assertPdfBytes, fetchOfficialPdfResponse, pdfResponseProblem, invoiceIsDraft } from './daftra-readonly.mjs';
 import { summariseValidationErrors } from './daftra-errors.mjs';
 
 // Response caps: list/single-record reads 6 MiB (a page is <= 500 rows), reports 16 MiB (single response, no pagination).
@@ -135,12 +135,14 @@ export async function fetchInvoicePdf(id, { env, fetcher = fetch }) {
   if (got.status !== 200 || !got.body) return { status: got.status === 200 ? 502 : got.status, message: got.message ?? 'Invoice not available' };
   let url;
   try { url = pdfUrl(got.body, env); } catch (e) { return { status: 422, message: clean(e.message) }; }
-  const response = await fetcher(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) return { status: 502, message: 'PDF download failed (HTTP ' + response.status + ')' };
-  const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) return { status: 502, message: 'Response is not PDF' };
+  const draft = invoiceIsDraft(got.body);
+  let fetched;
+  try { fetched = await fetchOfficialPdfResponse(url, { env, fetcher }); } catch (e) { return { status: 502, message: clean(e.message), draft }; }
+  const { response, redirects } = fetched;
+  const problem = pdfResponseProblem(response, { draft });
+  if (problem) return { status: 502, message: problem, draft };
   let bytes;
   try { bytes = await readCapped(response, MAX_PDF); } catch (e) { return { status: 502, message: clean(e.message) }; }
   try { assertPdfBytes(new Uint8Array(bytes)); } catch (e) { return { status: 502, message: clean(e.message) }; }
-  return { status: 200, size: bytes.length, base64: bytes.toString('base64') };
+  return { status: 200, size: bytes.length, base64: bytes.toString('base64'), draft, redirects };
 }
