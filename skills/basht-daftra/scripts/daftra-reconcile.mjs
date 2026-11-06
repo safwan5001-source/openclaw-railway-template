@@ -15,7 +15,7 @@
 // reported as "credit applied, source of the customer balance NOT verified": the origin and journal entry of a client credit
 // need an independent check.
 import { fetchAllRecords, getOne, getRecord } from './daftra-readonly.mjs';
-import { isCalendarDate } from './daftra-entities.mjs';
+import { isCalendarDate, normalizeDaftraDate } from './daftra-entities.mjs';
 import { format, ZERO } from './daftra-money.mjs';
 import { money } from './daftra-statements.mjs';
 
@@ -40,18 +40,32 @@ export function normalizePayment(raw, source, containerInvoiceId = null) {
   const amount = tryMoney(r.amount);
   if (amount === undefined) problems.push('amount_invalid');
   const status = str(r.status);
+  const date = normalizeDaftraDate(r.date);
+  if (str(r.date) !== null && date === null) problems.push('date_invalid');
   return {
     source, container: containerInvoiceId, id: idOf(r.id), raw_id: str(r.id), invoice_id: own ?? containerInvoiceId, claimed_invoice_id: own,
     amount: amount === undefined ? null : amount, amount_text: str(r.amount), status: status === null ? null : status.toLowerCase(),
-    method: str(r.payment_method ?? r.method)?.toLowerCase() ?? null, date: str(r.date)?.slice(0, 10) ?? null, problems,
+    method: str(r.payment_method ?? r.method)?.toLowerCase() ?? null, date, problems,
   };
 }
 
-// Payments embedded in an invoice detail. `present` is false when the response has no recognisable payments section at all.
+// Payments embedded in an invoice detail. The paths below are the ONLY ones read; each is an array of payments (flat or wrapped
+// in an `InvoicePayment` / `Payment` key). `present` is false when none of them exists, which is NOT evidence of "no payments".
+//   data.Payment                    (shape used by the document-copy code)
+//   data.InvoicePayment             (payments next to the Invoice model)
+//   data.Invoice.InvoicePayment     (payments nested inside the Invoice model; observed on the live tenant)
+// A payment found on more than one path is the same source (same endpoint) and is counted once.
+export const EMBEDDED_PATHS = Object.freeze(['data.Payment', 'data.InvoicePayment', 'data.Invoice.InvoicePayment']);
 export function embeddedPayments(payload) {
   const data = payload?.data;
-  const section = Array.isArray(data?.Payment) ? data.Payment : Array.isArray(data?.InvoicePayment) ? data.InvoicePayment : null;
-  return { present: section !== null, rows: section ?? [] };
+  const candidates = [['data.Payment', data?.Payment], ['data.InvoicePayment', data?.InvoicePayment], ['data.Invoice.InvoicePayment', data?.Invoice?.InvoicePayment]];
+  const rows = []; const paths = [];
+  for (const [path, section] of candidates) {
+    if (!Array.isArray(section)) continue;
+    paths.push(path);
+    for (const row of section) rows.push({ row, path });
+  }
+  return { present: paths.length > 0, rows, paths };
 }
 
 const FIELDS = ['amount', 'invoice_id', 'status', 'method'];
@@ -80,7 +94,7 @@ export function mergeObservations(observations) {
       values[f] = seen.size === 1 ? [...seen.keys()][0] : null;
     }
     const sources = [...new Set(rec.observations.map((o) => o.source))];
-    const duplicates = rec.observations.length - sources.length > 0 && sources.some((s) => rec.observations.filter((o) => o.source === s).length > 1);
+    const duplicates = rec.observations.some((o, i) => rec.observations.findIndex((x) => x.source === o.source && x.path === o.path) !== i);
     const problems = [...new Set(rec.observations.flatMap((o) => o.problems))];
     return { id: rec.id, sources, conflicts, duplicate_in_source: duplicates, problems, observations: rec.observations,
       amount: values.amount === null ? null : BigInt(values.amount), invoice_id: values.invoice_id, status: values.status, method: values.method,
@@ -119,10 +133,11 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
   const detailState = new Map();       // invoiceId -> { ok, present, error }
   for (const [invId, d] of details) {
     if (d.error) { detailState.set(invId, { ok: false, error: d.error }); continue; }
-    const { present, rows } = embeddedPayments(d.payload);
-    detailState.set(invId, { ok: true, present, header: d.header });
-    for (const row of rows) {
+    const { present, rows, paths } = embeddedPayments(d.payload);
+    detailState.set(invId, { ok: true, present, paths, header: d.header });
+    for (const { row, path } of rows) {
       const o = normalizePayment(row, 'detail', invId);
+      o.path = path;
       if (o.id === null) { unidentified.push({ source: 'detail', raw_id: o.raw_id, invoice_id: invId, amount: o.amount_text }); continue; }
       observations.push(o);
     }
@@ -141,6 +156,12 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     if (!crossChecked && !failedGet) reasons.push('single_source_unverified');
     if (m.amount === null && !m.conflicts.some((c) => c.field === 'amount')) reasons.push('amount_missing');
     if (m.invoice_id === null && !m.conflicts.some((c) => c.field === 'invoice_id')) reasons.push('invoice_id_missing');
+    // Each field that decides the outcome needs evidence from two sources, or from the single record itself. A value that only
+    // ONE listing/detail supplies is not enough to count money.
+    for (const f of ['amount', 'invoice_id', 'status']) {
+      const providers = new Set(m.observations.filter((o) => (f === 'invoice_id' ? (o.claimed_invoice_id ?? o.invoice_id) : o[f]) !== null && (f === 'invoice_id' ? (o.claimed_invoice_id ?? o.invoice_id) : o[f]) !== undefined).map((o) => o.source));
+      if (!m.conflicts.some((c) => c.field === f) && providers.size < 2 && !providers.has('individual') && !failedGet) reasons.push('field_single_source:' + f);
+    }
     const kind = classifyStatus(m.status);
     if (kind === 'unknown' && !m.conflicts.some((c) => c.field === 'status')) reasons.push('status_missing');
     if (kind === 'unrecognised') reasons.push('status_unrecognised:' + m.status);
@@ -173,7 +194,7 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     total = read('summary_total'); paid = read('summary_paid'); unpaid = read('summary_unpaid');
     if (total !== null && paid !== null && unpaid !== null && total - paid !== unpaid) reasons.push('summary_inconsistent: total - paid != unpaid');
     if (!ds || !ds.ok) reasons.push('detail_unavailable' + (ds?.error ? ' (' + ds.error + ')' : ''));
-    else if (!ds.present && !(paid === ZERO)) reasons.push('payments_section_not_found_in_detail');
+    else if (!ds.present) reasons.push('payments_section_not_found_in_detail (checked ' + EMBEDDED_PATHS.join(', ') + '): absence of a section is not evidence that nothing was paid');
     const mine = payments.filter((p) => p.candidate_invoices.includes(id));
     for (const u of unidentified) if (u.invoice_id === id) reasons.push('payment_without_stable_id(' + u.source + ')');
     const unresolvedPayments = mine.filter((p) => p.state === 'unresolved');
@@ -188,7 +209,10 @@ export function reconcile({ clientId, from, to, invoices, listPayments, details,
     else state = 'matched';
     const notCounted = mine.filter((p) => p.state === 'not_counted');
     return {
-      id, no: str(inv.no), date: str(inv.date)?.slice(0, 10), state, reasons,
+      id, no: str(inv.no), date: normalizeDaftraDate(inv.date), state, reasons,
+      evidence: state === 'matched' ? (counted.length ? 'payments_verified_by_id' : 'no_payments_claimed_and_none_found') : null,
+      credit_source_unverified: counted.some((p) => p.category === 'client_credit'),
+      payments_paths: ds?.paths ?? [],
       summary_total: total === null ? null : format(total), summary_paid: paid === null ? null : format(paid), summary_unpaid: unpaid === null ? null : format(unpaid),
       proven_paid: format(proven), cash_bank: format(byCat.cash_bank), client_credit: format(byCat.client_credit), unclassified: format(byCat.unclassified),
       partially_paid: paid !== null && total !== null && paid > ZERO && paid < total,
@@ -252,9 +276,9 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
   for (const inv of invoicesPage.records) {
     const id = idOf(inv.id);
     const party = idOf(inv.client_id);
-    const date = str(inv.date)?.slice(0, 10);
-    if (!id || party !== String(clientId) || !date || !isCalendarDate(date) || date < from || date > to)
-      throw Error('Invoice list scope mismatch: unexpected/missing invoice id, client_id or date (invoice ' + String(inv.id ?? 'unknown') + '); Daftra may have ignored its filters; reconciliation blocked');
+    const date = normalizeDaftraDate(inv.date);                 // strict: ISO or DD/MM/YYYY, anything else is rejected (never guessed)
+    if (!id || party !== String(clientId) || date === null || date < from || date > to)
+      throw Error('Invoice list scope mismatch: unexpected/missing invoice id, client_id or valid date (invoice ' + String(inv.id ?? 'unknown') + '); Daftra may have ignored its filters; reconciliation blocked');
   }
   if (invoicesPage.records.length > MAX_INVOICES) throw Error('Too many invoices (' + invoicesPage.records.length + ' > ' + MAX_INVOICES + '); narrow the period');
   // No status filter and no date filter on the payments list: cancelled/failed payments and payments dated after the period must stay visible.
@@ -270,8 +294,10 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
         const payload = await getRecord('invoices', id, env, fetcher);
         const header = payload?.data?.Invoice;
         if (!header || typeof header !== 'object' || String(header.id) !== id) throw Error('detail has no Invoice with id ' + id);
-        if (idOf(header.client_id) !== String(clientId) || str(header.date)?.slice(0, 10) !== str(inv.date)?.slice(0, 10))
-          throw Error('detail scope mismatch for invoice ' + id + ': client/date differs from the list');
+        const listDate = normalizeDaftraDate(inv.date); const detailDate = normalizeDaftraDate(header.date);
+        if (detailDate === null) throw Error('detail date is missing or not a valid ISO / DD/MM/YYYY date for invoice ' + id);
+        if (idOf(header.client_id) !== String(clientId)) throw Error('detail scope mismatch for invoice ' + id + ': client differs from the request');
+        if (detailDate !== listDate) throw Error('detail scope mismatch for invoice ' + id + ': date ' + detailDate + ' differs from list date ' + listDate);
         details.set(id, { payload, header });
       } catch (e) { details.set(id, { error: String(e.message).slice(0, 120) }); }
     }));
@@ -279,7 +305,7 @@ export async function reconcileClientPayments({ clientId, from, to }, env, fetch
 
   // First pass without single GETs, to decide which payments need an independent confirmation.
   const first = reconcile({ clientId, from, to, invoices: invoicesPage.records, listPayments: paymentsPage.records, details, listComplete });
-  const need = first.payments.filter((p) => p.reasons.some((r) => r === 'single_source_unverified' || r.startsWith('conflict') || r === 'status_missing' || r === 'amount_missing' || r === 'invoice_id_missing')).map((p) => p.id);
+  const need = first.payments.filter((p) => p.reasons.some((r) => r === 'single_source_unverified' || r.startsWith('field_single_source') || r.startsWith('conflict') || r === 'status_missing' || r === 'amount_missing' || r === 'invoice_id_missing')).map((p) => p.id);
   const individual = new Map();
   const todo = need.slice(0, MAX_INDIVIDUAL_GETS);
   for (const id of need.slice(MAX_INDIVIDUAL_GETS)) individual.set(id, { error: 'verification limit reached' });

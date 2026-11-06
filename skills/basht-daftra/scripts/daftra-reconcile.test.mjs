@@ -1,7 +1,8 @@
 // Invoice <-> payment reconciliation. All data is SYNTHETIC; the fetcher is GET-only and records every call.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcileClientPayments, reconcile, normalizePayment } from './daftra-reconcile.mjs';
+import { reconcileClientPayments, reconcile, normalizePayment, embeddedPayments } from './daftra-reconcile.mjs';
+import { normalizeDaftraDate } from './daftra-entities.mjs';
 import { run } from './daftra-cli.mjs';
 
 const env = { DAFTRA_BASE_URL: 'https://nepras.daftra.com', DAFTRA_API_KEY: 'dummy' };
@@ -12,7 +13,7 @@ const inv = (id, total, paid, extra = {}) => ({ id, no: String(id), date: '2026-
 const pay = (id, invoice_id, amount, extra = {}) => ({ id, invoice_id, amount, status: 1, payment_method: 'bank_transfer', date: '2026-10-20', client_id: 48, ...extra });
 
 // world({ invoices, list, embedded: {invoiceId: [payments] | undefined}, singles: {paymentId: record | number(HTTP status)}, ... })
-function world({ invoices, list = [], embedded = {}, singles = {}, detailHeader = {}, detailFail = {}, listFail = null, listTotalOverride = null, invoiceListFail = null, pageSize }) {
+function world({ invoices, list = [], embedded = {}, embeddedAt = {}, singles = {}, detailHeader = {}, detailFail = {}, listFail = null, listTotalOverride = null, invoiceListFail = null, pageSize }) {
   const calls = [];
   const page = (rows, model, url, total = rows.length) => {
     const limit = Number(url.searchParams.get('limit') || 100); const p = Number(url.searchParams.get('page') || 1);
@@ -34,6 +35,8 @@ function world({ invoices, list = [], embedded = {}, singles = {}, detailHeader 
       if (!row) return new Response('{}', { status: 404 });
       const data = { Invoice: { ...row, ...(detailHeader[id] ?? {}) }, InvoiceItem: [] };
       if (embedded[id] !== undefined) data.Payment = embedded[id];
+      if (embeddedAt.InvoicePayment?.[id] !== undefined) data.InvoicePayment = embeddedAt.InvoicePayment[id];
+      if (embeddedAt['Invoice.InvoicePayment']?.[id] !== undefined) data.Invoice.InvoicePayment = embeddedAt['Invoice.InvoicePayment'][id];
       return new Response(JSON.stringify({ code: 200, data }), { status: 200 });
     }
     if ((m = url.pathname.match(/^\/api2\/invoice_payments\/(\d+)\.json$/))) {
@@ -304,4 +307,154 @@ test('matching client and dates at period boundaries remain eligible', async () 
   const r = await R(world({ invoices, embedded: { 120: [], 121: [] } }));
   assert.deepEqual(r.state_counts, { matched: 2, mismatch: 0, unresolved: 0 });
   assert.equal(r.accounting_coverage, 'complete');
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Evidence-driven fixes (client 48 live test): date formats, payment locations, identity-based merging, scope.
+
+test('normalizeDaftraDate: strict ISO and DD/MM/YYYY only; everything else is rejected, never guessed', () => {
+  assert.equal(normalizeDaftraDate('2026-10-05'), '2026-10-05');
+  assert.equal(normalizeDaftraDate('05/10/2026'), '2026-10-05');
+  assert.equal(normalizeDaftraDate('2026-10-05 13:20:00'), '2026-10-05');
+  assert.equal(normalizeDaftraDate('05/10/2026 13:20'), '2026-10-05');
+  assert.equal(normalizeDaftraDate(' 2026-10-05 '), '2026-10-05');
+  for (const bad of ['5/10/2026', '10/05/26', '31/02/2026', '29/02/2026', '2026-13-01', '2026-02-30', '', '   ', '05-10-2026', '2026/10/05', '05.10.2026', null, undefined, 20261005, {}, 'tomorrow'])
+    assert.equal(normalizeDaftraDate(bad), null, JSON.stringify(bad));
+  assert.equal(normalizeDaftraDate('29/02/2028'), '2028-02-29');
+});
+
+test('DATES: list ISO vs detail DD/MM/YYYY (and the reverse) are the same day; the report shows ISO', async () => {
+  const p = pay(10001, 100, '50.00');
+  for (const [listDate, detailDate] of [['2026-10-05', '05/10/2026'], ['05/10/2026', '2026-10-05'], ['05/10/2026', '05/10/2026'], ['2026-10-05', '2026-10-05 08:00:00']]) {
+    const r = await R(world({ invoices: [inv(100, '50.00', '50.00', { date: listDate })], list: [p], embedded: { 100: [p] }, detailHeader: { 100: { date: detailDate } } }));
+    assert.equal(one(r, 100).state, 'matched', listDate + ' / ' + detailDate); assert.equal(one(r, 100).date, '2026-10-05');
+  }
+});
+
+test('DATES: a different day, an MM/DD reading, or an invalid date in the detail is NOT guessed: invoice unresolved', async () => {
+  const p = pay(10002, 101, '50.00');
+  for (const [detailDate, rx] of [['10/05/2026', /differs from list date 2026-05-10|differs from list date/], ['06/10/2026', /differs from list date/], ['31/02/2026', /not a valid/], ['5/10/2026', /not a valid/], ['', /not a valid/], [undefined, /not a valid/]]) {
+    const r = await R(world({ invoices: [inv(101, '50.00', '50.00', { date: '2026-10-05' }), inv(102, '10.00', '0.00', { date: '2026-10-06' })], list: [p], embedded: { 101: [p], 102: [] }, detailHeader: { 101: { date: detailDate } } }));
+    assert.equal(one(r, 101).state, 'unresolved', String(detailDate)); assert.match(one(r, 101).reasons.join(' '), rx, String(detailDate));
+    assert.equal(r.totals.proven_paid, '0.00', String(detailDate));            // its payment is not counted either
+    assert.equal(one(r, 102).state, 'matched');                                // other invoices are unaffected
+  }
+});
+
+test('SCOPE: list rows outside the requested client/date range, or with an unparseable date, abort the whole reconciliation', async () => {
+  const p = pay(10003, 110, '5.00');
+  for (const bad of [inv(110, '5.00', '5.00', { date: '2026-09-30' }), inv(110, '5.00', '5.00', { date: '2026-11-07' }), inv(110, '5.00', '5.00', { client_id: 49 }),
+    inv(110, '5.00', '5.00', { client_id: null }), inv(110, '5.00', '5.00', { date: '13/13/2026' }), inv(110, '5.00', '5.00', { date: '' }), inv(110, '5.00', '5.00', { id: 'abc' })])
+    await assert.rejects(R(world({ invoices: [bad], list: [p], embedded: { 110: [p] } })), /scope mismatch/, JSON.stringify(bad));
+  // boundary dates are in scope, in either format
+  for (const date of ['2026-10-01', '01/10/2026', '2026-11-06', '06/11/2026']) {
+    const r = await R(world({ invoices: [inv(110, '5.00', '5.00', { date })], list: [p], embedded: { 110: [p] }, detailHeader: { 110: { date } } }));
+    assert.equal(one(r, 110).state, 'matched', date);
+  }
+});
+
+test('SCOPE: a detail whose client or date differs from the request/list makes that invoice unresolved', async () => {
+  const a = pay(10004, 120, '5.00'); const b = pay(10005, 121, '6.00');
+  const r = await R(world({ invoices: [inv(120, '5.00', '5.00'), inv(121, '6.00', '6.00')], list: [a, b], embedded: { 120: [a], 121: [b] }, detailHeader: { 120: { client_id: 99 } } }));
+  assert.equal(one(r, 120).state, 'unresolved'); assert.match(one(r, 120).reasons.join(' '), /client differs from the request/);
+  assert.equal(one(r, 121).state, 'matched');
+});
+
+test('PAYMENT LOCATIONS: data.Payment, data.InvoicePayment and data.Invoice.InvoicePayment are each read, with the path reported', async () => {
+  const cases = [
+    ['data.Payment', (id, p) => ({ embedded: { [id]: [p] } })],
+    ['data.InvoicePayment', (id, p) => ({ embeddedAt: { InvoicePayment: { [id]: [p] } } })],
+    ['data.Invoice.InvoicePayment', (id, p) => ({ embeddedAt: { 'Invoice.InvoicePayment': { [id]: [p] } } })],
+  ];
+  let n = 0;
+  for (const [path, place] of cases) {
+    const id = 130 + n; const p = pay(10100 + n++, id, '70.00');
+    // wrapped elements ({ InvoicePayment: {...} }) are accepted as well
+    const r = await R(world({ invoices: [inv(id, '70.00', '70.00')], list: [p], ...place(id, { InvoicePayment: p }) }));
+    assert.equal(one(r, id).state, 'matched', path); assert.deepEqual(one(r, id).payments_paths, [path], path);
+    assert.deepEqual(payment(r, p.id).sources, ['list', 'detail'], path);
+  }
+  assert.deepEqual(embeddedPayments({ data: {} }), { present: false, rows: [], paths: [] });
+  assert.equal(embeddedPayments({ data: { Invoice: { InvoicePayment: 'x' }, Payment: {} } }).present, false);     // not arrays => not a payments section
+});
+
+test('PAYMENT LOCATIONS: no recognised section is UNRESOLVED with a clear reason, even when Daftra says nothing is owed or nothing was paid', async () => {
+  const p = pay(10200, 140, '30.00');
+  let r = await R(world({ invoices: [inv(140, '30.00', '30.00')], list: [p], embedded: {} }));
+  assert.equal(one(r, 140).state, 'unresolved'); assert.match(one(r, 140).reasons.join(' '), /payments_section_not_found_in_detail \(checked data\.Payment, data\.InvoicePayment, data\.Invoice\.InvoicePayment\)/);
+  r = await R(world({ invoices: [inv(141, '30.00', '0.00')], list: [], embedded: {} }));                         // nothing paid, but nothing proves it either
+  assert.equal(one(r, 141).state, 'unresolved'); assert.equal(r.accounting_coverage, 'unresolved');
+});
+
+test('PAYMENT LOCATIONS: a payment only in data.Invoice.InvoicePayment is confirmed by the single GET and flagged as missing from the list', async () => {
+  const p = pay(10300, 150, '90.00', { payment_method: 'client_credit' });
+  const w = world({ invoices: [inv(150, '90.00', '90.00')], list: [], embeddedAt: { 'Invoice.InvoicePayment': { 150: [p] } }, singles: { 10300: p } });
+  const r = await R(w);
+  assert.deepEqual(singleGets(w), ['10300']); assert.equal(one(r, 150).state, 'matched'); assert.deepEqual(one(r, 150).missing_from_list, ['10300']);
+  assert.equal(one(r, 150).credit_source_unverified, true); assert.deepEqual(payment(r, 10300).sources.sort(), ['detail', 'individual']);
+});
+
+test('NO DOUBLE COUNT: the same payment id in the list, in data.Payment and in data.Invoice.InvoicePayment is counted exactly once', async () => {
+  const p = pay(10400, 160, '100.00');
+  const r = await R(world({ invoices: [inv(160, '100.00', '100.00')], list: [p], embedded: { 160: [p] }, embeddedAt: { 'Invoice.InvoicePayment': { 160: [p] } } }));
+  assert.equal(r.totals.proven_paid, '100.00'); assert.equal(one(r, 160).state, 'matched'); assert.deepEqual(one(r, 160).payments, ['10400']);
+  assert.equal(r.payments.length, 1); assert.deepEqual(payment(r, 10400).sources, ['list', 'detail']);
+  // if summary_paid were the DOUBLE amount, a sum-based match would accept it; identity-based matching must not
+  const d = await R(world({ invoices: [inv(161, '200.00', '200.00')], list: [pay(10401, 161, '100.00')], embedded: { 161: [pay(10401, 161, '100.00')] } }));
+  assert.equal(one(d, 161).state, 'mismatch'); assert.equal(one(d, 161).proven_paid, '100.00');
+});
+
+test('IDENTITY, NOT TOTALS: two different payment ids are two payments; a payment without an id is never matched by its amount', async () => {
+  // list says id 1 (100), detail says id 2 (100): equal amounts, different identities => 200 proven vs 100 paid => mismatch
+  const a = pay(10501, 170, '100.00'); const b = pay(10502, 170, '100.00');
+  const w = world({ invoices: [inv(170, '100.00', '100.00')], list: [a], embedded: { 170: [b] }, singles: { 10501: a, 10502: b } });
+  const r = await R(w);
+  assert.equal(one(r, 170).state, 'mismatch'); assert.equal(one(r, 170).proven_paid, '200.00'); assert.deepEqual(one(r, 170).payments.sort(), ['10501', '10502']);
+  // a detail payment with the right amount but no id cannot stand in for the missing listed one
+  const noId = { invoice_id: 171, amount: '100.00', status: 1, payment_method: 'cash' };
+  const q = await R(world({ invoices: [inv(171, '100.00', '100.00')], list: [], embedded: { 171: [noId] } }));
+  assert.equal(one(q, 171).state, 'unresolved'); assert.equal(q.totals.proven_paid, '0.00'); assert.equal(q.unidentified_payments.length, 1);
+});
+
+test('INCOMPLETE PAYMENT DATA: amount, status or invoice link supplied by only one source needs the single GET; without it the payment is unresolved', async () => {
+  const full = pay(10600, 180, '40.00');
+  const stripped = (field) => { const c = { ...full }; delete c[field]; return c; };
+  for (const field of ['amount', 'status', 'invoice_id']) {
+    // list lacks the field, detail has it: one source only => confirmed by the single GET => matched
+    let w = world({ invoices: [inv(180, '40.00', '40.00')], list: [stripped(field)], embedded: { 180: [full] }, singles: { 10600: full } });
+    let r = await R(w);
+    assert.deepEqual(singleGets(w), ['10600'], field); assert.equal(one(r, 180).state, 'matched', field);
+    // ... and if the single GET is unavailable the money is NOT counted
+    w = world({ invoices: [inv(180, '40.00', '40.00')], list: [stripped(field)], embedded: { 180: [full] }, singles: { 10600: 500 } });
+    r = await R(w);
+    assert.equal(one(r, 180).state, 'unresolved', field); assert.equal(r.totals.proven_paid, '0.00', field); assert.match(payment(r, 10600).reasons.join(' '), /individual_get_failed/, field);
+  }
+  // amount missing everywhere / unparseable
+  let r = await R(world({ invoices: [inv(181, '40.00', '40.00')], list: [{ ...stripped('amount'), invoice_id: 181, id: 10601 }], embedded: { 181: [{ ...stripped('amount'), invoice_id: 181, id: 10601 }] }, singles: { 10601: { ...stripped('amount'), invoice_id: 181, id: 10601 } } }));
+  assert.equal(one(r, 181).state, 'unresolved'); assert.match(payment(r, 10601).reasons.join(' '), /amount_missing/);
+  r = await R(world({ invoices: [inv(182, '40.00', '40.00')], list: [pay(10602, 182, 'abc')], embedded: { 182: [pay(10602, 182, 'abc')] } }));
+  assert.equal(one(r, 182).state, 'unresolved'); assert.match(payment(r, 10602).reasons.join(' '), /amount_invalid/);
+  // an unparseable payment date is rejected, not ignored
+  r = await R(world({ invoices: [inv(183, '40.00', '40.00')], list: [pay(10603, 183, '40.00', { date: '31/02/2026' })], embedded: { 183: [pay(10603, 183, '40.00', { date: '31/02/2026' })] } }));
+  assert.equal(one(r, 183).state, 'unresolved'); assert.match(payment(r, 10603).reasons.join(' '), /date_invalid/);
+  // payment dates in either format are accepted
+  r = await R(world({ invoices: [inv(184, '40.00', '40.00')], list: [pay(10604, 184, '40.00', { date: '2026-10-20' })], embedded: { 184: [pay(10604, 184, '40.00', { date: '20/10/2026' })] } }));
+  assert.equal(one(r, 184).state, 'matched'); assert.equal(payment(r, 10604).date, '2026-10-20');
+});
+
+test('REAL DIFFERENCE: Daftra says paid/unpaid 0 but there is no payment evidence => NOT matched; partial evidence => mismatch with the gap', async () => {
+  let r = await R(world({ invoices: [inv(190, '100.00', '100.00')], list: [], embedded: { 190: [] } }));
+  assert.equal(one(r, 190).state, 'mismatch'); assert.equal(one(r, 190).summary_unpaid, '0.00'); assert.equal(one(r, 190).evidence, null);
+  assert.equal(r.accounting_coverage, 'unresolved'); assert.equal(r.totals.gap_summary_paid_minus_proven, '100.00');
+  const p = pay(10700, 191, '60.00');
+  r = await R(world({ invoices: [inv(191, '100.00', '100.00')], list: [p], embedded: { 191: [p] } }));
+  assert.equal(one(r, 191).state, 'mismatch'); assert.match(one(r, 191).reasons.join(' '), /proven payments 60\.00 != summary_paid 100\.00/);
+  assert.equal(r.totals.gap_summary_paid_minus_proven, '40.00');
+  // a genuinely unpaid invoice is matched only on positive evidence: the section is there, empty, and the list has nothing for it
+  r = await R(world({ invoices: [inv(192, '100.00', '0.00')], list: [], embedded: { 192: [] } }));
+  assert.equal(one(r, 192).state, 'matched'); assert.equal(one(r, 192).evidence, 'no_payments_claimed_and_none_found');
+  // matched invoices expose their evidence
+  const q = pay(10701, 193, '10.00', { payment_method: 'client_credit' });
+  r = await R(world({ invoices: [inv(193, '10.00', '10.00')], list: [q], embedded: { 193: [q] } }));
+  assert.equal(one(r, 193).evidence, 'payments_verified_by_id'); assert.equal(one(r, 193).credit_source_unverified, true);
 });
