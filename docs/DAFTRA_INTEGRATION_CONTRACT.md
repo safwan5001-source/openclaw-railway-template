@@ -36,7 +36,7 @@ Tenant is pinned to `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` root); redirects are
 | Official reports (ledger, trial balance, income statement, balance sheet, tax, revenue, payments, expenses, cash flow, chart of accounts, …) | `report <name>`; `financial_transactions` auto-walks pages | ✔ | ✘ | none |
 | Client statement | `statement` (local, reconciles against per-invoice `summary_unpaid`, `official:false`) | ✔ | ✘ | none |
 | Supplier statement | **Not implemented**: purchase-invoice list exposes no totals/payments; use the `ledger` report with `journal_account_id` | — | — | — |
-| Official invoice PDF | `pdf <invoice-id> <file>` | ✔ | ✘ | none |
+| Official invoice PDF (redirect-safe; drafts attempted) | `pdf <invoice-id>` → one-file `download_path` (gateway, existing setup login) | ✔ (fake) | ✘ | none |
 | Exports PDF/XLSX/CSV/DOCX/JSON | `export`, `export-report`, `export-statement` | ✔ (opened with openpyxl / python-docx / LibreOffice / Chromium) | n/a | none |
 | Create sales invoice · estimate · purchase invoice · expense · invoice payment · client payment | `propose` → `execute` (draft by default; payments are final) | ✔ (fake) | ✘ | **explicit, per operation** |
 | **Duplicate** sales invoice / purchase invoice / estimate into a new draft | `duplicate <source> <id>` → proposal with original-vs-proposed diff | ✔ (fake) | ✘ | **explicit, per operation** |

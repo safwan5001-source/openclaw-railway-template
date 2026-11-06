@@ -4,18 +4,19 @@
 //
 //   READ    capabilities | list <entity> | get <entity> <id> | report <name> | statement <client-id> | reconcile-payments <client-id>
 //           access-report [entity|report|entity:<name>|report:<name>]   (one minimal GET per endpoint, classified; read-only)
-//   FILES   pdf <invoice-id> <file.pdf> | export <entity> | export-report <name> | export-statement <client-id>
+//   FILES   pdf <invoice-id> [file.pdf] | export <entity> | export-report <name> | export-statement <client-id>
 //   WRITE   propose <type> | duplicate <source> <id> | show <proposal-id> | execute <proposal-id> | resolve <proposal-id>
 //           (propose/show are read-only; execute needs DAFTRA_WRITES_ENABLED=1 AND the exact approval phrase)
 import { readFile } from 'node:fs/promises';
-import { basename, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { basename, join, resolve } from 'node:path';
 import { ENTITIES, REPORTS, UNSUPPORTED_READS } from './daftra-entities.mjs';
 import { listPage, fetchAllRecords, getOneDetailed, getReport, isPartialReport, downloadInvoicePdf, DaftraError } from './daftra-readonly.mjs';
 import { accessReport } from './daftra-access-report.mjs';
 import { redactRecord, pickColumns } from './daftra-normalize.mjs';
 import { exportDaftraRecords, exportReport } from './daftra-export.mjs';
 import { exportData, FORMATS } from './daftra-exports.mjs';
-import { safeOutputPath, ensureExportsDir } from './daftra-paths.mjs';
+import { safeOutputPath, ensureExportsDir, exportsDir } from './daftra-paths.mjs';
 import { clientStatement } from './daftra-statements.mjs';
 import { reconcileClientPayments } from './daftra-reconcile.mjs';
 import { ACTION_TYPES } from './daftra-finance-preflight.mjs';
@@ -200,14 +201,16 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
       return { ok: true, ...(await reconcileClientPayments({ clientId: a1, from: flags.from, to: flags.to }, env, fetcher, { sleep })) };
     }
     case 'pdf': {
-      if (!a1 || !a2) throw Error('Usage: pdf <invoice-id> <file.pdf>');
+      // `pdf <invoice-id>` saves invoice-<id>-<random>.pdf in the private exports dir and returns the login-protected `download_path`.
+      // An explicit <file.pdf> still works for local use, but then no download path is issued.
+      if (!a1 || !/^[0-9]{1,15}$/.test(String(a1))) throw Error('Usage: pdf <invoice-id> [file.pdf]');
       await ensureExportsDir(env);
-      const outPath = safeOutputPath(a2, 'pdf', env);
+      const token = a2 ? null : randomBytes(16).toString('hex');
+      const outPath = safeOutputPath(a2 ?? join(exportsDir(env), 'invoice-' + a1 + '-' + token + '.pdf'), 'pdf', env);
       const got = serviceReadTarget
         ? await downloadInvoicePdfViaBroker({ id: a1, outPath, ...serviceReadTarget })
         : await downloadInvoicePdf(a1, outPath, env, fetcher);
-      // `download_path` is a path on the authenticated gateway (/setup/exports/<name>.pdf, setup password): never a Daftra link.
-      return { ok: true, ...got, official: true, download_path: '/setup/exports/' + basename(outPath) };
+      return { ok: true, ...got, official: true, ...(token ? { download_path: '/setup/exports/' + basename(outPath) } : {}) };
     }
     case 'export': {
       if (!a1 || !flags.format || !flags.out) throw Error('Usage: export <entity> --format csv|json|xlsx|docx|pdf --out <file> [--columns a,b] [--query k=v]...');

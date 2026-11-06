@@ -177,18 +177,21 @@ test('size and content guards still apply after a redirect (HTML, truncated, ove
 
 // ---------- CLI: official PDF end to end (fake Daftra, local files only) ---------------------------------------------------
 import { run } from './daftra-cli.mjs';
-test('CLI pdf: follows the 302, saves into the private exports dir, returns a gateway download path (never a Daftra link) and the draft flag', async () => {
+test('CLI pdf <id>: follows the 302, saves invoice-<id>-<random>.pdf in exports and returns only a gateway download path', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'basht-cli-pdf-'));
   const cliEnv = { OPENCLAW_WORKSPACE_DIR: dir, DAFTRA_BASE_URL: TENANT, DAFTRA_API_KEY: KEY };
-  const s = scripted([redirect('/invoices/download/97900.pdf'), pdfRes()], { draft: 1 });
   try {
-    const r = await run(['pdf', '97900', join(dir, 'exports', 'invoice-97900.pdf')], { env: cliEnv, fetcher: s.fetcher });
-    assert.deepEqual({ ok: r.ok, official: r.official, draft: r.draft, redirects: r.redirects, source: r.source, download_path: r.download_path },
-      { ok: true, official: true, draft: true, redirects: 1, source: 'daftra_official', download_path: '/setup/exports/invoice-97900.pdf' });
-    assert.equal(r.path, join(dir, 'exports', 'invoice-97900.pdf'));
-    assert.equal(JSON.stringify(r).includes(HASH), false);
-    assert.equal(JSON.stringify(r).includes(KEY), false);
+    const r = await run(['pdf', '97900'], { env: cliEnv, fetcher: scripted([redirect('/invoices/download/97900.pdf'), pdfRes()], { draft: 1 }).fetcher });
+    assert.deepEqual({ ok: r.ok, official: r.official, draft: r.draft, redirects: r.redirects }, { ok: true, official: true, draft: true, redirects: 1 });
+    assert.match(r.download_path, /^\/setup\/exports\/invoice-97900-[0-9a-f]{32}\.pdf$/);
+    assert.equal(r.path, join(dir, 'exports', r.download_path.split('/').pop()));
     assert.equal((await readFile(r.path)).equals(PDF), true);
-    await assert.rejects(run(['pdf', '97900', join(dir, 'escape.pdf')], { env: cliEnv, fetcher: s.fetcher }), /private exports directory/);
+    assert.equal(JSON.stringify(r).includes(HASH) || JSON.stringify(r).includes(KEY), false);
+    const second = await run(['pdf', '97900'], { env: cliEnv, fetcher: scripted([pdfRes()]).fetcher });
+    assert.notEqual(second.download_path, r.download_path);                                    // every download link is unique
+    const named = await run(['pdf', '97900', join(dir, 'exports', 'mine.pdf')], { env: cliEnv, fetcher: scripted([pdfRes()]).fetcher });
+    assert.equal(named.download_path, undefined);                                              // an explicit file name gets no download link
+    await assert.rejects(run(['pdf', '97900', join(dir, 'escape.pdf')], { env: cliEnv, fetcher: scripted([pdfRes()]).fetcher }), /private exports directory/);
+    await assert.rejects(run(['pdf', '../x'], { env: cliEnv, fetcher: scripted([]).fetcher }), /Usage/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
