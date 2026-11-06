@@ -12,6 +12,9 @@ const PROPOSAL_ID = /^prop_[0-9a-f]{16}$/;
 const HASH = /^[0-9a-f]{64}$/;
 // States after which the same request hash must NOT be sent again without a human decision.
 const BLOCKING_STATES = new Set(['submitting', 'submitted', 'ambiguous', 'resolved_created']);
+// A PUT that sets fields to given values is idempotent: once finished it must not block a later, deliberate repeat
+// (e.g. a price changed back and forth). It stays blocked while in flight or unresolved.
+const IN_FLIGHT_STATES = new Set(['submitting', 'ambiguous']);
 
 export class LedgerTampered extends Error {
   constructor(message) { super(message); this.name = 'LedgerTampered'; this.code = 'LEDGER_TAMPERED'; }
@@ -126,9 +129,10 @@ export function stateForHash(entries, requestHash) {
   const states = entries.filter((e) => e.request_hash === requestHash && e.state).map((e) => e.state);
   return states.length ? states[states.length - 1] : null;
 }
-export function isBlockedByLedger(entries, requestHash) {
+export function isBlockedByLedger(entries, requestHash, { idempotent = false } = {}) {
   const state = stateForHash(entries, requestHash);
-  return state !== null && BLOCKING_STATES.has(state) ? state : null;
+  const set = idempotent ? IN_FLIGHT_STATES : BLOCKING_STATES;
+  return state !== null && set.has(state) ? state : null;
 }
 export function proposalWasUsed(entries, proposalId) {
   return entries.some((e) => e.proposal_id === proposalId && e.state === 'submitting');

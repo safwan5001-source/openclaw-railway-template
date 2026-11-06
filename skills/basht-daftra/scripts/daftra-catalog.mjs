@@ -22,6 +22,9 @@ export const PRODUCT_FIELDS = Object.freeze(['name', 'type', 'product_code', 'ba
   'availabe_online', 'duration_minutes']);                       // `availabe_online` is spelled that way in the API
 export const CATEGORY_FIELDS = Object.freeze(['name', 'category_type', 'parent_id', 'description', 'display_order']);
 const PRICE_FIELDS = ['unit_price', 'buy_price', 'minimum_price', 'discount', 'profit_margin'];
+// Not literally prices but they change what a customer pays: highlighted together with prices.
+const PRICE_IMPACT_FIELDS = [...PRICE_FIELDS, 'discount_type', 'tax1', 'tax2'];
+const NUMERIC_COMPARE = new Set([...PRICE_FIELDS, 'duration_minutes']);   // everything else is compared as TEXT ("5.0" != "5")
 const UNSUPPORTED = new Set(['track_stock', 'tracking_type', 'initial_stock_level', 'store_id', 'low_stock_thershold', 'low_stock_threshold',
   'brand', 'category', 'ProductBundle', 'bundle', 'stock', 'stock_balance', 'id', 'created', 'modified', 'staff_id', 'branch_id']);
 
@@ -92,10 +95,10 @@ const num = (v) => { try { return parseDecimal(String(v), 'n', { maxDecimals: 6 
 function priceChanges(changes) {
   const out = [];
   for (const c of changes) {
-    if (!PRICE_FIELDS.includes(c.field)) continue;
+    if (!PRICE_IMPACT_FIELDS.includes(c.field)) continue;
     const from = num(c.from); const to = num(c.to);
     let pct = null;
-    if (from !== null && to !== null && from > ZERO) pct = Math.round(Number(to - from) / Number(from) * 10000) / 100;   // display only
+    if (PRICE_FIELDS.includes(c.field) && from !== null && to !== null && from > ZERO) pct = Math.round(Number(to - from) / Number(from) * 10000) / 100;   // display only
     out.push({ field: c.field, from: c.from ?? null, to: c.to, change_percent: pct });
   }
   return out;
@@ -125,16 +128,21 @@ export function prepareCatalogAction(type, input, options = {}) {
     if (!input.changes || typeof input.changes !== 'object' || Array.isArray(input.changes)) throw Error('changes must be an object of fields to modify');
     const fields = Object.keys(input.changes).filter((k) => input.changes[k] !== undefined);
     if (!fields.length) throw Error('changes is empty');
-    checkFieldNames(fields, PRODUCT_FIELDS, 'product');
+    checkFieldNames(fields, PRODUCT_FIELDS.filter((f) => f !== 'type'), 'product');   // changing product<->service<->bundle alters stock semantics: not supported
     const product = {};
     for (const f of fields) product[f] = productValue(f, input.changes[f], ctx);
     crossChecks(product, ctx, warnings);
     const current = options.current;
+    if (current) {
+      // validate the MERGED record: e.g. discount_type 1 alone must not turn a stored absolute 500 into 500%
+      const dt = product.discount_type ?? current.discount_type; const dv = product.discount ?? current.discount;
+      if (Number(dt) === 1 && num(dv) !== null && num(dv) > 100n * ONE) throw Error('Resulting percentage discount would exceed 100 (stored discount ' + dv + ')');
+    }
     if (current && typeof current === 'object') {
       for (const f of Object.keys(product)) {
         const cur = current[f];
         const same = Array.isArray(product[f]) ? false
-          : (num(cur) !== null && num(product[f]) !== null ? num(cur) === num(product[f]) : String(cur ?? '') === String(product[f]));
+          : (NUMERIC_COMPARE.has(f) && num(cur) !== null && num(product[f]) !== null ? num(cur) === num(product[f]) : cur !== undefined && cur !== null && String(cur) === String(product[f]));
         if (same) delete product[f];
         else changes.push({ field: f, from: cur === undefined ? '(not returned by Daftra)' : cur, to: product[f] });
       }

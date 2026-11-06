@@ -13,6 +13,8 @@ import { createProposal } from './daftra-proposal.mjs';
 import { isCalendarDate } from './daftra-entities.mjs';
 import { redactRecord } from './daftra-normalize.mjs';
 import { listPage } from './daftra-readonly.mjs';
+import { prepareFinancialAction } from './daftra-finance-preflight.mjs';
+import { parseDecimal } from './daftra-money.mjs';
 
 export const DUP_SOURCES = Object.freeze({
   invoices:          { type: 'sales_invoice',    header: 'Invoice',       items: 'InvoiceItem',       party: 'client_id' },
@@ -24,7 +26,9 @@ const LINE_KEYS = ['item', 'description', 'quantity', 'unit_price', 'tax1', 'tax
 const NEVER_COPIED = ['id', 'no', 'payments', 'payment_status', 'summary_paid', 'summary_unpaid', 'summary_deposit', 'summary_refund', 'created', 'modified',
   'invoice_pdf_url', 'invoice_html_url', 'qr_code_url', 'password', 'estimate_id', 'source_type', 'source_id', 'subscription_id', 'work_order_id',
   'pos_shift_id', 'staff_id', 'is_received', 'received_date'];
-const TOTAL_AFFECTING = ['discount', 'discount_amount', 'shipping_amount', 'deposit'];
+// Header-level amounts that change a document total and cannot be reproduced by a copy.
+const TOTAL_AFFECTING = ['discount', 'discount_amount', 'summary_discount', 'shipping_amount', 'deposit', 'summary_deposit', 'summary_refund', 'adjustment', 'adjustment_value', 'adjustments'];
+const ALLOWED_SOURCE_TYPES = { invoices: [0], estimates: [3] };   // Daftra type ids: 0 invoice, 3 estimate (credit notes, debit notes, subscriptions are refused)
 const OVERRIDE_KEYS = new Set(['date', 'client_id', 'supplier_id', 'currency_code', 'notes', 'finalize', 'line_overrides', 'remove_lines', 'add_lines',
   'accept_total_difference', 'acknowledge_duplicates']);
 
@@ -54,6 +58,7 @@ function mapPurchaseTax(value, taxes, label) {
   if (!hasValue(value)) return 0;
   const hits = taxes.filter((t) => Number(t.is_active) !== 0 && Number(t.value) === Number(value));
   if (hits.length !== 1) throw Error(label + ': source tax value ' + value + ' matches ' + hits.length + ' active taxes; choose the tax id with line_overrides');
+  if (Number(hits[0].included) === 1) throw Error(label + ': source tax value ' + value + ' matches only a tax-INCLUSIVE tax, which would change the total; choose the tax id with line_overrides');
   return Number(hits[0].id);
 }
 
@@ -66,6 +71,8 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
   const payload = await getRecord(source, id, env, fetcher);
   const { header, items } = locate(payload, spec);
   if (items.length > 100) throw Error('Source has more than 100 lines');
+  const srcType = header.type === undefined || header.type === null || header.type === '' ? undefined : Number(header.type);
+  if (ALLOWED_SOURCE_TYPES[source] && srcType !== undefined && !ALLOWED_SOURCE_TYPES[source].includes(srcType)) throw Error('Source document type ' + srcType + ' is not a standard ' + source.replace(/s$/, '').replace('_', ' ') + ' and cannot be duplicated');
   const taxes = (await listPage('taxes', {}, env, fetcher));
   if (!taxes.complete) throw Error('Tax table could not be proven complete');
   const taxRows = taxes.records;
@@ -95,12 +102,17 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
   items.forEach((src, i) => {
     const n = i + 1; const label = 'line ' + n;
     const copy = { item: src.item ?? src.org_name, description: src.description || undefined, quantity: plain(src.quantity, label + ' quantity'), unit_price: plain(src.unit_price, label + ' unit_price'),
-      product_id: src.product_id ? String(src.product_id) : undefined };
-    if (source === 'purchase_invoices') { copy.tax1 = mapPurchaseTax(src.tax1, taxRows, label + ' tax1'); copy.tax2 = mapPurchaseTax(src.tax2, taxRows, label + ' tax2'); }
+      product_id: src.product_id && String(src.product_id) !== '0' ? String(src.product_id) : undefined };
+    if (source === 'purchase_invoices') {
+      copy.tax1 = mapPurchaseTax(src.tax1, taxRows, label + ' tax1'); copy.tax2 = mapPurchaseTax(src.tax2, taxRows, label + ' tax2');
+      if (copy.tax1 !== 0 && copy.tax1 === copy.tax2) throw Error(label + ': tax1 and tax2 map to the same tax id; choose the tax ids with line_overrides');
+      delete copy.description;                                  // purchase create lines carry no documented description field
+    }
     else { copy.tax1 = hasValue(src.tax1) ? Number(src.tax1) : 0; copy.tax2 = hasValue(src.tax2) ? Number(src.tax2) : 0; }
     if (hasValue(src.discount)) { copy.discount = plain(src.discount, label + ' discount'); copy.discount_type = Number(src.discount_type) === 2 ? 2 : 1; }
     if (!copy.item || copy.quantity === undefined || copy.unit_price === undefined) throw Error(label + ' is missing item/quantity/unit_price in the source');
     const original = JSON.parse(JSON.stringify(copy));
+    if (source === 'purchase_invoices' && lineOv[String(n)]?.description !== undefined) throw Error('line_overrides: description is not supported on purchase invoice lines');
     const proposed = { ...copy, ...(lineOv[String(n)] ?? {}) };
     for (const k of Object.keys(proposed)) if (proposed[k] === undefined) delete proposed[k];
     if (remove.has(n)) { lineDiff.push({ n, original, proposed: null, changed: ['(line removed)'] }); return; }
@@ -108,7 +120,7 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
     lineDiff.push({ n, original, proposed, changed: LINE_KEYS.filter((k) => String(original[k] ?? '') !== String(proposed[k] ?? '')) });
   });
   for (const add of overrides.add_lines ?? []) {
-    for (const k of Object.keys(add ?? {})) if (!LINE_KEYS.includes(k)) throw Error('add_lines: unsupported field ' + k);
+    for (const k of Object.keys(add ?? {})) if (!LINE_KEYS.includes(k) || (source === 'purchase_invoices' && k === 'description')) throw Error('add_lines: unsupported field ' + k);
     lines.push(add); lineDiff.push({ n: null, original: null, proposed: add, changed: ['(line added)'] });
   }
   if (!lines.length) throw Error('The new document would have no lines');
@@ -119,11 +131,26 @@ export async function buildDuplicate({ source, id, overrides = {} }, env, fetche
   for (const k of Object.keys(header)) if (/e.?invoice|zatca/i.test(k) && hasValue(header[k]) && !notCopied.includes(k)) notCopied.push(k);
   if (Array.isArray(payload?.data?.Payment) && payload.data.Payment.length) notCopied.push('payments');
   const totalAffecting = TOTAL_AFFECTING.filter((k) => hasValue(header[k]));
+  if (source === 'purchase_invoices' && lines.some((l) => l.discount !== undefined)) warnings.push('Purchase invoice line discounts are not documented for creation: Daftra may ignore them; compare the total');
+  if (header.draft && String(header.draft) !== '0') warnings.push('The source is itself a draft');
   if (totalAffecting.length && overrides.accept_total_difference !== true)
     blocking.push('Source has header-level ' + totalAffecting.join('/') + ' that a copy cannot reproduce; the new total would differ. Re-propose with accept_total_difference:true after reviewing');
   else if (totalAffecting.length) warnings.push('Source header-level ' + totalAffecting.join('/') + ' is NOT reproduced; total differs from the original (accepted by requester)');
   if (notCopied.length) warnings.push('Not copied (the new document gets its own identity/state): ' + notCopied.join(', '));
 
+  // The new total must equal the source total unless the requester changed lines/prices or accepted a difference.
+  try {
+    const dry = prepareFinancialAction(spec.type, input, { taxes: taxRows, requireDate: true });
+    const srcTotal = header.summary_total;
+    const edited = Object.keys(lineOv).length > 0 || remove.size > 0 || (overrides.add_lines ?? []).length > 0;
+    if (srcTotal !== undefined && srcTotal !== null && srcTotal !== '' && !totalAffecting.length) {
+      const a = parseDecimal(String(srcTotal), 'summary_total', { maxDecimals: 6 }); const b = parseDecimal(dry.totals.total, 'total', { maxDecimals: 6 });
+      if (a !== b) {
+        if (!edited && overrides.accept_total_difference !== true) blocking.push('The computed total of the copy (' + dry.totals.total + ') differs from the source total (' + srcTotal + ') although no line was changed (rounding, tax or discount semantics differ). Re-propose with accept_total_difference:true after reviewing');
+        else warnings.push('Total of the copy ' + dry.totals.total + ' vs source ' + srcTotal + (edited ? ' (lines were changed)' : ' (difference accepted by requester)'));
+      }
+    }
+  } catch (e) { throw e; }
   const headerDiff = [
     { field: partyKey, original: header[partyKey] ?? null, proposed: input[partyKey] },
     { field: 'date', original: header.date ?? null, proposed: input.date },

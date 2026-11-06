@@ -14,26 +14,33 @@ export function publicProposal(p) {
   };
 }
 
+// Everything printed to a human/terminal passes through here: control characters (ESC, CR, LF, C1 incl. CSI),
+// zero-width and bidi-override characters are shown as visible \uXXXX escapes so no value can forge or hide lines.
+export function safeText(value) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/gu,
+    (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
+}
+
 // Human-readable comparison shown by the operator tool and the agent preview.
 export function formatMeta(meta) {
   if (!meta) return [];
   const out = [];
-  const money = (v) => (v === null || v === undefined ? '-' : String(v));
+  const money = (v) => (v === null || v === undefined ? '-' : safeText(v));
   if (meta.duplicate_of) {
     const d = meta.diff;
-    out.push('DUPLICATE OF ' + meta.duplicate_of.entity + '#' + meta.duplicate_of.id + (d?.original?.number ? ' (no. ' + d.original.number + ')' : '') + ' -> a NEW document (own id/number from Daftra)');
-    for (const h of d?.header ?? []) out.push('  header ' + h.field + ': ' + money(h.original) + '  =>  ' + money(h.proposed));
+    out.push('DUPLICATE OF ' + safeText(meta.duplicate_of.entity) + '#' + safeText(meta.duplicate_of.id) + (d?.original?.number ? ' (no. ' + safeText(d.original.number) + ')' : '') + ' -> a NEW document (own id/number from Daftra)');
+    for (const h of d?.header ?? []) out.push('  header ' + safeText(h.field) + ': ' + money(h.original) + '  =>  ' + money(h.proposed));
     for (const l of d?.lines ?? []) {
-      if (l.proposed === null) out.push('  line ' + l.n + ': REMOVED (' + l.original.item + ')');
-      else if (l.n === null) out.push('  line +: ADDED ' + JSON.stringify(l.proposed));
-      else if (l.changed.length) out.push('  line ' + l.n + ' (' + l.original.item + '): ' + l.changed.map((k) => k + ' ' + money(l.original[k]) + ' => ' + money(l.proposed[k])).join('; '));
-      else out.push('  line ' + l.n + ' (' + l.original.item + '): unchanged');
+      if (l.proposed === null) out.push('  line ' + l.n + ': REMOVED (' + safeText(l.original.item) + ')');
+      else if (l.n === null) out.push('  line +: ADDED ' + safeText(JSON.stringify(l.proposed)));
+      else if (l.changed.length) out.push('  line ' + l.n + ' (' + safeText(l.original.item) + '): ' + l.changed.map((k) => safeText(k) + ' ' + money(l.original[k]) + ' => ' + money(l.proposed[k])).join('; '));
+      else out.push('  line ' + l.n + ' (' + safeText(l.original.item) + '): unchanged');
     }
-    if (d?.not_copied?.length) out.push('  NOT copied: ' + d.not_copied.join(', '));
+    if (d?.not_copied?.length) out.push('  NOT copied: ' + safeText(d.not_copied.join(', ')));
   }
-  for (const c of meta.changes ?? []) out.push('  change ' + c.field + ': ' + money(typeof c.from === 'object' ? JSON.stringify(c.from) : c.from) + '  =>  ' + (typeof c.to === 'object' ? JSON.stringify(c.to) : money(c.to)));
-  for (const h of meta.highlights ?? []) out.push('  *** KEY FIELD CHANGE ' + h.field + ': ' + money(h.from) + ' => ' + money(h.to) + ' ***');
-  if (meta.carried_fields?.length) out.push('  (full record is sent; unchanged fields carried over: ' + meta.carried_fields.join(', ') + ')');
-  for (const c of meta.price_changes ?? []) out.push('  *** PRICE CHANGE ' + c.field + ': ' + money(c.from) + ' => ' + c.to + (c.change_percent === null ? '' : ' (' + (c.change_percent > 0 ? '+' : '') + c.change_percent + '%)') + ' ***');
+  for (const c of meta.changes ?? []) out.push('  change ' + safeText(c.field) + ': ' + money(typeof c.from === 'object' && c.from !== null ? JSON.stringify(c.from) : c.from) + '  =>  ' + (typeof c.to === 'object' && c.to !== null ? safeText(JSON.stringify(c.to)) : money(c.to)));
+  for (const h of meta.highlights ?? []) out.push('  *** KEY FIELD CHANGE ' + safeText(h.field) + ': ' + money(h.from) + ' => ' + money(h.to) + ' ***');
+  if (meta.carried_fields?.length) out.push('  (full record is sent; unchanged fields carried over: ' + safeText(meta.carried_fields.join(', ')) + ')');
+  for (const c of meta.price_changes ?? []) out.push('  *** PRICE CHANGE ' + safeText(c.field) + ': ' + money(c.from) + ' => ' + money(c.to) + (c.change_percent === null ? '' : ' (' + (c.change_percent > 0 ? '+' : '') + c.change_percent + '%)') + ' ***');
   return out;
 }

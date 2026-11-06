@@ -253,6 +253,8 @@ export function assertBodyShape(type, body) {
   if (top.length !== Object.keys(shape).length || top.some((k) => !Object.hasOwn(shape, k))) throw Error('Request body has unexpected sections');
   for (const [section, keys] of Object.entries(shape)) {
     const value = body[section];
+    const wantsArray = section === 'InvoiceItem' || section === 'PurchaseOrderItem';
+    if (Array.isArray(value) !== wantsArray) throw Error('Request body section ' + section + ' has the wrong type');
     const rows = Array.isArray(value) ? value : [value];
     if (!rows.length || rows.some((r) => !r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).some((k) => !keys.includes(k))))
       throw Error('Request body has unexpected fields in ' + section);

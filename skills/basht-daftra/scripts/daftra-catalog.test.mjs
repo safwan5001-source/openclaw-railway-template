@@ -113,7 +113,7 @@ test('approved price change: PUT to the exact product, partial body, read-back v
     const p = await createProposal('product_update', { product_id: 9, changes: { unit_price: '21.5' } }, run(env, fake));
     assert.equal(p.status, 'READY_FOR_APPROVAL');
     assert.equal(p.meta.price_changes[0].change_percent, 13.76);
-    assert.deepEqual(p.meta.snapshot, { unit_price: '18.90' });
+    assert.deepEqual(p.meta.snapshot, { unit_price: '"18.90"' });
     fake.records.products[9].unit_price = '21.50';                  // what Daftra will hold after the PUT
     // the live record differs from the preview snapshot => must be blocked at approval time (concurrent edit)
     const stale = await createProposal('product_update', { product_id: 9, changes: { unit_price: '30' } }, run(env, fake));
@@ -201,4 +201,122 @@ test('defence in depth: a SIGNED product update whose path id disagrees with its
     await assert.rejects(executeProposal({ id: p.id, phrase: approvalPhrase(env, p) }, run(env, fake)), (e) => e.code === 'TAMPERED' && /Target id/.test(e.message));
     assert.equal(fake.posts.length, 0);
   } finally { await done(); }
+});
+
+test('REVIEW#1 a 2xx whose BODY reports failure is a rejection, not a success; and the ledger does not freeze it', async () => {
+  const { env, fake, done } = await setup({ post: () => ({ status: 200, json: { result: 'failed', code: 422, message: 'Validation failed <b>' } }) });
+  try {
+    const p = await createProposal('product_update', { product_id: 9, changes: { unit_price: '25' } }, run(env, fake));
+    const r = await executeProposal(ok(env)(p), run(env, fake));
+    assert.equal(r.status, 'rejected'); assert.match(r.message, /reported failure in the response body/); assert.doesNotMatch(r.message, /<b>/);
+    fake.post = () => ({ status: 200, json: { result: 'successful', code: 200 } });
+    const again = await createProposal('product_update', { product_id: 9, changes: { unit_price: '25' } }, run(env, fake));
+    assert.equal(again.status, 'READY_FOR_APPROVAL');
+    const created = await setup({ post: () => ({ status: 200, json: { code: 500 } }) });
+    try {
+      const q = await createProposal('product_create', newProduct, run(created.env, created.fake));
+      assert.equal((await executeProposal(ok(created.env)(q), run(created.env, created.fake))).status, 'rejected');
+    } finally { await created.done(); }
+  } finally { await done(); }
+});
+
+test('REVIEW#2 the stale-edit snapshot covers EVERY changed field: null, arrays and odd strings', async () => {
+  for (const [field, curVal, change, mutate] of [
+    ['description', null, 'mine', 'colleague wrote this'],
+    ['name', '(old) Diesel', 'New name', '(older) Diesel'],
+    ['tags', ['a'], 'b, c', ['z']],
+    ['notes', undefined, 'n', 'appeared'],
+    ['description', 'old text', 'mine', null],            // a colleague CLEARED the field meanwhile
+    ['notes', 'n0', 'mine', undefined],                     // ...or it disappeared from the record
+  ]) {
+    const seed = { records: { products: { 9: { id: 9, name: 'Diesel 10L', unit_price: '18.90', tax1: 1, [field]: curVal } }, clients: { 4: { id: 4 } } } };
+    if (curVal === undefined) delete seed.records.products[9][field];
+    const { env, fake, done } = await setup({ ...seed, post: () => ({ status: 200, json: { result: 'successful', code: 200 } }) });
+    try {
+      const p = await createProposal('product_update', { product_id: 9, changes: { [field]: change } }, run(env, fake));
+      assert.equal(p.status, 'READY_FOR_APPROVAL', field);
+      assert.ok(field in p.meta.snapshot, field + ' must be snapshotted');
+      fake.records.products[9][field] = mutate;
+      await assert.rejects(executeProposal(ok(env)(p), run(env, fake)), (e) => e.code === 'RECHECK_FAILED' && e.message.includes(field), field);
+      assert.equal(fake.posts.length, 0);
+    } finally { await done(); }
+  }
+});
+
+test('REVIEW#3 the operator review shows overridden product duplicates', async () => {
+  const { env, fake, done } = await setup({ lists: { products: [{ id: 50, name: 'other', barcode: '6291041500999' }] } });
+  try {
+    const { review } = await import('./daftra-approve.mjs');
+    const p = await createProposal('product_create', { ...newProduct, acknowledge_duplicates: ['products#50'] }, run(env, fake));
+    assert.equal(p.status, 'READY_FOR_APPROVAL');
+    assert.match(await review(p.id, env), /!!! DUPLICATE WARNINGS OVERRIDDEN by the requester: products#50/);
+  } finally { await done(); }
+});
+
+test('REVIEW#4 formatMeta never emits raw control, C1 or bidi characters', async () => {
+  const { formatMeta, safeText } = await import('./daftra-public.mjs');
+  const evil = 'a\u001b[2Jb\u009bc\u202ed\r\ne\u2028';
+  const lines = formatMeta({ duplicate_of: { entity: 'invoices', id: evil }, diff: { original: { number: evil }, header: [{ field: evil, original: evil, proposed: evil }],
+    lines: [{ n: 1, original: { item: evil }, proposed: null, changed: [] }, { n: null, original: null, proposed: { item: evil }, changed: [] }], not_copied: [evil] },
+    changes: [{ field: evil, from: evil, to: evil }, { field: 'x', from: null, to: { a: evil } }], highlights: [{ field: evil, from: evil, to: evil }], price_changes: [{ field: evil, from: evil, to: evil, change_percent: 1 }], carried_fields: [evil] });
+  assert.ok(lines.length >= 8);
+  for (const l of lines) assert.equal(new RegExp('[\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2028\\u2029]').test(l), false, JSON.stringify(l));
+  assert.equal(safeText('\u001b'), '\\u001b');
+});
+
+test('REVIEW#5 product_update cannot change the product type or turn a stored absolute discount into a percentage', () => {
+  assert.throws(() => prepareFinancialAction('product_update', { product_id: 9, changes: { type: 1 } }, { current: { name: 'x', type: 3 } }), /Unknown product field: type|not supported/);
+  assert.throws(() => prepareFinancialAction('product_update', { product_id: 9, changes: { discount_type: 1 } }, { current: { name: 'x', discount: '500', discount_type: 2 } }), /exceed 100/);
+  const r = prepareFinancialAction('product_update', { product_id: 9, changes: { discount_type: 2, tax1: 2 } }, { current: { name: 'x', discount: '5', discount_type: 1, tax1: 1 } });
+  assert.deepEqual(r.price_changes.map((p) => p.field).sort(), ['discount_type', 'tax1']);
+});
+
+test('REVIEW#8 numeric-looking TEXT is compared as text (name "5.0" vs "5", code "1.0" vs "1"); prices still numerically', () => {
+  const cur = { name: '5', product_code: '1', unit_price: '18.90' };
+  assert.equal(prepareFinancialAction('product_update', { product_id: 9, changes: { name: '5.0', product_code: '1.0' } }, { current: cur }).changes.length, 2);
+  assert.throws(() => prepareFinancialAction('product_update', { product_id: 9, changes: { unit_price: '18.9' } }, { current: cur }), /No changes/);
+});
+
+test('REVIEW#7 an identical PUT can be repeated after success (idempotent), but never while in flight/ambiguous', async () => {
+  const { env, fake, done } = await setup({ post: () => ({ status: 200, json: { result: 'successful', code: 200 } }) });
+  try {
+    const set = async (price) => { fake.records.products[9].unit_price = price === '25' ? '18.90' : fake.records.products[9].unit_price; };
+    const flip = async (from, to) => {
+      fake.records.products[9].unit_price = from;
+      const p = await createProposal('product_update', { product_id: 9, changes: { unit_price: to } }, run(env, fake));
+      assert.equal(p.status, 'READY_FOR_APPROVAL');
+      fake.post = () => { fake.records.products[9].unit_price = to; return { status: 200, json: { code: 200 } }; };
+      return executeProposal(ok(env)(p), run(env, fake));
+    };
+    void set;
+    assert.equal((await flip('18.90', '25')).status, 'submitted');
+    assert.equal((await flip('25', '30')).status, 'submitted');
+    assert.equal((await flip('30', '25')).status, 'submitted');
+    assert.equal((await flip('18.90', '25')).status, 'submitted');           // the SAME request again: allowed
+    // ambiguous PUT stays blocked until a human resolves it
+    fake.postError = Object.assign(new Error('x'), { name: 'TimeoutError' });
+    fake.records.products[9].unit_price = '18.90';
+    const p = await createProposal('product_update', { product_id: 9, changes: { unit_price: '25' } }, run(env, fake));
+    assert.equal((await executeProposal(ok(env)(p), run(env, fake))).status, 'ambiguous');
+    fake.postError = null;
+    assert.equal((await createProposal('product_update', { product_id: 9, changes: { unit_price: '25' } }, run(env, fake))).status, 'BLOCKED');
+  } finally { await done(); }
+});
+
+test('REVIEW#9 names with punctuation do not break the duplicate scan; category parent cycles are blocked', async () => {
+  const { env, fake, done } = await setup({ lists: { products: [] }, records: { clients: {}, products: { 9: { id: 9, name: 'x', tax1: 1 } }, product_categories: { 12: { id: 12, parent_id: 13 }, 13: { id: 13, parent_id: 0 } } } });
+  try {
+    const p = await createProposal('product_create', { ...newProduct, name: 'Oil 5W-30 (4L) & Filter, 100% + more ' + 'x'.repeat(80) }, run(env, fake));
+    assert.equal(p.status, 'READY_FOR_APPROVAL');
+    const cyc = await createProposal('category_update', { category_id: 13, changes: { parent_id: 12 } }, run(env, fake));
+    assert.equal(cyc.status, 'BLOCKED'); assert.match(cyc.blocking.join(' '), /category cycle/);
+    assert.equal((await createProposal('category_update', { category_id: 12, changes: { parent_id: 0 } }, run(env, fake))).status, 'READY_FOR_APPROVAL');
+  } finally { await done(); }
+});
+
+test('REVIEW body shape: single-object sections cannot be arrays (and vice versa)', () => {
+  const mk = (body) => ({ method: 'PUT', path: '/api2/products/9.json', query: '', body });
+  assert.throws(() => assertWriteAllowed('product_update', mk({ Product: [{ name: 'x' }] })), WriteRefused);
+  assert.throws(() => assertWriteAllowed('sales_invoice', { method: 'POST', path: '/api2/invoices.json', query: '', body: { Invoice: [{ client_id: 4 }], InvoiceItem: [{ item: 'x' }] } }), WriteRefused);
+  assert.throws(() => assertWriteAllowed('sales_invoice', { method: 'POST', path: '/api2/invoices.json', query: '', body: { Invoice: { client_id: 4 }, InvoiceItem: { item: 'x' } } }), WriteRefused);
 });

@@ -12,7 +12,7 @@ import { review } from './daftra-approve.mjs';
 const OP = 'operator-secret-0123456789-0123456789-abcdef';
 const srcInvoice = {
   id: 3, no: 'INV-000123', date: '2025-01-10', client_id: 4, currency_code: 'SAR', notes: 'ملاحظات', draft: 0, payment_status: 2,
-  summary_total: '230.00', summary_paid: '230.00', summary_unpaid: '0.00', created: '2025-01-10 10:00:00', password: 'S3CRET',
+  summary_total: '237.00', summary_paid: '237.00', summary_unpaid: '0.00', created: '2025-01-10 10:00:00', password: 'S3CRET',
   invoice_pdf_url: 'https://nepras.daftra.com/invoices/view/3.pdf?hash=abc', einvoice_status: 'REPORTED', discount: 0, shipping_amount: 0,
 };
 const srcItems = [
@@ -187,4 +187,60 @@ test('fail closed on unreadable sources: no items, malformed numbers, oversize',
   try { await assert.rejects(buildDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch), /not a plain decimal/); } finally { await c.done(); }
   c = await setup({ items: Array.from({ length: 101 }, () => ({ item: 'x', quantity: 1, unit_price: 1, tax1: 0 })) });
   try { await assert.rejects(buildDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch), /more than 100/); } finally { await c.done(); }
+});
+
+test('REVIEW#6 the copy total must equal the source total unless lines were edited or the difference is accepted', async () => {
+  let c = await setup({ invoice: { summary_total: '999.00' } });
+  try {
+    const p = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, R(c));
+    assert.equal(p.status, 'BLOCKED'); assert.match(p.blocking.join(' '), /differs from the source total \(999.00\)/);
+    assert.equal((await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01', accept_total_difference: true } }, R(c))).status, 'READY_FOR_APPROVAL');
+    const edited = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01', line_overrides: { 1: { quantity: '50' } } } }, R(c));
+    assert.equal(edited.status, 'READY_FOR_APPROVAL'); assert.ok(edited.warnings.some((w) => /lines were changed/.test(w)));
+  } finally { await c.done(); }
+  c = await setup({ invoice: { summary_discount: '12.00' } });
+  try { assert.match((await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, R(c))).blocking.join(' '), /summary_discount/); } finally { await c.done(); }
+  c = await setup({ invoice: { adjustment_value: '5' } });
+  try { assert.match((await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, R(c))).blocking.join(' '), /adjustment_value/); } finally { await c.done(); }
+});
+
+test('REVIEW#6 only standard sources: credit/debit notes are refused; draft sources are flagged', async () => {
+  let c = await setup({ invoice: { type: 6 } });
+  try { await assert.rejects(buildDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch), /type 6 is not a standard/); } finally { await c.done(); }
+  c = await setup({ invoice: { type: 0, draft: 1 } });
+  try { assert.ok((await buildDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch)).warnings.some((w) => /itself a draft/.test(w))); } finally { await c.done(); }
+});
+
+test('REVIEW#6 purchase tax mapping: inclusive-only and duplicated mappings are refused; descriptions are not carried', async () => {
+  let c = await setup({ seed: { taxes: [{ id: 1, value: 15, included: 1, is_active: 1 }] } });
+  try { await assert.rejects(buildDuplicate({ source: 'purchase_invoices', id: 5, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch), /tax-INCLUSIVE/); } finally { await c.done(); }
+  c = await setup({ poItems: [{ item: 'Oil', description: 'dropped', quantity: 2, unit_price: 10, tax1: 15, tax2: 15 }] });
+  try { await assert.rejects(buildDuplicate({ source: 'purchase_invoices', id: 5, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch), /same tax id/); } finally { await c.done(); }
+  c = await setup({ poItems: [{ item: 'Oil', description: 'dropped', quantity: 2, unit_price: 10, tax1: 15, discount: 5, discount_type: 1, product_id: '0' }] });
+  try {
+    const b = await buildDuplicate({ source: 'purchase_invoices', id: 5, overrides: { date: '2025-03-01' } }, c.env, c.fake.fetch);
+    assert.equal('description' in b.input.items[0], false);
+    assert.equal('product_id' in b.input.items[0], false);                     // product_id "0" means none
+    assert.ok(b.warnings.some((w) => /line discounts are not documented/.test(w)));
+    await assert.rejects(buildDuplicate({ source: 'purchase_invoices', id: 5, overrides: { date: '2025-03-01', line_overrides: { 1: { description: 'ANOTHER' } } } }, c.env, c.fake.fetch), /description is not supported on purchase/);
+    await assert.rejects(buildDuplicate({ source: 'purchase_invoices', id: 5, overrides: { date: '2025-03-01', add_lines: [{ item: 'x', quantity: '1', unit_price: '1', tax1: 0, description: 'd' }] } }, c.env, c.fake.fetch), /unsupported field description/);
+  } finally { await c.done(); }
+});
+
+test('REVIEW#3/#4 the operator review shows overridden duplicates and cannot be spoofed by control characters in source data', async () => {
+  const evil = 'Diesel\u001b[2J\u001b[H FAKE‮\u009b';
+  const c = await setup({ items: [{ item: evil, quantity: 1, unit_price: 5, tax1: 0 }, srcItems[0]], seed: { lists: { invoices: [{ id: 3, summary_total: '207.00' }] } }, invoice: { summary_total: '207.00' } });
+  try {
+    // the hostile line is REMOVED from the copy, so it only ever appears in the comparison shown to the operator
+    const p = await proposeDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-01-10', remove_lines: [1], acknowledge_duplicates: ['invoices#3'] } }, R(c));
+    assert.equal(p.status, 'READY_FOR_APPROVAL');
+    const text = await review(p.id, c.env);
+    assert.match(text, /!!! DUPLICATE WARNINGS OVERRIDDEN by the requester: invoices#3/);
+    assert.equal(new RegExp('[\\u001b\\u009b\\r\\u202e]').test(text), false, 'no raw control/bidi characters reach the operator terminal');
+    assert.match(text, /REMOVED \(Diesel\\u001b/);
+    assert.equal((text.match(/^Hash    :/gm) ?? []).length, 1, 'a forged "Hash :" line is impossible');
+  } finally { await c.done(); }
+  // hostile text that WOULD be copied is refused outright by validation (fail closed)
+  const n = await setup({ invoice: { notes: 'n\u001b[31m\rHash : forged' } });
+  try { await assert.rejects(buildDuplicate({ source: 'invoices', id: 3, overrides: { date: '2025-03-01' } }, n.env, n.fake.fetch), undefined); } finally { await n.done(); }
 });

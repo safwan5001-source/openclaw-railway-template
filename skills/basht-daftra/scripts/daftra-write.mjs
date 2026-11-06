@@ -121,7 +121,8 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     // 7-8. ledger (authenticated chain), rate limit
     const ledger = await readLedger(env);
     if (proposalWasUsed(ledger, proposal.id)) throw new WriteRefused('ALREADY_USED', 'This proposal was already executed');
-    const blockedBy = isBlockedByLedger(ledger, proposal.request_hash);
+    const idempotent = proposal.request.method === 'PUT';
+    const blockedBy = isBlockedByLedger(ledger, proposal.request_hash, { idempotent });
     if (blockedBy) throw new WriteRefused('DUPLICATE', 'The identical request is already ' + blockedBy + '; resolve it first');
     const configured = Number(env.DAFTRA_MAX_WRITES_PER_HOUR);
     const limit = Number.isInteger(configured) && configured >= 1 ? configured : 20;
@@ -159,6 +160,16 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
     let payload = null;
     try { payload = await response.json(); } catch { /* non-JSON body */ }
 
+    // Daftra reports some outcomes in the BODY (e.g. HTTP 200 with `code` 202; a failure may also arrive as HTTP 200).
+    const bodyFailed = response.status >= 200 && response.status < 300 && payload && typeof payload === 'object'
+      && ((Number.isInteger(payload.code) && (payload.code < 200 || payload.code >= 300)) || ['failed', 'error'].includes(String(payload.result ?? '').toLowerCase()));
+    if (bodyFailed) {
+      const message = typeof payload.message === 'string' ? payload.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 300) : '';
+      await appendLedger({ ...entry, event: 'rejected_in_body', state: 'rejected', http_status: response.status, body_code: Number.isInteger(payload.code) ? payload.code : null }, env);
+      await updateProposal(proposal.id, { status: 'REJECTED' }, env);
+      keepHashLock = false;
+      return { ok: false, status: 'rejected', http_status: response.status, message: 'Daftra answered HTTP ' + response.status + ' but reported failure in the response body' + (message ? ': ' + message : '') + '. Nothing was changed.' };
+    }
     if (response.status >= 200 && response.status < 300) {
       const spec = ACTION_TYPES[proposal.type];
       const idFromBody = payload?.id ?? payload?.Category?.id;
@@ -173,7 +184,8 @@ export async function executeProposal({ id, phrase, actor = 'unknown' }, { env =
       const verification = duplicated ? { checked: false, reason: 'server reported duplicate' } : await verifyCreated(proposal, recordId, env, fetcher);
       await appendLedger({ ...entry, event: duplicated ? 'server_duplicate' : 'created', state: 'submitted', http_status: response.status, record_id: recordId, verification_matched: verification.matched ?? null }, env);
       await updateProposal(proposal.id, { status: duplicated ? 'DUPLICATE_ECHOED' : 'SUBMITTED', record_id: recordId }, env);
-      return { ok: true, status: duplicated ? 'duplicate_echoed' : 'submitted', record_id: recordId, http_status: response.status, verification };
+      if (idempotent) keepHashLock = false;                       // finished idempotent update: a later deliberate repeat is allowed
+      return { ok: true, needs_review: verification.matched === false ? 'READ-BACK DOES NOT MATCH THE APPROVED VALUES: check the record in Daftra before relying on it' : undefined, status: duplicated ? 'duplicate_echoed' : 'submitted', record_id: recordId, http_status: response.status, verification };
     }
     if (response.status >= 400 && response.status < 500) {
       const message = typeof payload?.message === 'string' ? payload.message.replace(/[^\p{L}\p{N} .,:;()_\-]/gu, '').slice(0, 300) : '';

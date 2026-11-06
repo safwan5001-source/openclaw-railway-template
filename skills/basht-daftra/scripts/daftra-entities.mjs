@@ -53,6 +53,10 @@ export const REPORTS = Object.freeze({
 const DATE_PARAMS = new Set(['date_from', 'date_to', 'due_date_from', 'due_date_to', 'created_from', 'created_to',
   'from_date', 'to_date', 'date_range_from', 'date_range_to']);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Free-text search parameters accept ordinary punctuation (product names like "Oil 5W-30 (4L) & Filter, 100%");
+// values are always URL-encoded, only control characters are refused.
+const FREE_TEXT = new Set(['keywords', 'name', 'note', 'vendor', 'address', 'item']);
+const FREE_TEXT_RE = new RegExp('^[^\\u0000-\\u001f\\u007f-\\u009f]{1,200}$', 'u');
 const TEXT_RE = /^[\p{L}\p{N} _.:@\-\/]{1,100}$/u;
 
 export function isCalendarDate(value) {
@@ -77,7 +81,7 @@ export function buildQuery(allowed, query = {}) {
       if (!/^\d{1,12}(\.\d{1,4})?$/.test(value)) throw Error(key + ' must be a number');
     } else if (DATE_PARAMS.has(key)) {
       if (!isCalendarDate(value)) throw Error(key + ' must be a valid YYYY-MM-DD date');
-    } else if (!TEXT_RE.test(value)) {
+    } else if (FREE_TEXT.has(key) ? !FREE_TEXT_RE.test(value) : !TEXT_RE.test(value)) {
       throw Error(key + ' has unsupported characters');
     }
     out.set(key, value);

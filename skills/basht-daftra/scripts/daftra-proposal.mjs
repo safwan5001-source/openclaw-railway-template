@@ -4,6 +4,7 @@
 import { ACTION_TYPES, prepareFinancialAction, hashRequest } from './daftra-finance-preflight.mjs';
 import { DaftraError, getOne, listPage, listRecords, fetchAllRecords } from './daftra-readonly.mjs';
 import { approvalSecret } from './daftra-auth.mjs';
+import { canonicalJson } from './daftra-canonical.mjs';
 import { normName, normEmail, digitsOnly, normTax } from './daftra-parties.mjs';
 import { newProposalId, saveProposal, readLedger, isBlockedByLedger } from './daftra-ledger.mjs';
 import { parseDecimal, format } from './daftra-money.mjs';
@@ -56,8 +57,9 @@ async function findDuplicates(type, preview, env, fetcher) {
 }
 
 
+// Snapshot of a current value for stale-edit detection: EVERY changed field, null/arrays/odd strings included.
+export const snap = (v) => (v === undefined ? '__absent__' : canonicalJson(v));
 const norm = (s) => String(s ?? '').trim().toLowerCase();
-const sameValue = (a, b) => { const x = num(a); const y = num(b); return x !== null && y !== null ? x === y : String(a ?? '') === String(b ?? ''); };
 
 // Customer/supplier duplicate scan. Daftra enforces unique e-mail only; tax number, phone and name duplicates are NOT
 // prevented server-side, so compare locally over ALL records (falls back to a keyword search for very large books).
@@ -122,7 +124,7 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
       const hits = new Map();
       if (body.barcode) for (const r of (await fetchAllRecords('products', q({ barcode: body.barcode }), env, fetcher)).records) if (!r.barcode || String(r.barcode) === String(body.barcode)) hits.set(String(r.id), r);
       if (body.product_code) for (const r of (await fetchAllRecords('products', q({ product_code: body.product_code }), env, fetcher)).records) if (!r.product_code || norm(r.product_code) === norm(body.product_code)) hits.set(String(r.id), r);
-      for (const r of (await fetchAllRecords('products', q({ keywords: body.name }), env, fetcher)).records) if (norm(r.name) === norm(body.name)) hits.set(String(r.id), r);
+      for (const r of (await fetchAllRecords('products', q({ keywords: String(body.name).slice(0, 100) }), env, fetcher)).records) if (norm(r.name) === norm(body.name)) hits.set(String(r.id), r);
       duplicates = [...hits.keys()].map((id) => ({ entity: 'products', id }));
     } else if (type === 'product_update') {
       counterparty = await exists('products', preview.target_id, env, fetcher, check, 'product');
@@ -135,6 +137,14 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
       duplicates = rows.filter((r) => norm(r.name) === norm(body.name) && String(r.parent_id ?? 0) === String(body.parent_id ?? 0)).map((r) => ({ entity: 'product_categories', id: String(r.id) }));
     } else if (type === 'category_update') {
       counterparty = await exists('product_categories', preview.target_id, env, fetcher, check, 'category');
+      if (preview.parent_id) {                                                    // walk the ancestor chain: no cycles
+        let cursor = String(preview.parent_id); let cycle = false;
+        for (let depth = 0; depth < 12 && cursor && cursor !== '0'; depth++) {
+          if (cursor === String(preview.target_id)) { cycle = true; break; }
+          try { cursor = String((await getOne('product_categories', cursor, env, fetcher)).parent_id ?? 0); } catch { break; }
+        }
+        check(!cycle, 'no_category_cycle', cycle ? 'Setting this parent would create a category cycle' : 'No category cycle', true);
+      }
     }
     const open = duplicates.filter((d) => !acknowledged.has(d.entity + '#' + d.id));
     check(open.length === 0, 'no_remote_duplicate', open.length
@@ -142,7 +152,7 @@ async function collectCatalogChecks(type, preview, env, fetcher, acknowledged, s
       : (duplicates.length ? 'Possible duplicates acknowledged by the requester' : 'No duplicate found'), true);
   } catch (e) { check(false, 'no_remote_duplicate', 'Duplicate scan failed (' + e.message + ')', true); }
   if (snapshot && counterparty) {
-    const changed = Object.entries(snapshot).filter(([f, v]) => counterparty[f] !== undefined && !sameValue(counterparty[f], v)).map(([f]) => f);
+    const changed = Object.entries(snapshot).filter(([f, v]) => snap(counterparty[f]) !== v).map(([f]) => f);
     check(changed.length === 0, 'unchanged_since_preview', changed.length ? 'Changed in Daftra since the preview: ' + changed.join(', ') + ' (create a new proposal)' : 'Record unchanged since the preview', true);
   }
   return { checks, blocking, warnings, duplicates, counterparty };
@@ -206,8 +216,8 @@ export async function createProposal(type, input, { env = process.env, fetcher =
   }
   let preview = prepareFinancialAction(type, input, { taxes, requireDate: true, current });
   if (current && preview.changes) {
-    snapshot = Object.fromEntries(preview.changes.filter((c) => typeof c.from !== 'object' && !String(c.from).startsWith('(')).map((c) => [c.field, c.from]));
-    for (const f of preview.carried_fields ?? []) if (current[f] !== undefined) snapshot[f] = current[f];   // supplier: every carried field must also be unchanged
+    snapshot = Object.fromEntries(preview.changes.map((c) => [c.field, snap(current[c.field])]));
+    for (const f of preview.carried_fields ?? []) snapshot[f] = snap(current[f]);   // supplier: every carried field must also be unchanged
   }
   if (type === 'expense') {
     // Expenses support a real server-side idempotency key; derive it from the request itself.
@@ -217,7 +227,7 @@ export async function createProposal(type, input, { env = process.env, fetcher =
   const collected = await collectChecks(type, preview, env, fetcher, acknowledged, { snapshot });
   const effective = [...preBlocking, ...extraBlocking, ...collected.blocking];
   const ledger = await readLedger(env);
-  const ledgerState = isBlockedByLedger(ledger, preview.request_hash);
+  const ledgerState = isBlockedByLedger(ledger, preview.request_hash, { idempotent: preview.request.method === 'PUT' });
   if (ledgerState) effective.push('The identical request was already ' + ledgerState + ' (see ledger); resolve it before proposing again');
 
   const proposal = {
