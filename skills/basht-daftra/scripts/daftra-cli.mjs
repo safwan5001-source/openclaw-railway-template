@@ -27,6 +27,7 @@ import { loadProposal } from './daftra-ledger.mjs';
 import { publicProposal } from './daftra-public.mjs';
 import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
 import { callBrokerService, createBrokerFetcher, downloadInvoicePdfViaBroker } from './daftra-broker-service-client.mjs';
+import { renderCliResult, formatFailure, LANGS, VIEWS } from './daftra-format.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -120,7 +121,27 @@ const DAFTRA_CREDENTIAL_ENV = ['DAFTRA_API_KEY', 'DAFTRA_API_KEY_FILE', 'DAFTRA_
 const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
   'OPERATOR_PASSWORD', 'OPERATOR_TOTP_SEED', 'BROKER_AGENT_TOKEN', 'BROKER_AGENT_TOKEN_PREVIOUS', 'BROKER_STATE_DIR', 'RAILWAY_API_TOKEN', 'RAILWAY_TOKEN'];
 
-export async function run(argv, { env = process.env, fetcher = fetch, sleep, brokerFetcher = fetch } = {}) {
+// `--render ar|en [--view summary|detail]` turns a read result into chat-ready Markdown (daftra-format.mjs). Presentation only: the
+// data is fetched exactly as without the flag, and no write/approval command accepts it.
+const RENDERABLE = new Set(['list', 'get', 'report', 'statement']);
+export function renderOptions(argv) {
+  const { positional, flags } = parseArgs(argv);
+  if (flags.render === undefined && flags.view === undefined) return null;
+  if (!LANGS.includes(flags.render)) throw Error('--render must be one of: ' + LANGS.join(', '));
+  if (flags.view !== undefined && !VIEWS.includes(flags.view)) throw Error('--view must be one of: ' + VIEWS.join(', '));
+  if (!RENDERABLE.has(positional[0])) throw Error('--render supports only: ' + [...RENDERABLE].join(', '));
+  return { lang: flags.render, view: flags.view ?? 'summary' };
+}
+
+export async function run(argv, options = {}) {
+  const render = renderOptions(argv);
+  const result = await runCommand(argv, options);
+  if (!render) return result;
+  const { positional } = parseArgs(argv);
+  return renderCliResult(positional[0], positional[1], result, render);
+}
+
+async function runCommand(argv, { env = process.env, fetcher = fetch, sleep, brokerFetcher = fetch } = {}) {
   const { positional, flags, query } = parseArgs(argv);
   const [command, a1, a2] = positional;
   const actor = flags.actor || 'unknown';
@@ -268,6 +289,8 @@ if (process.argv[1] && import.meta.url === new URL('file://' + resolve(process.a
       if (error.owner_action) body.owner_action = error.owner_action;
       if (error.validationErrors) body.validation_errors = error.validationErrors;
     }
+    // With --render the failure also carries a ready-to-relay message saying what happened (never raw JSON for the user).
+    try { const r = renderOptions(process.argv.slice(2)); if (r) body.markdown = formatFailure(body, { lang: r.lang }); } catch { /* bad --render flags: plain error */ }
     console.error(JSON.stringify(body));
     process.exitCode = 1;
   }

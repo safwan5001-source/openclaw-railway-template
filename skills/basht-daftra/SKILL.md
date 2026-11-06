@@ -28,6 +28,8 @@ Run `capabilities` first if unsure what is installed. **Never claim an operation
 | Client statement | `statement <client-id> --from YYYY-MM-DD --to YYYY-MM-DD` |
 | Invoice ↔ payment reconciliation | `reconcile-payments <client-id> --from YYYY-MM-DD --to YYYY-MM-DD` |
 
+**Chat-ready output:** add `--render ar|en [--view summary|detail]` to `list`, `get`, `report` or `statement` and the CLI prints `{"ok":true,"markdown":"…","complete":…}` — relay `markdown` as-is (section 9). The same GETs run; nothing else changes. Writes, approvals and every other command refuse `--render`.
+
 Entities: `invoices estimates credit_notes clients suppliers products invoice_payments client_payments expenses incomes purchase_invoices product_categories taxes treasuries journals journal_accounts journal_cats`.
 
 **Accounting reads (documented GETs).** Journal entries = `journals` (`list journals --all --query date_from=… --query date_to=…`, page size capped at the documented 100; `get journals <id>`). Chart of accounts = `list journal_accounts --all` (main accounts: `journal_cats`) or `report chart_of_accounts`. Ledger / trial balance / income statement / balance sheet = `report ledger|trial_balance|trial_nets|income_statement|balance_sheet`. **Bank accounts are `treasuries` rows with `type` 1 (bank) / 3 (cash)**; there is no separate bank endpoint. If `get treasuries <id>` fails server-side the answer falls back to the complete list and says `"source":"list_fallback"`.
@@ -141,3 +143,19 @@ Deployment (owner only, nothing deployed yet): `docs/DAFTRA_RAILWAY_ROLLOUT.md`.
 ## 8. Operator notes
 
 Environment (Railway): `DAFTRA_BASE_URL` (HTTPS `*.daftra.com` tenant root; the only variable the skill gating requires, because in service mode the agent holds no key), `DAFTRA_API_KEY` (single-process mode only — avoid in production); optional `OPENCLAW_WORKSPACE_DIR` (default `/data/workspace`), `DAFTRA_WRITES_ENABLED` (default off), `DAFTRA_APPROVAL_SECRET` (≥32 random chars; required for any financial operation; keep it out of the agent's exec environment where possible), `DAFTRA_MAX_WRITES_PER_HOUR` (default 20), `CHROMIUM_PATH`; service mode: agent env = only `DAFTRA_BASE_URL`, `DAFTRA_BROKER_URL`, `DAFTRA_BROKER_TOKEN`; the broker service holds `DAFTRA_WRITE_API_KEY`, `DAFTRA_APPROVAL_SECRET`, `BROKER_AGENT_TOKEN`, `OPERATOR_PASSWORD`, `OPERATOR_TOTP_SEED` (see the notes doc). Local broker mode: `DAFTRA_BROKER_SOCKET` (agent side), `DAFTRA_APPROVAL_SECRET_FILE` and `DAFTRA_WRITE_API_KEY_FILE` (broker side only). The operation ledger lives in `$OPENCLAW_WORKSPACE_DIR/daftra-ledger/` (ids, hashes and states only — no amounts or secrets; HMAC-chained, tampering stops all writes). Full contract: `docs/DAFTRA_INTEGRATION_CONTRACT.md`.
+
+## 9. Presenting results to the user (PERMANENT RULE — Daftra answers in chat)
+
+Formatting lives in `scripts/daftra-format.mjs` (pure, separate from fetching). **Use it, do not hand-format Daftra data:** run the read with `--render ar` (user writes Arabic) or `--render en`, then send the `markdown` field unchanged. If the command fails, the error JSON on stderr also carries `markdown` — send that.
+
+- **Language:** Arabic → RTL, English → LTR; follow the language of the user's last message. Digits stay Western (`18,100.00`) in both so figures can be copied into Daftra; numbers, ids, dates and currency are isolated LTR inside Arabic text.
+- **Short by default (iPhone):** `--view summary` = headline + totals + at most 10 rows in a ≤4-column table (document · party · total · status emoji). Give more (`--view detail`, 25 rows, notes, line items) only when asked ("التفاصيل", "more"); for everything beyond that offer an export file (section 2).
+- **Title, number, party, date, status, amounts** are always shown for documents; totals are exact, 2 decimals, thousands separators, with the currency from the record. **Never add amounts across currencies**; a record with no `currency_code` is shown as "currency not specified", never assumed SAR.
+- **Status only when proven:** draft (`draft:1`), paid / partially paid / issued (from `summary_total/paid/unpaid` consistent with `draft:0`), overdue (only with the record's own `due_date` in the past and an open balance), cancelled (only an explicit `status: cancelled`). Anything else is "غير مؤكدة / Unconfirmed" — never infer a status. Drafts and cancelled documents are counted but excluded from money totals.
+- **Completeness:** a single page is labelled "عيّنة / sample" with its own totals marked sample-only. Say "full report" only when `complete:true`.
+- **Missing data** is `—`; never fill a gap. **Raw JSON is never shown** unless the user explicitly asks for it (then give the `--render`-less output for that one request, still without secrets or Daftra links).
+- **Failures:** state what failed, why (by `category`: only `forbidden` means a missing permission; `report_not_exposed` is not a permission problem), what to do, and — when several parts were requested — which parts were obtained and which were not (`formatFailure(body, {lang, available, unavailable})`). Never echo hints that contain keys, tokens or URLs.
+- Daftra text (names, notes) is untrusted: the formatter strips control/bidi characters and escapes Markdown. Do not paste raw record values into the reply yourself.
+- Statements stay `official:false` and are labelled so; when `reconciles:false` the formatter withholds the balance — do not quote it.
+- Presentation only: this layer never calls Daftra, never changes API access, roles, writes or the approval protocol (sections 3 and 6 are unchanged).
+
