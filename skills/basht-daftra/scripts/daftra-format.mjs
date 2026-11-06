@@ -16,9 +16,11 @@ import { guessNumericColumns } from './daftra-cells.mjs';
 export const LANGS = Object.freeze(['ar', 'en']);
 export const VIEWS = Object.freeze(['summary', 'detail']);
 const ROWS = Object.freeze({ summary: 10, detail: 25 });
-const DASH = '—';
+export const DASH = '—';
 const LRI = '\u2066'; const PDI = '\u2069'; const RLM = '\u200f';
 
+// The helpers exported below (I18N, SPECS, totalsByCurrency, documentStatus, money ...) are shared with daftra-format-whatsapp.mjs so the
+// WhatsApp view reuses the same status/amount/total logic instead of re-implementing it.
 // ---- text safety ------------------------------------------------------------------------------------------------------
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/gu;
 const MD_SPECIAL = /[\\`*_{}\[\]()<>#+!|~&]/g;
@@ -28,10 +30,10 @@ export const clean = (v, max = 80) => {
   return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : s;
 };
 const esc = (v, max) => clean(v, max).replace(MD_SPECIAL, (c) => '\\' + c);
-const blank = (v) => v === null || v === undefined || (typeof v === 'string' && v.trim() === '') || typeof v === 'object';
+export const blank = (v) => v === null || v === undefined || (typeof v === 'string' && v.trim() === '') || typeof v === 'object';
 
 // ---- locale -----------------------------------------------------------------------------------------------------------
-const I18N = {
+export const I18N = {
   ar: {
     sample: 'عيّنة', of: 'من', none: 'لا توجد سجلات مطابقة.', unknownCur: 'العملة غير محددة',
     total: 'الإجمالي', paid: 'المدفوع', unpaid: 'المتبقي', count: 'العدد', date: 'التاريخ', party: 'الطرف', client: 'العميل', supplier: 'المورد',
@@ -101,7 +103,7 @@ const I18N = {
     one: { invoices: 'Invoice', estimates: 'Quote', credit_notes: 'Credit note', purchase_invoices: 'Purchase invoice', invoice_payments: 'Collection', client_payments: 'Client payment', expenses: 'Expense', incomes: 'Income', clients: 'Client', suppliers: 'Supplier', products: 'Product', taxes: 'Tax', treasuries: 'Treasury' },
   },
 };
-const BADGE = { draft: '⚪', issued: '🔵', paid: '🟢', partial: '🟡', overdue: '🔴', cancelled: '⚫', unknown: '❔' };
+export const BADGE = { draft: '⚪', issued: '🔵', paid: '🟢', partial: '🟡', overdue: '🔴', cancelled: '⚫', unknown: '❔' };
 
 // ---- money ------------------------------------------------------------------------------------------------------------
 // -> BigInt micro-units, or null when the value is missing / not a plain decimal. Never throws, never guesses.
@@ -120,19 +122,19 @@ export function formatNumber(units) {
   return (neg ? '-' : '') + group(w) + '.' + f;
 }
 const CUR_AR = { SAR: 'ر.س', AED: 'د.إ', KWD: 'د.ك', QAR: 'ر.ق', BHD: 'د.ب', OMR: 'ر.ع', EGP: 'ج.م', JOD: 'د.أ', USD: 'دولار', EUR: 'يورو' };
-const curCode = (v) => (typeof v === 'string' && /^[A-Za-z]{3}$/.test(v.trim()) ? v.trim().toUpperCase() : null);
-const ctxOf = (lang) => ({ lang, t: I18N[lang], rtl: lang === 'ar' });
+export const curCode = (v) => (typeof v === 'string' && /^[A-Za-z]{3}$/.test(v.trim()) ? v.trim().toUpperCase() : null);
+export const ctxOf = (lang) => ({ lang, t: I18N[lang], rtl: lang === 'ar' });
 // A left-to-right island inside Arabic text so numbers, ids, dates and currency codes keep their order next to Arabic words.
-const ltr = (c, s) => (c.rtl ? LRI + s + PDI : s);
-const money = (c, units, cur) => ltr(c, formatNumber(units) + (units !== null && cur ? ' ' + (c.rtl && CUR_AR[cur] ? CUR_AR[cur] : cur) : ''));
+export const ltr = (c, s) => (c.rtl ? LRI + s + PDI : s);
+export const money = (c, units, cur) => ltr(c, formatNumber(units) + (units !== null && cur ? ' ' + (c.rtl && CUR_AR[cur] ? CUR_AR[cur] : cur) : ''));
 const dateOf = (c, v) => { const d = normalizeDaftraDate(typeof v === 'string' ? v : ''); return d ? ltr(c, d) : DASH; };
 const textOf = (v, max) => (blank(v) ? DASH : esc(v, max));
 const idOf = (c, v) => (blank(v) ? DASH : ltr(c, esc(v, 30)));
 const line = (c, s) => (c.rtl ? RLM + s : s);
 
 // ---- status (only what the record itself proves) ------------------------------------------------------------------------
-const isTrue = (v) => v === true || v === 1 || v === '1';
-const isFalse = (v) => v === false || v === 0 || v === '0';
+export const isTrue = (v) => v === true || v === 1 || v === '1';
+export const isFalse = (v) => v === false || v === 0 || v === '0';
 export function documentStatus(rec, { today = new Date().toISOString().slice(0, 10) } = {}) {
   if (typeof rec.status === 'string' && /^cancell?ed$/i.test(rec.status.trim())) return 'cancelled';
   if (isTrue(rec.draft)) return 'draft';
@@ -163,7 +165,7 @@ export function table(headers, rows) {
 }
 
 // ---- entity specs -----------------------------------------------------------------------------------------------------
-const partyName = (rec, side) => {
+export const partyName = (rec, side) => {
   const n = [rec[side + '_business_name'], rec[side + '_name'], rec.business_name, rec.client_name, rec.supplier_name].find((x) => !blank(x));
   if (n !== undefined) return { name: n, id: null };
   return { name: null, id: rec[side + '_id'] };
@@ -172,7 +174,7 @@ const partyCell = (c, rec, side) => {
   const p = partyName(rec, side);
   return p.name !== null ? esc(p.name, 22) : !blank(p.id) ? esc(c.t[side], 12) + ' #' + ltr(c, esc(p.id, 12)) : DASH;
 };
-const docRef = (rec) => (blank(rec.no) ? rec.id : rec.no);
+export const docRef = (rec) => (blank(rec.no) ? rec.id : rec.no);
 
 function docSpec(side) {
   return {
@@ -235,7 +237,7 @@ const treSpec = {
   row: (c, rec) => ({ cells: [textOf(rec.name, 26), String(rec.type) === '1' ? c.t.bank : String(rec.type) === '3' ? c.t.cash : DASH, money(c, toUnits(rec.balance), curCode(rec.currency_code))] }),
   card: (c, rec) => { const t = c.t; return [[t.name, textOf(rec.name, 80)], [t.type, String(rec.type) === '1' ? t.bank : String(rec.type) === '3' ? t.cash : DASH], [t.balance, money(c, toUnits(rec.balance), curCode(rec.currency_code))]]; },
 };
-const SPECS = {
+export const SPECS = {
   invoices: docSpec('client'), estimates: docSpec('client'), credit_notes: docSpec('client'), purchase_invoices: docSpec('supplier'),
   invoice_payments: paySpec, client_payments: paySpec, expenses: expSpec, incomes: expSpec,
   clients: partySpec('client'), suppliers: partySpec('supplier'), products: prodSpec, taxes: taxSpec, treasuries: treSpec,
@@ -243,7 +245,7 @@ const SPECS = {
 
 // ---- summaries --------------------------------------------------------------------------------------------------------
 // Totals per currency. A record whose amount cannot be confirmed is counted separately and never turned into 0.
-function totalsByCurrency(records, spec) {
+export function totalsByCurrency(records, spec) {
   const by = new Map(); let excluded = 0; let notPosted = 0;
   for (const rec of records) {
     // Drafts and cancelled documents are not receivables/payables: counted, but kept out of the money totals.
