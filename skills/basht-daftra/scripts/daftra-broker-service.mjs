@@ -696,7 +696,15 @@ export function createBrokerService(options = {}) {
       if (method === 'GET') return html(res, 200, 'Enroll', '<h1>Authenticator enrollment / تسجيل المصادقة</h1><form method="post" action="/enroll"><input type="hidden" name="pre" value="' + esc(auth.issuePre()) + '"><label>Password<input type="password" name="password" required></label><button>Show setup key</button></form>');
       if (method === 'POST') {
         let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
-        if (!sameOrigin(req) || !auth.consumePre(form.get('pre'))) return textReply(res, 403, 'Forbidden');
+        if (!sameOrigin(req)) {
+          log({ level: 'warn', msg: 'operator enrollment rejected: origin policy', originPresent: typeof req.headers.origin === 'string',
+            sameSiteBrowserMetadata: req.headers['sec-fetch-site'] === 'same-origin' });
+          return textReply(res, 403, 'Forbidden');
+        }
+        if (!auth.consumePre(form.get('pre'))) {
+          log({ level: 'warn', msg: 'operator enrollment rejected: one-time form token invalid or expired' });
+          return textReply(res, 403, 'Forbidden');
+        }
         const r = await auth.verifyPasswordOnly({ password: form.get('password') ?? '', ip });
         if (!r.ok) { noteEvent('enroll_failed', ip); return html(res, r.status, 'Enroll', '<div class="bad">Invalid / غير صحيح</div>'); }
         if (enrollShown) return textReply(res, 404, 'Not Found');
