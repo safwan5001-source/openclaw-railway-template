@@ -92,7 +92,7 @@ Threat model: the agent controls CLI arguments and can read/write the workspace,
 
 ## 6. Not verified / needs the real tenant
 
-Live JSON shapes of each endpoint and report; whether the API key's role allows each entity; real `invoice_pdf_url` download; ZATCA/e-invoice side effects of final invoices; open/closed financial periods; tenant payment-method names; tax inclusive/exclusive rounding vs Daftra's own (the read-back catches differences); PDF Arabic fonts and Chromium inside the Railway image; delivery on iPhone.
+Live JSON shapes of each endpoint and report; whether the API key's role allows each entity; real `invoice_pdf_url` download; ZATCA/e-invoice side effects of final invoices; open/closed financial periods; tenant payment-method names; **payment reconciliation inputs**: the exact shape of payments embedded in `GET invoices/<id>` (assumed `data.Payment[]`, or `data.InvoicePayment[]`, elements flat or wrapped in `InvoicePayment`), the `invoice_payments.status` codes (only `1` is treated as successful, `0`/cancelled/failed as not counted, anything else as unresolved) and whether the single `GET invoice_payments/<id>` returns `data.InvoicePayment`; tax inclusive/exclusive rounding vs Daftra's own (the read-back catches differences); PDF Arabic fonts and Chromium inside the Railway image; delivery on iPhone.
 
 ## 7. Acceptance gates before any production use
 
