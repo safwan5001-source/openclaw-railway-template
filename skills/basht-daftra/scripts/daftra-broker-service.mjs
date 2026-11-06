@@ -31,6 +31,7 @@ import { reviewLines } from './daftra-approve.mjs';
 import { validateRequest } from './daftra-broker.mjs';
 import { createOperatorAuth, constantTimeEqual, totpBase32, otpauthUri } from './daftra-operator-auth.mjs';
 import { validateGet, performGet, validateInvoicePdfRequest, fetchInvoicePdf, BadRead } from './daftra-broker-reads.mjs';
+import { createSessionStore, parseCookieInput } from './daftra-session-store.mjs';
 
 const MAX_API_BODY = 256 * 1024;
 const MAX_FORM_BODY = 16 * 1024;
@@ -78,7 +79,7 @@ function checkStateDir(dir, { create = true } = {}) {
     if (!st.isDirectory()) return 'BROKER_STATE_DIR is not a directory';
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return 'BROKER_STATE_DIR is not owned by the running user';
     if ((st.mode & 0o027) !== 0) return 'BROKER_STATE_DIR must not be group-writable or accessible by others (chmod 700)';
-    for (const rel of ['daftra-ledger', 'daftra-ledger/proposals', 'daftra-ledger/locks', 'daftra-ledger/ledger.jsonl', 'audit.jsonl', 'operator-state.json']) {
+    for (const rel of ['daftra-ledger', 'daftra-ledger/proposals', 'daftra-ledger/locks', 'daftra-ledger/ledger.jsonl', 'audit.jsonl', 'operator-state.json', 'daftra-session.json']) {
       try { if (lstatSync(join(dir, rel)).isSymbolicLink()) return 'a symlink was found inside the state directory (' + rel + ')'; } catch { /* absent */ }
     }
     return null;
@@ -137,8 +138,10 @@ export function createBrokerService(options = {}) {
   const configured = issues.length === 0;
   const secrets = [cfg.writeKey, cfg.secret, env.BROKER_AGENT_TOKEN, env.BROKER_AGENT_TOKEN_PREVIOUS, env.OPERATOR_PASSWORD, env.OPERATOR_TOTP_SEED,
     env.DAFTRA_API_KEY, env.DAFTRA_WRITE_API_KEY].filter((s) => typeof s === 'string' && s.length >= 6);
-  const scrub = (text) => { let out = String(text); for (const s of secrets) if (out.includes(s)) out = out.split(s).join('[redacted]'); return out; };
-  const containsSecret = (text) => secrets.some((s) => String(text).includes(s));
+  // The operator's pasted Daftra session cookie values are added here at runtime so no log line or reply can ever carry them.
+  const dynamicSecrets = new Set();
+  const scrub = (text) => { let out = String(text); for (const s of [...secrets, ...dynamicSecrets]) if (out.includes(s)) out = out.split(s).join('[redacted]'); return out; };
+  const containsSecret = (text) => secrets.some((s) => String(text).includes(s)) || [...dynamicSecrets].some((s) => String(text).includes(s));
   const rawLog = options.log ?? ((line) => console.log(line));
   const log = (obj) => { try { rawLog(scrub(JSON.stringify({ ts: new Date(now()).toISOString(), svc: 'basht-broker', ...obj }))); } catch { /* logging must never break a request */ } };
 
@@ -152,6 +155,9 @@ export function createBrokerService(options = {}) {
 
   const auth = createOperatorAuth({ env, stateDir: cfg.stateDir, now, deviceSecret: cfg.secret });
   const exposure = { alarm: false, count: 0, last: null };
+  // Encrypted-at-rest Daftra browser session pasted by the operator (never by the agent); used only for GET of one invoice PDF.
+  const sessionStore = configured ? createSessionStore({ dir: cfg.stateDir, secret: cfg.secret, now }) : null;
+  const rememberSessionSecrets = async () => { for (const v of await sessionStore.secretValues().catch(() => [])) dynamicSecrets.add(v); };
   const lastAuditKey = new Map();
 
   // ---- audit (HMAC chain, fail-closed) ------------------------------------------------------------------------
@@ -459,7 +465,16 @@ export function createBrokerService(options = {}) {
       const id = validateInvoicePdfRequest(body);
       noteEvent('agent_invoice_pdf');
       let result;
-      try { result = await fetchInvoicePdf(id, { env: brokerEnv, fetcher }); }
+      // `session` is passed whenever sessions are supported: cookieHeader is null until the operator connects one.
+      const session = sessionStore ? {
+        cookieHeader: await sessionStore.cookieHeader().catch(() => null),
+        onResult: async (outcome) => {
+          if (outcome === 'ok') { await sessionStore.markOk(); log({ evt: 'invoice_pdf_session', outcome: 'ok' }); }
+          else { await sessionStore.markExpired(); log({ evt: 'invoice_pdf_session', outcome: 'expired' }); await auditThrottled('daftra_session_expired', 'daftra_session_expired', {}); }
+        },
+      } : undefined;
+      if (session?.cookieHeader) await rememberSessionSecrets();
+      try { result = await fetchInvoicePdf(id, { env: brokerEnv, fetcher, session }); }
       catch (e) { if (e instanceof BadRead) throw e; result = { status: 502, message: 'Upstream unreachable' }; }
       // Operator-visible reason for a non-PDF answer: fixed fields only (never the link, hash, path or page content).
       if (result.diagnostic) log({ evt: 'invoice_pdf_not_pdf', ...result.diagnostic, draft: result.draft === true });
@@ -550,7 +565,9 @@ export function createBrokerService(options = {}) {
     const pendingHtml = rows.splice(0).join('') || '<p>Nothing awaiting approval / لا يوجد ما ينتظر الاعتماد</p>';
     for (const id of recentIds(15)) await card(id, false);
     const nav = pages > 1 ? '<p>' + (pg > 1 ? '<a href="/console?page=' + (pg - 1) + '">← Newer</a> ' : '') + 'Page ' + pg + '/' + pages + (pg < pages ? ' <a href="/console?page=' + (pg + 1) + '">Older →</a>' : '') + '</p>' : '';
+    const ss = await sessionStore.status().catch(() => ({ state: 'not_connected' }));
     htmlA(res, 200, 'Console', '<h1>Awaiting approval / بانتظار الاعتماد (' + pending.length + ')</h1>' + pendingHtml + nav
+      + '<p><a href="/console/daftra-session">Daftra session for official PDFs / جلسة دفترة لملفات PDF الرسمية</a> — <b>' + esc(ss.state) + '</b></p>'
       + '<h2>Recent / الأحدث</h2>' + (rows.join('') || '<p>—</p>')
       + (pending.length ? '<form method="post" action="/console/reject_all"><input type="hidden" name="csrf" value="' + esc(session.csrf) + '"><button class="danger" type="submit">Reject ALL ' + pending.length + ' pending / رفض الكل (no code needed)</button></form>' : '')
       + '<form method="post" action="/logout"><input type="hidden" name="csrf" value="' + esc(session.csrf) + '"><button class="ghost">Sign out / خروج</button></form>');
@@ -596,6 +613,54 @@ export function createBrokerService(options = {}) {
     }
     await audit('operator_reject_all', { count: n, session: session.short }).catch(() => {});
     return htmlA(res, 200, 'Rejected', '<div class="ok">Rejected ' + n + ' proposal(s) — nothing was sent. / تم رفض ' + n + '</div><a href="/console">← Back</a>');
+  }
+
+  // ---- Daftra session for official PDFs (operator only: session + CSRF + a FRESH authenticator code to connect) ------------------
+  async function sessionPage(res, session, { message, kind = 'warn' } = {}) {
+    const st = await sessionStore.status().catch(() => ({ state: 'not_connected' }));
+    const csrf = '<input type="hidden" name="csrf" value="' + esc(session.csrf) + '">';
+    const facts = [['Status / الحالة', st.state], ['Saved / حُفظت', st.saved_at ?? '—'], ['Last successful PDF / آخر نجاح', st.last_ok_at ?? '—'], ['Last failure / آخر فشل', st.last_failure_at ?? '—']]
+      .map(([k, v]) => '<tr><td>' + esc(k) + '</td><td class="dyn">' + esc(v) + '</td></tr>').join('');
+    htmlA(res, 200, 'Daftra session', (message ? '<div class="' + kind + '">' + esc(message) + '</div>' : '')
+      + '<h1>Daftra session for official PDFs / جلسة دفترة</h1>'
+      + '<div class="card"><table>' + facts + '</table></div>'
+      + '<div class="card"><p>Sign in to Daftra in <b>your own browser</b>, then copy the session cookie <code>OISystem</code> '
+      + '(browser developer tools → Application/Storage → Cookies → your Daftra site) and paste it below. '
+      + 'Your Daftra password is never entered here and never reaches BASHT. The cookie is stored encrypted, used only to download invoice PDFs '
+      + '(GET only), and never shown again. When Daftra signs you out, paste a new one. / '
+      + 'سجّل الدخول إلى دفترة في متصفحك ثم الصق قيمة الكوكي <code>OISystem</code> هنا؛ لا تُدخل كلمة مرور دفترة هنا.</p>'
+      + '<form method="post" action="/console/daftra-session" autocomplete="off">' + csrf
+      + '<label>Cookie value or Cookie header / قيمة الكوكي<input type="password" name="cookie" autocomplete="off" autocapitalize="off" spellcheck="false" required></label>'
+      + '<label>Fresh authenticator code / رمز جديد<input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>'
+      + '<button type="submit">Save session / حفظ الجلسة</button></form></div>'
+      + (st.state !== 'not_connected' ? '<form method="post" action="/console/daftra-session/clear">' + csrf + '<button class="danger" type="submit">Disconnect and delete / فصل وحذف</button></form>' : '')
+      + '<p><a href="/console">← Back</a></p>');
+  }
+
+  async function saveSession(req, res, session) {
+    let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
+    if (!sameOrigin(req) || !csrfOk(session, form)) { audit('csrf_rejected', { id: 'daftra_session' }).catch(() => {}); return textReply(res, 403, 'Forbidden'); }
+    const parsed = parseCookieInput(String(form.get('cookie') ?? ''));
+    if (!parsed.ok) return sessionPage(res, session, { message: parsed.error + ' / الكوكي غير صالح', kind: 'bad' });
+    const ip = clientIp(req);
+    const su = await auth.stepUp({ ip, code: String(form.get('code') ?? '').trim(), device: deviceOf(req), session });
+    if (!su.ok) {
+      audit('stepup_failed', { id: 'daftra_session', action: 'session_save', status: su.status, ip: ipHash(ip), session: session.short, revoked: su.revoked === true }).catch(() => {});
+      if (su.revoked) return redirect(res, '/', { 'Set-Cookie': '__Host-bsess=deleted' + cookieAttrs + '; Max-Age=0' });
+      return htmlA(res, su.status === 429 ? 429 : su.status === 503 ? 503 : 401, 'Code rejected', '<div class="bad">Code rejected' + (su.status === 429 ? ' — locked out, try later' : '') + '. Wait for a NEW code and retry. / الرمز مرفوض</div><a href="/console/daftra-session">← Back</a>');
+    }
+    await audit('operator_daftra_session_save', { cookies: parsed.pairs.length, step: su.step, session: session.short });   // audit BEFORE acting; never the values
+    for (const [, v] of parsed.pairs) if (v.length >= 6) dynamicSecrets.add(v);
+    await sessionStore.save(parsed.pairs);
+    return sessionPage(res, session, { message: 'Session saved. Ask BASHT for an invoice PDF to verify it. / تم حفظ الجلسة', kind: 'ok' });
+  }
+
+  async function clearSession(req, res, session) {
+    let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
+    if (!sameOrigin(req) || !csrfOk(session, form)) { audit('csrf_rejected', { id: 'daftra_session' }).catch(() => {}); return textReply(res, 403, 'Forbidden'); }
+    await audit('operator_daftra_session_clear', { session: session.short });
+    await sessionStore.clear();
+    return sessionPage(res, session, { message: 'Session deleted. / تم حذف الجلسة', kind: 'ok' });
   }
 
   const busy = new Set();
@@ -739,6 +804,14 @@ export function createBrokerService(options = {}) {
       auth.logout(session.id); audit('logout', { session: session.short }).catch(() => {});
       return redirect(res, '/', { 'Set-Cookie': '__Host-bsess=deleted' + cookieAttrs + '; Max-Age=0' });
     }
+    if (path === '/console/daftra-session' || path === '/console/daftra-session/clear') {
+      if (!session) return redirect(res, '/');
+      if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
+      if (path === '/console/daftra-session' && method === 'GET') return sessionPage(res, session);
+      if (path === '/console/daftra-session' && method === 'POST') return saveSession(req, res, session);
+      if (path === '/console/daftra-session/clear' && method === 'POST') return clearSession(req, res, session);
+      return textReply(res, 405, 'Method Not Allowed');
+    }
     if (path === '/console' || path === '/console/reject_all' || path.startsWith('/proposal/')) {
       if (!session) return redirect(res, '/');
       if (!configured) return htmlA(res, 503, 'Unavailable', '<div class="bad">Not configured</div>');
@@ -794,7 +867,7 @@ export function createBrokerService(options = {}) {
     if (!configured) log({ level: 'warn', msg: 'SERVICE NOT CONFIGURED: writes impossible', issues });
     else if (!writesEnabled()) log({ level: 'info', msg: 'writes are DISABLED (DAFTRA_WRITES_ENABLED is not 1)' });
     await auth.ready();
-    if (configured) { await indexLoad(); await prune(); try { await ensureAuditHead(); } catch (e) { if (e.code === 'AUDIT_TAMPERED') log({ level: 'error', msg: 'audit chain failed verification: approvals are refused until the audit file is investigated' }); } }
+    if (configured) { await rememberSessionSecrets(); await indexLoad(); await prune(); try { await ensureAuditHead(); } catch (e) { if (e.code === 'AUDIT_TAMPERED') log({ level: 'error', msg: 'audit chain failed verification: approvals are refused until the audit file is investigated' }); } }
     if (env.OPERATOR_STATE_RESET === '1') {
       // Break-glass: ALWAYS clears lock counters (never the replay high-water mark); a corrupt state file is replaced as well.
       if (auth.broken) { await auth.reset(); await audit('operator_state_reset', {}).catch(() => {}); log({ level: 'warn', msg: 'operator state was reset (OPERATOR_STATE_RESET=1): unset it' }); }

@@ -11,6 +11,7 @@
 import { ENTITIES, REPORTS, buildQuery, buildReportQuery } from './daftra-entities.mjs';
 import { config, pdfUrl, assertPdfBytes, fetchOfficialPdfResponse, pdfResponseProblem, diagnosePdfResponse, invoiceIsDraft } from './daftra-readonly.mjs';
 import { summariseValidationErrors } from './daftra-errors.mjs';
+import { fetchSessionPdf } from './daftra-session-pdf.mjs';
 
 // Response caps: list/single-record reads 6 MiB (a page is <= 500 rows), reports 16 MiB (single response, no pagination).
 export const MAX_LIST_RESPONSE = 6 * 1024 * 1024;
@@ -129,19 +130,32 @@ export function validateInvoicePdfRequest(body) {
   return id;
 }
 
-// Official PDF: invoice -> invoice_pdf_url (same tenant, https, *.pdf, no credentials) -> download WITHOUT the API key.
-export async function fetchInvoicePdf(id, { env, fetcher = fetch }) {
+// Official PDF. Two sources, session first:
+//   1. the operator's own Daftra session (`session.cookieHeader`, pasted once in the operator console): one GET of the invoice's PDF page,
+//      works for drafts too (daftra-session-pdf.mjs);
+//   2. otherwise the invoice's hash link (invoice_pdf_url: same tenant, https, *.pdf, no credentials), downloaded WITHOUT the API key.
+// `session` = { cookieHeader: string|null, onResult?(outcome: 'ok'|'expired') }; undefined => hash link only.
+export async function fetchInvoicePdf(id, { env, fetcher = fetch, session } = {}) {
   const got = await performGet(validateGet({ path: '/api2/invoices/' + id + '.json' }), { env, fetcher });
   if (got.status !== 200 || !got.body) return { status: got.status === 200 ? 502 : got.status, message: got.message ?? 'Invoice not available' };
+  if (session?.cookieHeader) {
+    const draftNow = invoiceIsDraft(got.body);
+    let r;
+    try { r = await fetchSessionPdf(String(id), { cookieHeader: session.cookieHeader, env, fetcher }); }
+    catch (e) { return { status: 502, message: clean(e.message), draft: draftNow }; }
+    if (r.kind === 'pdf') { try { await session.onResult?.('ok'); } catch { /* status bookkeeping never fails a download */ } return { status: 200, size: r.bytes.length, base64: Buffer.from(r.bytes).toString('base64'), draft: draftNow, redirects: r.redirects, source: 'daftra_session' }; }
+    if (r.expired) { try { await session.onResult?.('expired'); } catch { /* ignore */ } }
+    return { status: 502, message: String(r.message).slice(0, 300), draft: draftNow, diagnostic: r.diagnostic, session: r.expired ? 'expired' : 'failed' };
+  }
   let url;
-  try { url = pdfUrl(got.body, env); } catch (e) { return { status: 422, message: clean(e.message) }; }
+  try { url = pdfUrl(got.body, env); } catch (e) { return { status: 422, message: clean(e.message) + (session ? '. Connect your Daftra session in the operator console.' : ''), ...(session ? { session: 'not_connected' } : {}) }; }
   const draft = invoiceIsDraft(got.body);
   let fetched;
   try { fetched = await fetchOfficialPdfResponse(url, { env, fetcher }); } catch (e) { return { status: 502, message: clean(e.message), draft }; }
   const { response, redirects, landedOnLogin } = fetched;
   const diagnostic = await diagnosePdfResponse(response, { redirects, landedOnLogin });
   const problem = diagnostic && pdfResponseProblem(response, { draft, redirects, landedOnLogin, page: diagnostic.page });
-  if (problem) return { status: 502, message: problem, draft, diagnostic };   // diagnostic: status / media type / redirects / page class only
+  if (problem) return { status: 502, message: problem + (session && diagnostic.page === 'login' ? ' Connect your Daftra session in the operator console.' : ''), draft, diagnostic, ...(session ? { session: 'not_connected' } : {}) };   // diagnostic: status / media type / redirects / page class only
   let bytes;
   try { bytes = await readCapped(response, MAX_PDF); } catch (e) { return { status: 502, message: clean(e.message) }; }
   try { assertPdfBytes(new Uint8Array(bytes)); } catch (e) { return { status: 502, message: clean(e.message) }; }
