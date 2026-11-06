@@ -174,3 +174,41 @@ test('the legacy Python exporter is gone and nothing references it', () => {
   walk(root);
   assert.deepEqual(hits, [], 'stale references to the removed Python exporter');
 });
+
+// ---------------------------------------------------------------- experimental login-browser image (phase 1; never deployed by this repo)
+test('Dockerfile.login: separate, pinned, non-root, Chromium here and NOT in the broker, no secrets baked, no volume, tests excluded', () => {
+  const lines = dockerfileLines('Dockerfile.login'); const t = lines.join('\n');
+  const from = lines.filter((l) => /^FROM\b/.test(l));
+  assert.equal(from.length, 1); assert.match(from[0], /^FROM node:26-bookworm-slim$/);
+  assert.match(t, /\bchromium\b/); assert.match(t, /\bfonts-noto-core\b/); assert.match(t, /\btini\b/);
+  assert.match(t, /useradd --system --uid 10002 --gid login .*--shell \/usr\/sbin\/nologin login/);
+  assert.match(t, /^USER login$/m, 'the service runs unprivileged');
+  assert.match(t, /^COPY skills\/basht-daftra\/scripts \.\/skills\/basht-daftra\/scripts$/m);
+  assert.match(t, /^COPY daftra-login \.\/daftra-login$/m);
+  assert.ok(!/^COPY \. /m.test(t) && !/^ADD /m.test(t) && !/\bVOLUME\b/.test(t), 'no blanket copy, no volume: nothing persists');
+  assert.match(t, /^ENTRYPOINT \["tini", "--", "node", "\/app\/daftra-login\/server\.mjs"\]$/m);
+  assert.match(t, /^HEALTHCHECK .*\/healthz/m); assert.match(t, /^EXPOSE 8080$/m);
+  for (const l of lines.filter((x) => /^(ENV|ARG)\b/.test(x))) assert.ok(!/KEY|SECRET|TOKEN|PASSWORD|CODE|DAFTRA|BROKER|OPERATOR|APPROVAL/i.test(l.replace('LOGIN_CHROMIUM_NO_SANDBOX', '')), 'secret-like ENV/ARG baked in: ' + l);
+  assert.ok(!/DAFTRA_(API|WRITE|APPROVAL)|BROKER_|OPERATOR_|LOGIN_ACCESS_CODE/.test(t), 'no secret names in the image');
+  // the privilege split this design depends on: the money-holding broker still has NO browser
+  assert.ok(!/chromium|chrome/i.test(dockerfileLines('Dockerfile.broker').join('\n')), 'Dockerfile.broker must stay browser-free');
+  assert.ok(!/daftra-login/.test(dockerfileLines('Dockerfile.broker').join('\n') + dockerfileLines('Dockerfile').join('\n')), 'the login service is not shipped in the broker or OpenClaw images');
+  const ig = read('.dockerignore'); assert.match(ig, /^daftra-login\/\*\*\/\*\.test\.mjs$/m); assert.match(ig, /^daftra-login\/\*\*\/\*\.test-helper\.mjs$/m);
+});
+
+test('railway.login.toml is a reference only (no variables); the login service answers the root railway.toml health path too', () => {
+  const l = parseToml(read('railway.login.toml'));
+  assert.equal(l.build.dockerfilePath, 'Dockerfile.login'); assert.equal(l.deploy.healthcheckPath, '/healthz'); assert.equal(l.variables, undefined);
+  assert.match(read('railway.login.toml'), /RAILWAY_DOCKERFILE_PATH=Dockerfile\.login/);
+  assert.match(read('daftra-login/server.mjs'), /path === '\/setup\/healthz'/);
+});
+
+test('login service import graph: every relative import resolves, and it never touches broker/ledger/approval code or the Daftra API key', () => {
+  const dir = join(root, 'daftra-login');
+  for (const f of readdirSync(dir).filter((n) => /\.mjs$/.test(n) && !/\.test(-helper)?\.mjs$/.test(n))) {
+    const src = read('daftra-login/' + f);
+    for (const m of src.matchAll(/from '(\.[^']+)'/g)) assert.ok(existsSync(resolve(dir, m[1])), f + ' imports a missing file: ' + m[1]);
+    assert.ok(!/daftra-(broker|write|ledger|proposal|approve|auth|operator-auth)/.test(src), f + ' must not import the financial broker code');
+    assert.ok(!/DAFTRA_API_KEY|DAFTRA_WRITE|APPROVAL_SECRET|BROKER_/.test(src), f + ' must not read any Daftra/broker credential');
+  }
+});

@@ -8,7 +8,7 @@
 //     a redirect to the same invoice's PDF/view path is followed (max 3), anything else is refused;
 //   * nothing is returned or thrown that contains a URL, path, cookie, hash or page content: only status / media type / redirect
 //     count / page class (daftra-pdf-diagnose.mjs).
-import { config, assertPdfBytes } from './daftra-readonly.mjs';
+import { tenantBase, assertPdfBytes } from './daftra-readonly.mjs';
 import { diagnosePdfResponse } from './daftra-pdf-diagnose.mjs';
 
 const MAX_PDF = 20 * 1024 * 1024;
@@ -34,10 +34,11 @@ async function readCapped(response, cap) {
 function problem(message, diagnostic, { expired = false } = {}) { return { kind: 'problem', message, diagnostic, expired }; }
 
 // Returns { kind: 'pdf', bytes, redirects } or { kind: 'problem', message, diagnostic, expired }.
-export async function fetchSessionPdf(id, { cookieHeader, env = process.env, fetcher = fetch } = {}) {
+// `userAgent` should be the one the session was created with (some PHP session configs bind the session to it).
+export async function fetchSessionPdf(id, { cookieHeader, env = process.env, fetcher = fetch, userAgent } = {}) {
   if (typeof id !== 'string' || !/^[1-9][0-9]{0,14}$/.test(id)) throw new Error('Invalid invoice id');
   if (typeof cookieHeader !== 'string' || !cookieHeader) throw new Error('No Daftra session');
-  const { base } = config(env);
+  const base = tenantBase(env);
   const host = base.hostname.toLowerCase();
   const allowedRedirect = new RegExp('^/(?:owner/)?invoices/(?:view|download|pdf|preview)/' + id + '(?:\\.pdf)?$');
   let last = null;
@@ -47,7 +48,7 @@ export async function fetchSessionPdf(id, { cookieHeader, env = process.env, fet
     for (;; hops++) {
       response = await fetcher(current, {
         method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(20000),
-        headers: { Cookie: cookieHeader, Accept: 'application/pdf,*/*;q=0.8', 'User-Agent': 'Mozilla/5.0 (compatible; BASHT-Broker/1.0)' },
+        headers: { Cookie: cookieHeader, Accept: 'application/pdf,*/*;q=0.8', 'User-Agent': typeof userAgent === 'string' && /^[\x20-\x7e]{10,300}$/.test(userAgent) ? userAgent : 'Mozilla/5.0 (compatible; BASHT-Broker/1.0)' },
       });
       if (!REDIRECT_STATUS.has(response.status)) break;
       try { await response.body?.cancel?.(); } catch { /* closed */ }
