@@ -57,11 +57,14 @@ Reports: ledger, trial_balance, income_statement, balance_sheet, tax_summary/tax
 
 Files are written only inside the private `$OPENCLAW_WORKSPACE_DIR/exports/` folder (created automatically, mode 0600).
 
-- **Official PDF first.** For an invoice always try `pdf <invoice-id> <name>.pdf` — this downloads Daftra's own PDF (`invoice_pdf_url`). Quotes, payments, expenses and reports have **no** official PDF in the API.
+- **Official PDF first.** For an invoice always try `pdf <invoice-id> $OPENCLAW_WORKSPACE_DIR/exports/<name>.pdf` — this downloads Daftra's own PDF (`invoice_pdf_url`). Quotes, payments, expenses and reports have **no** official PDF in the API.
+  - **Redirects (HTTP 301/302/303/307/308) are followed by the tool, never by you.** At most 3 hops; each hop must be HTTPS, DNS-named, default port, no embedded credentials, and on the tenant host, another `*.daftra.com` host, or an exact host the operator listed in `DAFTRA_PDF_REDIRECT_HOSTS`. Any other destination is refused *before* it is requested (`PDF redirect refused: untrusted destination host <host>`) — tell the operator that host if they want it allowed; do not work around it. **No hop ever carries the API key, `Authorization` or a cookie** (the document link authenticates itself). Error texts never include the link, path or hash.
+  - **Drafts:** the tool attempts the official PDF for drafts too and returns `draft: true`. Whether Daftra serves a draft PDF is Daftra's decision (not documented either way); if it refuses (HTTP 403/404, HTML, login redirect) the error says the invoice is a draft — report that plainly and do **not** substitute a generated PDF as "official". A draft PDF is not a posted tax invoice: say so.
+  - **iPhone download:** the result has `download_path` (`/setup/exports/<name>.pdf`). It is served by the gateway behind the setup password (Basic auth), `application/pdf`, inline (opens in Safari's PDF viewer → Share → Save to Files), no caching. Give the user only that path on the operator's own gateway domain; never a Daftra URL. If the channel tool can attach files, prefer attaching the file privately.
 - `export <entity> --format csv|json|xlsx|docx|pdf --out <name>.<format> [--columns a,b] [--query k=v]...` — complete data only.
 - `export-report <name> --format ... --out ... [--param k=v]...`, `export-statement <client-id> --from --to --format ... --out ...`.
 - A `pdf` produced by `export*` is a **generated summary**, labelled "not an official Daftra document". Never present it as the official invoice or send it as a tax document. DOCX is for editable letters/summaries only.
-- Passwords, tokens and hash-authenticated links (`*_url`) are stripped and cannot be exported. Never print or forward a Daftra PDF link.
+- Passwords, tokens and hash-authenticated links (`*_url`) are stripped and cannot be exported. Never print or forward a Daftra PDF link (it contains an access hash) or a redirect `Location`.
 - Deliver files only to the authorised user over the approved private channel. Do not claim a file was sent unless the channel tool confirmed it.
 
 ## 3. Financial operations — approval protocol (MANDATORY)

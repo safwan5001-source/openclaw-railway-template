@@ -309,19 +309,83 @@ export function assertPdfBytes(bytes) {
     throw new Error('Invalid, truncated or oversized PDF');
 }
 
-// Official Daftra PDF (the invoice's own `invoice_pdf_url`). Never fabricated locally.
+// ---- official PDF download: redirect-safe, key-less -------------------------------------------------------------------------
+// Daftra's `invoice_pdf_url` can answer 301/302/303/307/308. Every hop is validated BEFORE it is requested, and no hop ever carries
+// the API key, an Authorization header or a cookie (the document link is hash-authenticated by itself).
+const PDF_REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const MAX_PDF_REDIRECTS = 3;
+const HOSTNAME_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+// Operator extension for a redirect target that is not under daftra.com (e.g. a storage/CDN host): exact hostnames only.
+export function trustedPdfRedirectHosts(env = process.env) {
+  const out = new Set();
+  for (const raw of String(env.DAFTRA_PDF_REDIRECT_HOSTS ?? '').split(',')) {
+    const host = raw.trim().toLowerCase();
+    if (host && HOSTNAME_RE.test(host)) out.add(host);          // wildcards, IPs, ports, schemes never match
+  }
+  return out;
+}
+
+function hostLabel(url) { return String(url.hostname).replace(/[^a-z0-9.-]/gi, '?').slice(0, 80); }   // hostname only: never path or query (hash token)
+
+// Returns the validated absolute URL of the next hop or throws a message that never contains the link (it carries a hash token).
+export function assertPdfRedirectTarget(location, from, env = process.env) {
+  if (typeof location !== 'string' || !location || location.length > 4096 || /[\u0000-\u001f\u007f\\]/.test(location)) throw new Error('PDF redirect refused: invalid destination');
+  let next;
+  try { next = new URL(location, from); } catch { throw new Error('PDF redirect refused: invalid destination'); }
+  const { base } = config(env);
+  if (next.protocol !== 'https:') throw new Error('PDF redirect refused: destination is not HTTPS');
+  if (next.username || next.password) throw new Error('PDF redirect refused: destination carries credentials');
+  if (next.port !== '') throw new Error('PDF redirect refused: destination uses a non-standard port');
+  const host = next.hostname.toLowerCase();
+  if (!HOSTNAME_RE.test(host)) throw new Error('PDF redirect refused: destination is not a DNS hostname');   // IP literals, localhost, single labels
+  const trusted = host === base.hostname.toLowerCase() || host.endsWith('.daftra.com') || trustedPdfRedirectHosts(env).has(host);
+  if (!trusted) throw new Error('PDF redirect refused: untrusted destination host ' + hostLabel(next));
+  next.hash = '';
+  return next;
+}
+
+// GET the document URL, following only validated redirects. The request carries NO credentials of any kind.
+export async function fetchOfficialPdfResponse(url, { env = process.env, fetcher = fetch } = {}) {
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    const response = await fetcher(current, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(20000) });
+    if (!PDF_REDIRECT_STATUS.has(response.status)) return { response, redirects: hop };
+    try { await response.body?.cancel?.(); } catch { /* body already closed */ }
+    if (hop >= MAX_PDF_REDIRECTS) throw new Error('PDF download failed: too many redirects');
+    const location = response.headers?.get?.('location');
+    if (!location) throw new Error('PDF download failed: redirect without a destination (HTTP ' + response.status + ')');
+    current = assertPdfRedirectTarget(location, current, env);
+  }
+}
+
+export function invoiceIsDraft(invoice) {
+  const v = invoice?.data?.Invoice?.draft ?? invoice?.Invoice?.draft ?? invoice?.data?.draft;
+  return v === true || v === 1 || v === '1';
+}
+
+// Why a final response is not a usable PDF (null = usable). No URLs in the text.
+export function pdfResponseProblem(response, { draft = false } = {}) {
+  const note = draft ? ' (the invoice is a draft; Daftra may not serve an official PDF for drafts)' : '';
+  if (!response.ok) return 'PDF download failed (HTTP ' + response.status + ')' + note;
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) return 'Response is not PDF' + note;
+  return null;
+}
+
+// Official Daftra PDF (the invoice's own `invoice_pdf_url`). Never fabricated locally. Drafts are attempted too:
+// whether Daftra serves them is Daftra's decision, and the result says so instead of guessing.
 export async function downloadInvoicePdf(id, outPath, env = process.env, fetcher = fetch) {
   const invoice = await getInvoice(id, env, fetcher);
   const url = pdfUrl(invoice, env);
-  // The PDF link is hash-authenticated; never send the API key to a document URL.
-  const response = await fetcher(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(20000) });
-  if (!response.ok) throw new Error('PDF download failed (HTTP ' + response.status + ')');
-  const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) throw new Error('Response is not PDF');
+  const draft = invoiceIsDraft(invoice);
+  const { response, redirects } = await fetchOfficialPdfResponse(url, { env, fetcher });
+  const problem = pdfResponseProblem(response, { draft });
+  if (problem) throw new Error(problem);
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PDF_BYTES) throw new Error('PDF exceeds size limit');
   const bytes = new Uint8Array(await response.arrayBuffer());
   assertPdfBytes(bytes);
   await writeFile(resolve(outPath), bytes, { flag: 'wx', mode: 0o600 });
-  return { path: resolve(outPath), size: bytes.byteLength, source: 'daftra_official' };
+  return { path: resolve(outPath), size: bytes.byteLength, source: 'daftra_official', draft, redirects };
 }

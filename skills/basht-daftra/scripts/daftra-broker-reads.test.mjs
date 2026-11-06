@@ -179,7 +179,7 @@ test('INVOICE PDF through the broker: official bytes, downloaded WITHOUT the API
     ['not a .pdf path', { pdfUrl: TENANT + '/invoices/view/3?hash=x' }, 422, /same-tenant/],
     ['HTML disguised as PDF', { pdfResponse: new Response('<html>x</html>', { status: 200, headers: { 'content-type': 'text/html' } }) }, 502, /not PDF/],
     ['truncated PDF', { pdfResponse: new Response('%PDF-1.4 no trailer', { status: 200, headers: { 'content-type': 'application/pdf' } }) }, 502, /truncated|Invalid/],
-    ['redirect', { pdfResponse: new Response('', { status: 302, headers: { location: 'https://evil.example/x.pdf' } }) }, 502, /HTTP 302/],
+    ['redirect', { pdfResponse: new Response('', { status: 302, headers: { location: 'https://evil.example/x.pdf' } }) }, 502, /redirect refused/],
     ['oversize', { pdfResponse: new Response(Buffer.alloc(21 * 1024 * 1024, 0x25), { status: 200, headers: { 'content-type': 'application/pdf', 'content-length': String(21 * 1024 * 1024) } }) }, 502, /too large/],
   ]) {
     const f = new FakeDaftra(); const calls = scripted(f, pdfHandlers(extra));

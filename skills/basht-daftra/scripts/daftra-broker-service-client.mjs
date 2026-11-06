@@ -87,5 +87,5 @@ export async function downloadInvoicePdfViaBroker({ id, outPath, url, token, env
   const bytes = Buffer.from(reply.base64, 'base64');
   assertPdfBytes(new Uint8Array(bytes));
   await writeFile(outPath, bytes, { flag: 'wx', mode: 0o600 });
-  return { path: outPath, size: bytes.length, source: 'daftra_official' };
+  return { path: outPath, size: bytes.length, source: 'daftra_official', draft: reply.draft === true, redirects: Number.isInteger(reply.redirects) ? reply.redirects : 0 };
 }
