@@ -5,6 +5,8 @@ import { resolve } from 'node:path';
 import { ENTITIES, REPORTS, buildQuery, buildReportQuery, normalizeReportParams } from './daftra-entities.mjs';
 import { extractList, extractOne, extractPage, extractUnpaged } from './daftra-normalize.mjs';
 import { classifyFailure, summariseValidationErrors } from './daftra-errors.mjs';
+import { diagnosePdfResponse } from './daftra-pdf-diagnose.mjs';
+export { diagnosePdfResponse };
 
 const MAX_PDF_BYTES = 20 * 1024 * 1024;
 const MAX_JSON_BYTES = 50 * 1024 * 1024;
@@ -364,15 +366,18 @@ export function invoiceIsDraft(invoice) {
   return v === true || v === 1 || v === '1';
 }
 
-// Why a final response is not a usable PDF (null = usable). No URLs in the text.
-export function pdfResponseProblem(response, { draft = false, redirects = 0, landedOnLogin = false } = {}) {
+// Why a final response is not a usable PDF (null = usable). No URLs in the text. `page` comes from diagnosePdfResponse
+// (login | invoice_view | error | empty | not_html | unknown): a fixed vocabulary, never page content.
+export function pdfResponseProblem(response, { draft = false, redirects = 0, landedOnLogin = false, page } = {}) {
   const note = draft ? ' (the invoice is a draft; Daftra may not serve an official PDF for drafts)' : '';
-  if (!response.ok) return 'PDF download failed (HTTP ' + response.status + ')' + note;
+  const kind = page ?? (landedOnLogin ? 'login' : undefined);
+  if (!response.ok) return 'PDF download failed (HTTP ' + response.status + (kind ? ', page=' + kind : '') + ')' + note;
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
   if (!contentType.includes('application/pdf') && !contentType.includes('octet-stream')) {
-    // Diagnostics only: status, media type (no parameters), redirect count and whether the final hop was a login page. Never a URL.
+    // Diagnostics only: status, media type (no parameters), redirect count and page class. Never a URL or page content.
     const media = contentType.split(';')[0].trim().replace(/[^a-z0-9.+\/-]/g, '').slice(0, 60) || 'none';
-    return 'Response is not PDF [HTTP ' + response.status + ', ' + media + ', ' + redirects + ' redirect(s)' + (landedOnLogin ? ', ended on a login page: Daftra requires a signed-in session for this document' : '') + ']' + note;
+    return 'Response is not PDF [HTTP ' + response.status + ', ' + media + ', ' + redirects + ' redirect(s)' + (kind ? ', page=' + kind : '') + ']'
+      + (kind === 'login' ? ' Daftra requires a signed-in session for this document.' : '') + note;
   }
   return null;
 }
@@ -384,7 +389,8 @@ export async function downloadInvoicePdf(id, outPath, env = process.env, fetcher
   const url = pdfUrl(invoice, env);
   const draft = invoiceIsDraft(invoice);
   const { response, redirects, landedOnLogin } = await fetchOfficialPdfResponse(url, { env, fetcher });
-  const problem = pdfResponseProblem(response, { draft, redirects, landedOnLogin });
+  const diagnostic = await diagnosePdfResponse(response, { redirects, landedOnLogin });
+  const problem = diagnostic && pdfResponseProblem(response, { draft, redirects, landedOnLogin, page: diagnostic.page });
   if (problem) throw new Error(problem);
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PDF_BYTES) throw new Error('PDF exceeds size limit');

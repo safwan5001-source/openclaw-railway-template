@@ -461,6 +461,8 @@ export function createBrokerService(options = {}) {
       let result;
       try { result = await fetchInvoicePdf(id, { env: brokerEnv, fetcher }); }
       catch (e) { if (e instanceof BadRead) throw e; result = { status: 502, message: 'Upstream unreachable' }; }
+      // Operator-visible reason for a non-PDF answer: fixed fields only (never the link, hash, path or page content).
+      if (result.diagnostic) log({ evt: 'invoice_pdf_not_pdf', ...result.diagnostic, draft: result.draft === true });
       return jsonReply(res, 200, { ok: true, result }, { raw: true });
     } finally { getInflight--; }
   }
