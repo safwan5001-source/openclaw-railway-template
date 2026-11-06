@@ -3,6 +3,11 @@ name: BASHT Daftra integration checks
 # in-memory fake and temp directories; images are only BUILT locally on the runner (never pushed, no registry login).
 # Actions are pinned by major version; pinning to full commit SHAs is recommended for a hardened setup.
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'skills/basht-daftra/**'
+      - '.github/workflows/basht-daftra-ci.yml'
   pull_request:
     paths:
       - 'skills/basht-daftra/**'
