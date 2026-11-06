@@ -2,7 +2,7 @@
 // BASHT × Daftra command line. Every command prints ONE JSON document on stdout.
 // Errors print {"ok":false,"error":...} on stderr and exit 1. Secrets are never printed.
 //
-//   READ    capabilities | list <entity> | get <entity> <id> | report <name> | statement <client-id>
+//   READ    capabilities | list <entity> | get <entity> <id> | report <name> | statement <client-id> | reconcile-payments <client-id>
 //   FILES   pdf <invoice-id> <file.pdf> | export <entity> | export-report <name> | export-statement <client-id>
 //   WRITE   propose <type> | duplicate <source> <id> | show <proposal-id> | execute <proposal-id> | resolve <proposal-id>
 //           (propose/show are read-only; execute needs DAFTRA_WRITES_ENABLED=1 AND the exact approval phrase)
@@ -15,6 +15,7 @@ import { exportDaftraRecords, exportReport } from './daftra-export.mjs';
 import { exportData, FORMATS } from './daftra-exports.mjs';
 import { safeOutputPath, ensureExportsDir } from './daftra-paths.mjs';
 import { clientStatement } from './daftra-statements.mjs';
+import { reconcileClientPayments } from './daftra-reconcile.mjs';
 import { ACTION_TYPES } from './daftra-finance-preflight.mjs';
 import { createProposal } from './daftra-proposal.mjs';
 import { proposeDuplicate, DUP_SOURCES } from './daftra-duplicate.mjs';
@@ -110,7 +111,7 @@ async function forwardToService(command, a1, a2, flags, env) {
 const SERVICE_COMMANDS = new Set(['propose', 'duplicate', 'show', 'status', 'execute', 'resolve']);
 // Reads in service mode: the agent holds NO Daftra credential (Daftra roles are per entity, not per method, so a key that can
 // read can also write). Every GET goes through the broker's /v1/get; a real key that happens to be in the env is never used.
-const READ_COMMANDS = new Set(['list', 'get', 'report', 'statement', 'pdf', 'export', 'export-report', 'export-statement']);
+const READ_COMMANDS = new Set(['list', 'get', 'report', 'statement', 'reconcile-payments', 'pdf', 'export', 'export-report', 'export-statement']);
 const KEYLESS_PLACEHOLDER = 'keyless-service-mode-no-credential';
 const DAFTRA_CREDENTIAL_ENV = ['DAFTRA_API_KEY', 'DAFTRA_API_KEY_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE'];
 const OPERATOR_ONLY_ENV = ['DAFTRA_APPROVAL_SECRET', 'DAFTRA_APPROVAL_SECRET_FILE', 'DAFTRA_WRITE_API_KEY', 'DAFTRA_WRITE_API_KEY_FILE', 'DAFTRA_WRITES_ENABLED',
@@ -186,6 +187,10 @@ export async function run(argv, { env = process.env, fetcher = fetch, sleep, bro
     case 'statement': {
       if (!a1 || !flags.from || !flags.to) throw Error('Usage: statement <client-id> --from YYYY-MM-DD --to YYYY-MM-DD');
       return { ok: true, ...(await clientStatement({ clientId: a1, from: flags.from, to: flags.to }, env, fetcher, { sleep })) };
+    }
+    case 'reconcile-payments': {
+      if (!a1 || !flags.from || !flags.to) throw Error('Usage: reconcile-payments <client-id> --from YYYY-MM-DD --to YYYY-MM-DD');
+      return { ok: true, ...(await reconcileClientPayments({ clientId: a1, from: flags.from, to: flags.to }, env, fetcher, { sleep })) };
     }
     case 'pdf': {
       if (!a1 || !a2) throw Error('Usage: pdf <invoice-id> <file.pdf>');

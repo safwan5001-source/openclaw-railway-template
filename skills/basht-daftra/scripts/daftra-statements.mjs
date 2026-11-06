@@ -9,7 +9,7 @@ import { fetchAllRecords } from './daftra-readonly.mjs';
 import { isCalendarDate } from './daftra-entities.mjs';
 import { parseDecimal, format, ZERO } from './daftra-money.mjs';
 
-const money = (v, field) => {
+export const money = (v, field) => {
   // Daftra returns amounts as numbers or strings, possibly negative for refunds/credits.
   const s = String(v ?? '0').trim();
   const neg = s.startsWith('-');
