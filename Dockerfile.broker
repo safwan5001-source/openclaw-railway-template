@@ -1,0 +1,45 @@
+# BASHT x Daftra approval BROKER — a SEPARATE Railway service (not the OpenClaw container).
+#
+# Purpose: hold the write-capable Daftra key, the approval secret and the proposal/ledger state OUTSIDE the
+# agent's trust domain. The OpenClaw service never receives any of them.
+# Not applied by this repo: building/deploying it is an explicit owner action (see docs/DAFTRA_PACKAGING_NOTES.md).
+#
+# Railway wiring (no shell needed): on the NEW broker service set the variable
+#   RAILWAY_DOCKERFILE_PATH=Dockerfile.broker
+# The repo-root railway.toml has no dockerfilePath, so this variable selects this file; the root healthcheck
+# (/setup/healthz) is also answered by the broker. railway.broker.toml is an optional reference only.
+#
+# Contents: Node + the zero-dependency skill scripts. NO OpenClaw, NO Chromium, NO Homebrew, NO Python, NO compilers,
+# NO secrets/ENV keys baked in: every secret arrives as a service variable at run time.
+FROM node:26-bookworm-slim
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gosu \
+    tini \
+  && rm -rf /var/lib/apt/lists/*
+
+# Unprivileged runtime user (the entrypoint starts as root only to prepare the volume, then drops to it).
+RUN groupadd --system --gid 10001 broker \
+  && useradd --system --uid 10001 --gid broker --no-create-home --shell /usr/sbin/nologin broker
+
+WORKDIR /app
+# Only the skill scripts (tests are excluded by .dockerignore).
+COPY skills/basht-daftra/scripts ./scripts
+COPY --chmod=755 broker-entrypoint.sh /usr/local/bin/broker-entrypoint.sh
+
+# Public operator console port. The PRIVATE agent API (BROKER_PRIVATE_PORT, default 8081) is intentionally NOT
+# EXPOSEd and must never get a public domain.
+ENV PORT=8080
+ENV BROKER_PRIVATE_PORT=8081
+ENV BROKER_STATE_DIR=/broker-data
+EXPOSE 8080
+
+# Health probe via node (no curl in the image). Hits the public listener only.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+
+# Root only until the entrypoint has fixed the volume ownership; it then exec's node as the `broker` user.
+USER root
+ENTRYPOINT ["tini", "--", "/usr/local/bin/broker-entrypoint.sh"]

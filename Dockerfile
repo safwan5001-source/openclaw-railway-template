@@ -1,3 +1,7 @@
+# OpenClaw service image.
+# SECURITY BOUNDARY: this image (and its entrypoints) must never contain or receive any BASHT/Daftra broker secret
+# (DAFTRA_APPROVAL_SECRET, write-capable DAFTRA_* keys, BROKER_* state or tokens). Those live ONLY in the separate
+# broker service (Dockerfile.broker). Enforced by scripts/check-dockerfiles.mjs.
 FROM node:26-bookworm
 
 RUN apt-get update \
@@ -28,8 +32,12 @@ RUN apt-get update \
     libxrandr2 \
     libatspi2.0-0 \
     chromium \
+    fontconfig \
+    fonts-noto-core \
   && command -v chromium \
   && chromium --version \
+  && fc-cache -f \
+  && fc-match 'Noto Naskh Arabic' | grep -qi 'NotoNaskhArabic' \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g \
@@ -46,7 +54,10 @@ RUN npm install -g pnpm@11.24.0 \
   && pnpm install --frozen-lockfile --prod
 
 COPY src ./src
+# Self-contained BASHT Daftra skill; entrypoint.sh syncs it into the persistent workspace at boot (skill-sync.sh).
+COPY skills ./skills
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
+COPY --chmod=755 skill-sync.sh ./skill-sync.sh
 
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \

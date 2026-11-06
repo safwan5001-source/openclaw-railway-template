@@ -1,0 +1,18 @@
+# OPTIONAL REFERENCE ONLY — not required and not relied on.
+#
+# PRIMARY wiring for the broker service (stable, per Railway's Dockerfile docs, https://docs.railway.com/builds/dockerfiles):
+# set the service VARIABLE  RAILWAY_DOCKERFILE_PATH=Dockerfile.broker . The repo-root railway.toml has no
+# dockerfilePath, so the variable selects Dockerfile.broker, and the root healthcheck (/setup/healthz) is answered
+# by the broker as well as /healthz.
+#
+# Railway's docs mark "Config as Code" files as deprecated in favour of Infrastructure as Code (legacy services keep
+# working until 2026-12-01; https://docs.railway.com/reference/config-as-code). This file only documents the same
+# settings for anyone who prefers a per-service config file. It holds NO variables and NO secrets.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.broker"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"

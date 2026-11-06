@@ -1,0 +1,117 @@
+name: BASHT Daftra integration checks
+# No Daftra credentials, no Railway access and no deployment exist anywhere in this workflow: every test uses an
+# in-memory fake and temp directories; images are only BUILT locally on the runner (never pushed, no registry login).
+# Actions are pinned by major version; pinning to full commit SHAs is recommended for a hardened setup.
+on:
+  pull_request:
+    paths:
+      - 'skills/basht-daftra/**'
+      - 'src/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'Dockerfile.*'
+      - 'entrypoint.sh'
+      - 'broker-entrypoint.sh'
+      - 'skill-sync.sh'
+      - 'railway.toml'
+      - 'railway.broker.toml'
+      - '.dockerignore'
+      - 'docs/DAFTRA_*.md'
+      - 'package.json'
+      - '.github/workflows/basht-daftra-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: basht-daftra-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  daftra-tests:
+    name: daftra-tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['24', '26']          # OpenClaw 2026.10.9 supports >=24.22.1 <25 || >=26.12.1; production image is Node 26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Independent readers used by the export tests to prove the XLSX/DOCX files really open (no repo code, test-time only).
+      - name: Install reader libraries for export validation
+        run: python3 -m pip install --disable-pip-version-check openpyxl python-docx
+      - name: Node version
+        run: node --version
+      - name: Node tests (wrapper + Daftra skill, offline fakes only)
+        run: node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
+      - name: Skill frontmatter is valid and self-contained
+        run: |
+          node -e "
+          const t=require('fs').readFileSync('skills/basht-daftra/SKILL.md','utf8');
+          const m=t.match(/^---\n([\s\S]*?)\n---/); if(!m) throw Error('no frontmatter');
+          if(!/^name: basht-daftra$/m.test(m[1])) throw Error('name');
+          if(!/^description: /m.test(m[1])) throw Error('description');
+          if(/\.\.\/\.\.\/src|\bsrc\/daftra/.test(t)) throw Error('SKILL.md references repo paths outside the skill bundle');
+          console.log('frontmatter ok');"
+          ! grep -rEn "from '\.\./|require\('\.\./" skills/basht-daftra/scripts/*.mjs
+
+  dockerfile-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Static Dockerfile / entrypoint / Railway-config invariants
+        run: node --test scripts/check-dockerfiles.mjs
+      - name: Entrypoint simulations (skill-sync.sh, broker-entrypoint.sh) in temp roots
+        run: node --test scripts/test-entrypoint.mjs
+      - name: shellcheck (all shell scripts)
+        run: shellcheck -S warning entrypoint.sh broker-entrypoint.sh skill-sync.sh scripts/*.sh
+      - name: Dockerfile lint (docker build --check, no build, no network)
+        run: |
+          docker build --check -f Dockerfile .
+          docker build --check -f Dockerfile.broker .
+
+  broker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the broker image (build only; no push, no registry login)
+        run: docker build -f Dockerfile.broker -t basht-broker-ci .
+      - name: Smoke-run with FAKE env on loopback (healthz, public/private separation, non-root, writes disabled)
+        run: bash scripts/smoke-broker-image.sh basht-broker-ci
+
+  pdf-rtl:
+    # Runs the offline Arabic/RTL PDF test inside the SAME apt/font layer the OpenClaw Dockerfile installs
+    # (Debian chromium + fonts-noto-core), so it proves the font set Railway would ship; EXPECT_NOTO=1 demands Noto Naskh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Dockerfile's font/Chromium layer and run the RTL test in it
+        run: RUN_RTL_TEST=1 bash scripts/check-font-layer.sh
+
+  openclaw-skill-eligibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install the PINNED OpenClaw (same version as the Dockerfile), scripts disabled
+        run: |
+          mkdir -p "$RUNNER_TEMP/oc" && cd "$RUNNER_TEMP/oc"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9
+          node node_modules/openclaw/openclaw.mjs --version
+      - name: Skill is discovered as a workspace skill; eligible only when DAFTRA_* env is present
+        run: bash scripts/verify-skill-eligibility.sh "$RUNNER_TEMP/oc"
