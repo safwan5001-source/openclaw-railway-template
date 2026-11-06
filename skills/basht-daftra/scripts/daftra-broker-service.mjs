@@ -697,8 +697,21 @@ export function createBrokerService(options = {}) {
       if (method === 'POST') {
         let form; try { form = await readForm(req); } catch (e) { return textReply(res, e.status ?? 400, 'Bad request'); }
         if (!sameOrigin(req)) {
-          log({ level: 'warn', msg: 'operator enrollment rejected: origin policy', originPresent: typeof req.headers.origin === 'string',
-            sameSiteBrowserMetadata: req.headers['sec-fetch-site'] === 'same-origin' });
+          let originInfo = { originValidUrl: false, originHostMatchesConfigured: false, originSchemeHttps: false, requestHostMatchesConfigured: false };
+          try {
+            const configUrl = new URL(env.BROKER_PUBLIC_ORIGIN);
+            const originUrl = new URL(String(req.headers.origin ?? ''));
+            originInfo = {
+              originValidUrl: true,
+              originHostMatchesConfigured: originUrl.host === configUrl.host,
+              originSchemeHttps: originUrl.protocol === 'https:',
+              requestHostMatchesConfigured: req.headers.host === configUrl.host,
+            };
+          } catch { /* record only booleans, never raw attacker-controlled headers */ }
+          log({ level: 'warn', msg: 'operator enrollment rejected: origin policy',
+            originPresent: typeof req.headers.origin === 'string',
+            sameSiteBrowserMetadata: req.headers['sec-fetch-site'] === 'same-origin',
+            ...originInfo });
           return textReply(res, 403, 'Forbidden');
         }
         if (!auth.consumePre(form.get('pre'))) {
