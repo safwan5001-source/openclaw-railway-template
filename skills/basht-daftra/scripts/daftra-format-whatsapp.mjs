@@ -163,7 +163,10 @@ function waList(entity, result, w, view, rows) {
   const out = [w.ln('📋 ' + w.b(title) + ' — ' + how)];
   if (!complete) out.push(w.ln('⚠️ ' + t.incomplete));
   if (!records.length) return [...out, w.ln(t.none)];
-  if (spec?.amounts) out.push(...moneyBlock(w, records, spec, complete));
+  // A "last N" reply shows only the requested rows: totals and status counts are computed over the shown rows only when
+  // every record is displayed, so a partial list never carries a grand total or full-set statistics.
+  const partial = records.length > shown.length;
+  if (spec?.amounts && !partial) out.push(...moneyBlock(w, records, spec, complete));
   shown.forEach((rec) => out.push('', ...render(w, rec, { full: view === 'detail' })));
   if (records.length > shown.length) out.push('', w.ln('ℹ️ ' + ltr(w.c, String(shown.length)) + ' / ' + ltr(w.c, n) + ' — ' + t.moreRows));
   return out;
