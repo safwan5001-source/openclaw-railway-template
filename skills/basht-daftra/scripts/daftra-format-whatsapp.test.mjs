@@ -96,7 +96,7 @@ test('financial status is shown only when the record proves it; anything else is
 
 test('incomplete lists are labelled a sample, never a full report', () => {
   const s = wa('invoices', many(8), { complete: false, total: 80 });
-  assert.match(s, /عيّنة/); assert.match(s, /صفحة واحدة فقط/); assert.match(s, /إجماليات العيّنة المعروضة فقط/);
+  assert.match(s, /عيّنة/); assert.match(s, /صفحة واحدة فقط/); assert.ok(!s.includes('إجماليات العيّنة المعروضة فقط'), 'a partial list carries no totals');
   assert.ok(!wa('invoices', many(8)).includes('صفحة واحدة فقط'));
   assert.equal(renderWhatsAppCliResult('list', 'invoices', list('invoices', many(2), { complete: false })).complete, false);
 });
@@ -237,4 +237,15 @@ test('CLI --render whatsapp is read-only and strict about flags', () => {
   assert.deepEqual(renderOptions(['statement', '5', '--render', 'whatsapp', '--lang', 'en', '--view', 'detail']), { channel: 'whatsapp', lang: 'en', view: 'detail' });
   assert.deepEqual(renderOptions(['list', 'invoices', '--render', 'en']), { lang: 'en', view: 'summary' });
   assert.equal(renderOptions(['list', 'invoices']), null);
+});
+
+test('"last N" lists show only the requested rows: no grand total and no full-set status counts', () => {
+  const s = wa('invoices', many(8));
+  assert.match(s, /آخر|Last/);
+  assert.equal((s.match(/\*\*?INV-|INV-\d/g) ?? []).length, 5, 'only the 5 requested rows are shown');
+  assert.ok(!/💰 \*الإجمالي/.test(s), 'no grand total line for a partial list: ' + s);
+  assert.ok(!/مدفوعة\s*\u2066?8/.test(s), 'no full-set status counts: ' + s);
+  assert.ok(!s.includes('إجماليات العيّنة'), 'no totals line for a partial list');
+  // A complete list that fits in the requested rows still carries its totals.
+  assert.match(wa('invoices', many(3)), /💰 \*الإجمالي/);
 });
