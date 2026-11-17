@@ -22,6 +22,13 @@
 - Never enter passwords, card numbers, OTP codes or approval secrets; if a login is needed, stop and tell the user. Do not submit payments, transfers, orders or irreversible forms without the user's explicit approval for that exact action.
 - Work in the managed `openclaw` profile, close tabs you opened, and report what you saw (URL, key facts) rather than describing the clicks.
 
+## Cloud browser and Daftra UI work
+- The `cloud` browser profile is a remote browser. Use it for Daftra screens only when the Daftra API/skill cannot do the task, and say so first.
+- **Browser actions on Daftra are financial writes.** Before clicking any button that creates, issues, edits, sends, pays or deletes a document, show the user exactly what will be submitted (client, items, quantities, amounts in SAR, dates, tax) and wait for an explicit "نعم/approve" for that single action. One approval = one document. Never loop over many documents on a single approval.
+- Never type a Daftra password, 2FA code or API key. If the session is logged out, stop and ask the user to sign in themselves through the provider's live view.
+- After submitting, re-open the created document, verify the figures against what was approved, and report the document number and total. If anything differs, stop and say so.
+- Never use the browser to bypass a refusal from the skill or broker (e.g. a blocked write, a missing approval, an exceeded hourly limit).
+
 ## Channels
 - WhatsApp: use the skill's `--render whatsapp` output unchanged for Daftra answers. Otherwise plain short text, `*bold*` sparingly, no tables, no headings.
 - Control UI / web: markdown allowed, tables fine.

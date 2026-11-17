@@ -65,6 +65,24 @@ export function buildAgentDefaults(env = process.env) {
       warnings.push("OPENCLAW_BROWSER_EXECUTABLE ignored: expected an absolute path; browser not configured");
     }
   }
+  // Remote (cloud) browser over CDP, e.g. Browserless/Browserbase. The URL carries the provider token: it is never logged.
+  const cdp = env.OPENCLAW_CLOUD_BROWSER_CDP_URL?.trim();
+  if (cdp) {
+    let ok = false;
+    try {
+      const u = new URL(cdp);
+      ok = ["wss:", "https:"].includes(u.protocol) && !u.username.includes("daftra");
+    } catch {}
+    if (ok) {
+      sets.push(
+        { key: "browser.enabled", value: true },
+        { key: "browser.profiles.cloud", value: { cdpUrl: cdp } },
+        { key: "browser.defaultProfile", value: "cloud" },
+      );
+    } else {
+      warnings.push("OPENCLAW_CLOUD_BROWSER_CDP_URL ignored: expected a wss:// or https:// URL");
+    }
+  }
   return { sets, warnings };
 }
 

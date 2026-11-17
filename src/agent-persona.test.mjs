@@ -81,3 +81,20 @@ test('browser defaults are opt-in and validated', () => {
   assert.deepEqual(bad.sets, []);
   assert.equal(bad.warnings.length, 1);
 });
+
+test('cloud browser profile is opt-in, validated and becomes default', () => {
+  const url = 'wss://production-sfo.browserless.io?token=abc';
+  const m = buildAgentDefaults({ OPENCLAW_BROWSER: '1', OPENCLAW_CLOUD_BROWSER_CDP_URL: url }).sets;
+  assert.deepEqual(m.find((x) => x.key === 'browser.profiles.cloud').value, { cdpUrl: url });
+  assert.equal(m.filter((x) => x.key === 'browser.defaultProfile').at(-1).value, 'cloud');
+  const bad = buildAgentDefaults({ OPENCLAW_CLOUD_BROWSER_CDP_URL: 'http://x' });
+  assert.deepEqual(bad.sets, []);
+  assert.equal(bad.warnings.length, 1);
+});
+
+test('applyAgentDefaults never logs the cloud browser URL', async () => {
+  const lines = [];
+  const l = { info: (_c, m) => lines.push(m), warn: (_c, m) => lines.push(m) };
+  await applyAgentDefaults(async () => ({ code: 0 }), { OPENCLAW_CLOUD_BROWSER_CDP_URL: 'wss://h.io?token=SECRET' }, l);
+  assert.ok(lines.length && !lines.join('\n').includes('SECRET'));
+});
