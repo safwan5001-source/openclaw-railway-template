@@ -98,3 +98,11 @@ test('applyAgentDefaults never logs the cloud browser URL', async () => {
   await applyAgentDefaults(async () => ({ code: 0 }), { OPENCLAW_CLOUD_BROWSER_CDP_URL: 'wss://h.io?token=SECRET' }, l);
   assert.ok(lines.length && !lines.join('\n').includes('SECRET'));
 });
+
+test('cloud browser URL check is protocol-only (userinfo is not special-cased)', () => {
+  const ok = buildAgentDefaults({ OPENCLAW_CLOUD_BROWSER_CDP_URL: 'wss://daftra-user:pw@h.example.io/?t=1' }).sets;
+  assert.ok(ok.some((x) => x.key === 'browser.profiles.cloud'));
+  for (const u of ['http://h.io', 'ws://h.io', 'ftp://h.io', 'not a url']) {
+    assert.deepEqual(buildAgentDefaults({ OPENCLAW_CLOUD_BROWSER_CDP_URL: u }).sets, [], u);
+  }
+});

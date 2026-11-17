@@ -71,7 +71,7 @@ export function buildAgentDefaults(env = process.env) {
     let ok = false;
     try {
       const u = new URL(cdp);
-      ok = ["wss:", "https:"].includes(u.protocol) && !u.username.includes("daftra");
+      ok = ["wss:", "https:"].includes(u.protocol);
     } catch {}
     if (ok) {
       sets.push(
