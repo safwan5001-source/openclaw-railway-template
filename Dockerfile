@@ -34,6 +34,7 @@ RUN apt-get update \
     chromium \
     fontconfig \
     fonts-noto-core \
+    ffmpeg \
   && command -v chromium \
   && chromium --version \
   && fc-cache -f \
