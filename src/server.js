@@ -13,6 +13,7 @@ import {
   describeGatewayHealth,
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
+import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
@@ -493,6 +494,18 @@ async function ensureGatewayRunning() {
     gatewayStarting = (async () => {
       await syncTrustedProxies();
       await syncAllowedOrigins();
+      try {
+        const seeded = seedPersonaFiles(WORKSPACE_DIR);
+        if (seeded.created.length) log.info("persona", `seeded ${seeded.created.join(", ")}`);
+        if (seeded.errors.length) log.warn("persona", seeded.errors.join("; "));
+        await applyAgentDefaults(
+          (args) => runCmd(OPENCLAW_NODE, clawArgs(args)),
+          process.env,
+          log,
+        );
+      } catch (err) {
+        log.warn("persona", `skipped: ${err.message}`);
+      }
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
       if (!ready) {
