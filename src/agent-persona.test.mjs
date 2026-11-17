@@ -68,3 +68,16 @@ test('applyAgentDefaults runs config set per key and tolerates failures', async 
   assert.deepEqual(calls[0], ['config', 'set', '--json', 'agents.defaults.model.primary', '"anthropic/claude-sonnet-5-5"']);
   assert.equal(keys.length, 2);
 });
+
+test('browser defaults are opt-in and validated', () => {
+  assert.deepEqual(buildAgentDefaults({}).sets, []);
+  const on = buildAgentDefaults({ OPENCLAW_BROWSER: '1' }).sets;
+  const m = Object.fromEntries(on.map((x) => [x.key, x.value]));
+  assert.deepEqual(m, {
+    'browser.enabled': true, 'browser.headless': true, 'browser.noSandbox': true,
+    'browser.defaultProfile': 'openclaw', 'browser.executablePath': '/usr/bin/chromium',
+  });
+  const bad = buildAgentDefaults({ OPENCLAW_BROWSER: '1', OPENCLAW_BROWSER_EXECUTABLE: '/usr/../bin/x; id' });
+  assert.deepEqual(bad.sets, []);
+  assert.equal(bad.warnings.length, 1);
+});

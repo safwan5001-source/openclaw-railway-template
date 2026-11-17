@@ -10,6 +10,8 @@ export const PERSONA_FILES = ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md"];
 
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,120}$/;
 const THINKING_RE = /^[a-z]{2,10}$/;
+const EXEC_RE = /^\/[A-Za-z0-9._/-]{1,120}$/;
+export const DEFAULT_CHROMIUM = "/usr/bin/chromium"; // installed by the Dockerfile (apt chromium)
 
 /** Copy missing persona files into the workspace. Existing files (even empty) and symlinks are left alone. */
 export function seedPersonaFiles(workspaceDir, { sourceDir = PERSONA_DIR, disabled = process.env.OPENCLAW_PERSONA_SEED === "0" } = {}) {
@@ -47,6 +49,21 @@ export function buildAgentDefaults(env = process.env) {
   if (thinking) {
     if (THINKING_RE.test(thinking)) sets.push({ key: "agents.defaults.thinkingDefault", value: thinking });
     else warnings.push("OPENCLAW_THINKING_DEFAULT ignored: expected a level such as off|low|medium|high");
+  }
+  // Managed headless browser for the agent's `browser` tool (container: headless, no sandbox as non-root).
+  if (env.OPENCLAW_BROWSER?.trim() === "1") {
+    const exe = env.OPENCLAW_BROWSER_EXECUTABLE?.trim() || DEFAULT_CHROMIUM;
+    if (EXEC_RE.test(exe) && !exe.includes("..")) {
+      sets.push(
+        { key: "browser.enabled", value: true },
+        { key: "browser.headless", value: true },
+        { key: "browser.noSandbox", value: true },
+        { key: "browser.defaultProfile", value: "openclaw" },
+        { key: "browser.executablePath", value: exe },
+      );
+    } else {
+      warnings.push("OPENCLAW_BROWSER_EXECUTABLE ignored: expected an absolute path; browser not configured");
+    }
   }
   return { sets, warnings };
 }
