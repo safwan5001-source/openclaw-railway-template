@@ -73,3 +73,17 @@ For a full accounting deliverable: executive summary; entity and source; period/
 - Critical reconciliations tied to GL or disclosed unsupported.
 - No write, third-party delivery or security change without required explicit authorization.
 - Outstanding tasks/limitations disclosed; no claim of certification or audit opinion.
+
+## Owner-approved Daftra retrieval procedure (2026-11-19)
+Use this only to read or download Daftra records through the cloud browser. It never creates, edits or deletes anything.
+- Browser profile: `steel-daftra` only. Do not use `browserbase` or the old `daftra` profile (both are retired).
+- Single account URL: `https://nepras.daftra.com`. The login is kept by the cloud browser; do not ask for credentials. If a login page appears, stop and tell the owner.
+- Read/download only: no create, edit or delete of invoices or other records without an explicit owner command.
+- Downloading an invoice PDF:
+  1. Open the invoice from the interface, then click the PDF link inside the page (for example `/owner/invoices/preview/<id>.pdf`). Do not `goto` the PDF URL directly: it fails with "Download is starting".
+  2. Wait about 5 seconds, then in the workspace run `curl -s http://basht-steel-bridge.railway.internal:8080/files/daftra` (lists PDFs saved by the cloud browser; no token is needed on the private network).
+  3. Pick the newest entry whose name carries the requested invoice number (`TAX_Invoice-<number>.pdf`), copy its `download` value exactly, and run `curl -s -o <name>.pdf "http://basht-steel-bridge.railway.internal:8080<download>"`.
+  4. Verify: `file` reports PDF, the content starts with `%PDF-`, the size is plausible, and the name carries the invoice number. A tiny file or JSON content is an error, not a PDF.
+  5. Send it as a WhatsApp attachment, then delete the local copy. Say that the invoice number was matched by file name when the text could not be read.
+  6. If the download fails, retry once, then report to the owner.
+- Close the browser after sending. The session also ends by itself after 3 minutes without commands and has a hard cap of 12 minutes.
