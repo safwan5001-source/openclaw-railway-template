@@ -16,4 +16,7 @@ ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 /app/skill-sync.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw \
   || echo "[entrypoint] skill sync skipped (see message above); OpenClaw starts normally" >&2
 
+/app/skill-sync.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw basht-accounting \
+  || echo "[entrypoint] accounting skill sync skipped (see message above); OpenClaw starts normally" >&2
+
 exec gosu openclaw node src/server.js
