@@ -1,7 +1,7 @@
 #!/bin/bash
-# Idempotently install the self-contained basht-daftra skill into the persistent OpenClaw workspace.
-#   skill-sync.sh <skills-source-dir> <workspace-dir> <owner user:group | ->
-# Copies <skills-source-dir>/basht-daftra -> <workspace-dir>/skills/basht-daftra:
+# Idempotently install a supported BASHT skill into the persistent OpenClaw workspace.
+#   skill-sync.sh <skills-source-dir> <workspace-dir> <owner user:group | -> [basht-daftra|basht-accounting]
+# Copies the selected skill into <workspace-dir>/skills/<name>:
 #   - everything else in the workspace is left untouched; unchanged content is not rewritten;
 #   - symlinks are never followed or copied (a symlink anywhere on the path or in the source => refuse);
 #   - the new tree is staged next to the target and swapped in with renames, so the target is always either the
@@ -12,9 +12,10 @@ set -euo pipefail
 SRC_ROOT="${1:?usage: skill-sync.sh <skills-source-dir> <workspace-dir> <owner|->}"
 WS="${2:?workspace dir required}"
 OWNER="${3:--}"
-NAME=basht-daftra
+NAME="${4:-basht-daftra}"
 say() { echo "[skill-sync] $*" >&2; }
 die() { say "refusing: $*"; exit 1; }
+case "$NAME" in basht-daftra|basht-accounting) ;; *) die "unsupported skill name" ;; esac
 
 [ -d "$SRC_ROOT" ] || { say "no skills directory at $SRC_ROOT; nothing to do"; exit 0; }
 SRC="$SRC_ROOT/$NAME"
