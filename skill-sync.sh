@@ -12,7 +12,8 @@ set -euo pipefail
 SRC_ROOT="${1:?usage: skill-sync.sh <skills-source-dir> <workspace-dir> <owner|->}"
 WS="${2:?workspace dir required}"
 OWNER="${3:--}"
-NAME=basht-daftra
+NAME="${4:-basht-daftra}"
+case "$NAME" in basht-daftra|basht-accounting) ;; *) die "unsupported skill name" ;; esac
 say() { echo "[skill-sync] $*" >&2; }
 die() { say "refusing: $*"; exit 1; }
 
