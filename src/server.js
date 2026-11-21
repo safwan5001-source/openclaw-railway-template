@@ -9,11 +9,21 @@ import { pathToFileURL } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
 import {
+  authenticateSetupRequest,
+  createFailureLimiter,
+  createRequireSetupAuth,
+  mayInjectGatewayToken,
+  rejectCrossSiteRequests,
+  setupSecurityHeaders,
+} from "./setup-auth.js";
+import {
   canServeGatewayRequest,
   describeGatewayHealth,
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
+import { registerBackupRoute } from "./backup.js";
+import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
@@ -26,6 +36,8 @@ const WORKSPACE_DIR =
   path.join(STATE_DIR, "workspace");
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+// The gateway, the agent's tools and every CLI child inherit process.env: the admin password must not travel with it.
+delete process.env.SETUP_PASSWORD;
 
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
@@ -379,11 +391,41 @@ async function probeGatewayOnce(opts = {}) {
   return { ok: false, endpoint: null };
 }
 
+// Maintenance lock: while a backup or an import holds the gateway down, nothing may start it (proxied requests,
+// WebSocket reconnects, the auto-restart timer). Otherwise a request arriving mid-snapshot or mid-swap would restart the
+// gateway and let it write to the databases / WhatsApp session that are being copied or replaced.
+let gatewayPausedFor = null;
+
+async function pauseGateway(reason) {
+  if (gatewayPausedFor) throw new Error(`gateway is already paused for ${gatewayPausedFor}`);
+  gatewayPausedFor = reason;
+  // A start already in flight sees the lock, stops waiting and settles; then the process is stopped.
+  try {
+    await gatewayStarting;
+  } catch {}
+  try {
+    await stopGatewayProcess();
+  } catch (err) {
+    gatewayPausedFor = null;
+    throw err;
+  }
+}
+
+async function resumeGateway() {
+  gatewayPausedFor = null;
+  gatewayRestartCount = 0;
+  return ensureGatewayRunning();
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
+    if (gatewayPausedFor) {
+      log.info("gateway", `start abandoned: paused for ${gatewayPausedFor}`);
+      return false;
+    }
     const probe = await probeGatewayOnce();
     if (probe.ok) {
       log.info("gateway", `ready at ${probe.endpoint}`);
@@ -397,6 +439,7 @@ async function waitForGatewayReady(opts = {}) {
 
 async function startGateway() {
   if (gatewayProc) return;
+  if (gatewayPausedFor) throw new Error(`Gateway is paused for ${gatewayPausedFor}`);
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -484,6 +527,7 @@ async function startGateway() {
 }
 
 async function ensureGatewayRunning() {
+  if (gatewayPausedFor) throw new Error(`Gateway is paused for ${gatewayPausedFor}`);
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
   const probe = await probeGatewayOnce();
@@ -509,7 +553,9 @@ async function ensureGatewayRunning() {
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
       if (!ready) {
-        throw new Error("Gateway did not become ready in time");
+        throw new Error(
+          gatewayPausedFor ? `Gateway start cancelled: paused for ${gatewayPausedFor}` : "Gateway did not become ready in time",
+        );
       }
     })().finally(() => {
       gatewayStarting = null;
@@ -533,68 +579,25 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
-const setupRateLimiter = {
-  attempts: new Map(),
-  windowMs: 60_000,
-  maxAttempts: 50,
-  cleanupInterval: setInterval(function () {
-    const now = Date.now();
-    for (const [ip, data] of setupRateLimiter.attempts) {
-      if (now - data.windowStart > setupRateLimiter.windowMs) {
-        setupRateLimiter.attempts.delete(ip);
-      }
-    }
-  }, 60_000),
-
-  isRateLimited(ip) {
-    const now = Date.now();
-    const data = this.attempts.get(ip);
-    if (!data || now - data.windowStart > this.windowMs) {
-      this.attempts.set(ip, { windowStart: now, count: 1 });
-      return false;
-    }
-    data.count++;
-    return data.count > this.maxAttempts;
-  },
+// Failed-login throttling (per client and global); successful requests are never counted. See src/setup-auth.js.
+const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || "";
+const setupLoginLimiter = createFailureLimiter();
+const setupLimiterSweep = setInterval(() => setupLoginLimiter.sweep(), 60_000);
+setupLimiterSweep.unref();
+const setupAuthOptions = {
+  password: SETUP_PASSWORD,
+  limiter: setupLoginLimiter,
+  railwayPublicDomain: RAILWAY_PUBLIC_DOMAIN,
 };
-
-function requireSetupAuth(req, res, next) {
-  if (!SETUP_PASSWORD) {
-    return res
-      .status(500)
-      .type("text/plain")
-      .send(
-        "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
-      );
-  }
-
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
-  if (setupRateLimiter.isRateLimited(ip)) {
-    return res.status(429).type("text/plain").send("Too many requests. Try again later.");
-  }
-
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
-  if (!isValid) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
-  }
-  return next();
-}
+const requireSetupAuth = createRequireSetupAuth(setupAuthOptions);
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+// Admin surface: anti-framing/no-store headers and a same-origin check on every state-changing request (CSRF).
+app.use(["/setup", "/logs"], setupSecurityHeaders, rejectCrossSiteRequests({ railwayPublicDomain: RAILWAY_PUBLIC_DOMAIN }));
+// JSON parsing only for the wrapper's own API: a global parser would consume the body of proxied gateway requests
+// (e.g. JSON /hooks/* webhooks), which then reach the gateway empty and time out.
+app.use("/setup", express.json({ limit: "1mb" }));
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
@@ -1467,57 +1470,50 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
     .json({ ok: result.code === 0, output: result.output });
 });
 
-app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const zipName = `openclaw-export-${timestamp}.zip`;
-  const tmpZip = path.join(os.tmpdir(), zipName);
+// Streaming export (src/export-stream.js): starts sending at once, no temp file, one at a time, stops with the client.
+registerStreamingExport(app, requireSetupAuth, {
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  password: SETUP_PASSWORD,
+  log,
+});
 
-  try {
-    const dirsToExport = [];
-    if (fs.existsSync(STATE_DIR)) dirsToExport.push(STATE_DIR);
-    if (fs.existsSync(WORKSPACE_DIR)) dirsToExport.push(WORKSPACE_DIR);
+const IMPORT_MAX_BYTES = 1024 * 1024 * 1024;
 
-    if (dirsToExport.length === 0) {
-      return res.status(404).json({ ok: false, error: "No data directories found to export." });
-    }
-
-    const zipArgs = ["-r", "-P", SETUP_PASSWORD, tmpZip, ...dirsToExport];
-    const result = await runCmd("zip", zipArgs);
-
-    if (result.code !== 0 || !fs.existsSync(tmpZip)) {
-      return res.status(500).json({ ok: false, error: "Failed to create export archive.", output: result.output });
-    }
-
-    const stat = fs.statSync(tmpZip);
-    res.set({
-      "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${zipName}"`,
-      "Content-Length": String(stat.size),
-    });
-
-    const stream = fs.createReadStream(tmpZip);
-    stream.pipe(res);
-    stream.on("end", () => {
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
-    });
-    stream.on("error", (err) => {
-      log.error("export", `stream error: ${err.message}`);
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
-      if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "Stream error during export." });
+/** Streams a request body to `file` (created exclusively, 0600), enforcing `max` bytes. Resolves to the byte count. */
+function receiveUpload(req, file, max) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(file, { flags: "wx", mode: 0o600 });
+    let n = 0;
+    req.on("data", (chunk) => {
+      n += chunk.length;
+      if (n > max) {
+        req.unpipe(out);
+        out.destroy();
+        const e = new Error(`Archive too large (max ${Math.round(max / 1e6)} MB).`);
+        e.status = 413;
+        reject(e);
+        req.resume();
       }
     });
-  } catch (err) {
-    try { fs.rmSync(tmpZip, { force: true }); } catch {}
-    log.error("export", `error: ${err.message}`);
-    return res.status(500).json({ ok: false, error: `Export failed: ${err.message}` });
-  }
-});
+    req.on("aborted", () => {
+      out.destroy();
+      const e = new Error("Upload interrupted.");
+      e.status = 400;
+      reject(e);
+    });
+    out.on("error", (err) => {
+      err.status = /ENOSPC/.test(String(err.code)) ? 507 : 500;
+      reject(err);
+    });
+    out.on("finish", () => resolve(n));
+    req.pipe(out);
+  });
+}
 
 app.post(
   "/setup/api/import",
   requireSetupAuth,
-  express.raw({ type: "application/zip", limit: "250mb" }),
   async (req, res) => {
     const dataRoot = "/data";
     const isUnder = (p) => {
@@ -1532,9 +1528,26 @@ app.post(
       });
     }
 
-    const buf = req.body;
-    if (!Buffer.isBuffer(buf) || buf.length === 0) {
-      return res.status(400).json({ ok: false, error: "Empty or invalid request body." });
+    // The upload is streamed to the volume (it used to be buffered in memory, up to 250 MB). Refuse early when it
+    // cannot fit: the archive and its extracted copy both live on the volume until the swap.
+    if (!/^application\/zip\b/i.test(String(req.get("content-type") || ""))) {
+      return res.status(415).json({ ok: false, error: "Upload must be application/zip." });
+    }
+    const declared = Number(req.get("content-length") || 0);
+    if (declared > IMPORT_MAX_BYTES) {
+      return res.status(413).json({ ok: false, error: `Archive too large (max ${Math.round(IMPORT_MAX_BYTES / 1e6)} MB).` });
+    }
+    if (declared > 0) {
+      try {
+        const st = fs.statfsSync(dataRoot);
+        const free = Number(st.bavail) * Number(st.bsize);
+        if (free < declared * 2.2 + 200e6) {
+          return res.status(507).json({
+            ok: false,
+            error: `Not enough free space on the volume for this restore: needs about ${Math.round((declared * 2.2 + 200e6) / 1e6)} MB, ${Math.round(free / 1e6)} MB free.`,
+          });
+        }
+      } catch {}
     }
 
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1593,7 +1606,8 @@ app.post(
     const backups = [];
     let gatewayWasStopped = false;
     try {
-      fs.writeFileSync(tmpZip, buf);
+      const uploaded = await receiveUpload(req, tmpZip, IMPORT_MAX_BYTES);
+      if (uploaded === 0) throw reject(400, "Empty or invalid request body.");
 
       // Pre-validate every archive entry. Reject anything that isn't under one
       // of the configured state/workspace prefixes — the archive is gated by
@@ -1678,8 +1692,9 @@ app.post(
 
       // Now that the archive is fully extracted and validated, take down the
       // gateway. From here through the rename swap, downtime is unavoidable.
-      gatewayWasStopped = gatewayProc !== null;
-      if (gatewayWasStopped) await stopGatewayProcess();
+      // Hold the maintenance lock for the whole swap (also when the gateway was not running).
+      await pauseGateway("import");
+      gatewayWasStopped = true;
 
       for (const { target, source } of validReplacements) {
         const backup = `${target}.bak-${ts}`;
@@ -1696,8 +1711,9 @@ app.post(
       }
       backups.length = 0;
 
-      log.info("import", `restored ${buf.length} bytes from archive`);
-      await restartGateway();
+      log.info("import", `restored ${uploaded} bytes from archive`);
+      gatewayWasStopped = false;
+      await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });
     } catch (err) {
       const status = err.status ?? 500;
@@ -1708,7 +1724,7 @@ app.post(
         try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
         try { fs.renameSync(backup, target); } catch {}
       }
-      if (gatewayWasStopped) await ensureGatewayRunning().catch(() => {});
+      if (gatewayWasStopped) await resumeGateway().catch(() => {});
       return res.status(status).json({ ok: false, error: err.message, ...extra });
     } finally {
       cleanup();
@@ -1719,6 +1735,16 @@ app.post(
 // Official Daftra invoice PDFs created by the `pdf` command, behind the existing setup login.
 registerExportDownload(app, requireSetupAuth, WORKSPACE_DIR);
 
+// Encrypted off-Railway backup (opt-in via BASHT_BACKUP_PUBLIC_KEY; the server holds only the public key).
+registerBackupRoute(app, requireSetupAuth, {
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  publicKeyPem: process.env.BASHT_BACKUP_PUBLIC_KEY,
+  pauseGateway,
+  resumeGateway,
+  log,
+});
+
 app.get("/logs", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));
 });
@@ -1727,7 +1753,8 @@ app.get("/setup/api/logs", requireSetupAuth, async (_req, res) => {
   try {
     const content = fs.readFileSync(LOG_FILE, "utf8");
     const lines = content.split("\n").filter(Boolean);
-    const limit = Math.min(Number.parseInt(_req.query.lines ?? "500", 10), 5000);
+    const requested = Number.parseInt(String(_req.query.lines ?? "500"), 10);
+    const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 5000) : 500;
     return res.json({ ok: true, lines: lines.slice(-limit) });
   } catch (err) {
     if (err.code === "ENOENT") {
@@ -1764,6 +1791,11 @@ const proxy = httpProxy.createProxyServer({
 
 proxy.on("error", (err, _req, res) => {
   log.error("proxy", String(err));
+  // WebSocket proxying passes the raw client socket here (no headersSent): close it instead of leaving it open.
+  if (res && typeof res.headersSent === "undefined" && typeof res.destroy === "function") {
+    res.destroy();
+    return;
+  }
   if (res && typeof res.headersSent !== "undefined" && !res.headersSent) {
     res.writeHead(503, { "Content-Type": "text/html" });
     try {
@@ -1782,10 +1814,30 @@ const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : GATEWAY_TARGET;
 
-proxy.on("proxyReq", (proxyReq, req, res) => {
-  if (!req.url?.startsWith("/hooks/")) {
+// The gateway token is attached ONLY to requests that carry the valid setup password (decided per request in
+// classifyProxiedRequest). Anonymous internet traffic reaches the gateway with its own credentials, so the gateway's
+// own auth applies; previously every anonymous request was upgraded to full operator access.
+const INJECT_GATEWAY_TOKEN = Symbol("injectGatewayToken");
+const CARRIES_SETUP_PASSWORD = Symbol("carriesSetupPassword");
+
+function classifyProxiedRequest(req) {
+  const auth = authenticateSetupRequest(req, setupAuthOptions);
+  req[INJECT_GATEWAY_TOKEN] = mayInjectGatewayToken(req.url, auth);
+  req[CARRIES_SETUP_PASSWORD] = auth === "ok";
+  return auth;
+}
+
+function setProxiedAuthorization(proxyReq, req) {
+  if (req[INJECT_GATEWAY_TOKEN] === true) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  } else if (req[CARRIES_SETUP_PASSWORD] === true) {
+    // e.g. /hooks/* opened in a logged-in browser: never forward the admin password upstream.
+    proxyReq.removeHeader("Authorization");
   }
+}
+
+proxy.on("proxyReq", (proxyReq, req, res) => {
+  setProxiedAuthorization(proxyReq, req);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
   rebuildForwardedHeaders(
     proxyReq,
@@ -1795,7 +1847,7 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
-  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  setProxiedAuthorization(proxyReq, req);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
   rebuildForwardedHeaders(
     proxyReq,
@@ -1838,8 +1890,25 @@ app.use(async (req, res) => {
     }
   }
 
+  const auth = classifyProxiedRequest(req);
+  if (auth === "blocked") {
+    res.set("Retry-After", String(Math.ceil(setupLoginLimiter.windowMs / 1000)));
+    return res.status(429).type("text/plain").send("Too many failed logins. Try again later.");
+  }
+  if (auth === "invalid") {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).type("text/plain").send("Invalid password");
+  }
+
   if (req.path === "/openclaw" && !req.query.token) {
-    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
+    // The token-bearing link is handed out only after the setup login (it used to be given to any visitor).
+    if (auth !== "ok") {
+      res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+      return res.status(401).type("text/plain").send("Auth required");
+    }
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    return res.redirect(`/openclaw?token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`);
   }
 
   return proxy.web(req, res, { target: GATEWAY_TARGET });
@@ -1869,6 +1938,12 @@ const server = app.listen(PORT, () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
+  // A client may reset the TCP connection at any point of the handshake. Without a listener that 'error' is unhandled
+  // and kills the whole wrapper (and with it the gateway and WhatsApp): any anonymous client could do that at will.
+  socket.on("error", (err) => {
+    if (err?.code !== "ECONNRESET" && err?.code !== "EPIPE") log.warn("websocket", `client socket error: ${err?.code || err?.message}`);
+    socket.destroy();
+  });
   if (!isConfigured()) {
     socket.destroy();
     return;
@@ -1880,6 +1955,12 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+  const auth = classifyProxiedRequest(req);
+  if (auth === "blocked" || auth === "invalid") {
+    const status = auth === "blocked" ? "429 Too Many Requests" : "401 Unauthorized";
+    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    return;
+  }
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
@@ -1887,9 +1968,7 @@ async function gracefulShutdown(signal) {
   log.info("wrapper", `received ${signal}, shutting down`);
   shuttingDown = true;
 
-  if (setupRateLimiter.cleanupInterval) {
-    clearInterval(setupRateLimiter.cleanupInterval);
-  }
+  clearInterval(setupLimiterSweep);
 
   server.close();
 

@@ -16,9 +16,11 @@ jobs:
             const pr = context.payload.pull_request;
             const author = pr.user.login;
 
-            // Skip PRs from repo owner
-            if (author === 'arjunkomath') {
-              console.log('PR from repo owner, skipping.');
+            // Skip PRs from this repository's owner and its collaborators (the check used to name the upstream
+            // template's owner, so in this fork the owner's own short-titled PRs were auto-closed).
+            const trusted = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            if (author === context.repo.owner || trusted.includes(pr.author_association)) {
+              console.log('PR from the repository owner or a collaborator, skipping.');
               return;
             }
 
