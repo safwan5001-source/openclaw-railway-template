@@ -23,14 +23,17 @@ export const STATE_EXCLUDES = ["cache", "tmp", "logs", "server.log", "media/play
 export const WORKSPACE_EXCLUDES = ["skills/basht-daftra", "skills/basht-accounting", "node_modules", ".cache"];
 
 /** Arguments for `find` (run with cwd "/"): regular files and directories only, excluded paths pruned. */
-export function buildFindArgs(stateDir, workspaceDir) {
+/** Extra exclusions of the "essential" export: bulky, re-obtainable content (official PDFs, media). */
+export const ESSENTIAL_EXTRA = { state: ["media"], workspace: ["exports"] };
+
+export function buildFindArgs(stateDir, workspaceDir, extra = { state: [], workspace: [] }) {
   const rel = (p) => path.resolve(p).replace(/^\/+/, "");
   const stateRel = rel(stateDir);
   const wsRel = rel(workspaceDir);
   const roots = wsRel === stateRel || wsRel.startsWith(stateRel + "/") ? [stateRel] : [stateRel, wsRel];
   const pruned = [
-    ...STATE_EXCLUDES.map((e) => `${stateRel}/${e}`),
-    ...WORKSPACE_EXCLUDES.map((e) => `${wsRel}/${e}`),
+    ...[...STATE_EXCLUDES, ...(extra.state ?? [])].map((e) => `${stateRel}/${e}`),
+    ...[...WORKSPACE_EXCLUDES, ...(extra.workspace ?? [])].map((e) => `${wsRel}/${e}`),
   ];
   const prune = pruned.flatMap((p, i) => (i ? ["-o", "-path", p] : ["-path", p]));
   return {
