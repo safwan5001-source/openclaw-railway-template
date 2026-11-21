@@ -20,7 +20,7 @@ import {
   readOriginalFromPatched,
   sha256,
 } from "./openclaw-memory-flush-owner.mjs";
-import { classifyWhatsAppId, maskId } from "./memory-flush-doctor.mjs";
+import { classifyWhatsAppId, maskId, normalizeOwnerCandidates, verdict } from "./memory-flush-doctor.mjs";
 
 // Minimal stand-in that contains every anchor exactly once, in upstream order.
 const FIXTURE = [
@@ -171,6 +171,19 @@ test("doctor helpers: PN/LID classification and masking", () => {
   assert.equal(classifyWhatsAppId("123456789012345@lid"), "LID");
   assert.equal(classifyWhatsAppId(undefined), "none");
   assert.equal(maskId("agent:main:whatsapp:direct:+966500001234"), "agent:main:whatsapp:direct:+••••••••1234");
+});
+
+test("doctor: simulation applies the patch's owner gate (channel allowFrom is not ownership)", () => {
+  const onlyChannel = normalizeOwnerCandidates({}, { allowFrom: ["+15550001234"] });
+  assert.deepEqual(onlyChannel.configuredOwners, [], "channels.whatsapp.allowFrom alone never proves ownership");
+  assert.deepEqual(onlyChannel.channelOnly, ["+15550001234"]);
+  const both = normalizeOwnerCandidates({ ownerAllowFrom: ["whatsapp:+15550001234", "*", "telegram:123", "+15550009999"] }, { allowFrom: ["+15550001234", "+14440000000"] });
+  assert.deepEqual(both.configuredOwners, ["+15550001234", "+15550009999"], "wildcard and other-channel entries ignored");
+  assert.deepEqual(both.channelOnly, ["+14440000000"]);
+  const sim = { owner_turn: { write: true }, flush_upstream: { write: false }, flush_patched: { write: true }, flush_impostor: { write: false } };
+  assert.match(verdict(sim, false), /OWNER UNVERIFIED/, "no configured owner => never a 'patch restores' verdict");
+  assert.match(verdict(sim, true), /identity propagation is the cause/);
+  assert.match(verdict({ ...sim, flush_impostor: { write: true } }, true), /UNSAFE/);
 });
 
 // ---------------------------------------------------------------- integration with the real OpenClaw dist

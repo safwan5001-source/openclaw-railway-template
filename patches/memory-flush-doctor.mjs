@@ -58,10 +58,18 @@ function readConfigSection(key) {
   return r.ok ? { value: r.value } : { missing: true, error: r.error };
 }
 
-function normalizeOwnerCandidates(commands, whatsapp) {
-  const raw = [...(commands?.ownerAllowFrom ?? []), ...(whatsapp?.allowFrom ?? [])].map(String);
-  const e164 = [...new Set(raw.map((v) => v.replace(/^whatsapp:/i, "")).filter((v) => /^\+\d{7,15}$/.test(v)))];
-  return { raw, e164 };
+/**
+ * Mirrors the patch's fail-closed gate: only commands.ownerAllowFrom proves ownership (no command-owner authority
+ * exists for WhatsApp in 2026.10.9). channels.whatsapp.allowFrom admits a sender but does NOT make it the owner, and
+ * wildcards never count. Entries for other channels are ignored.
+ */
+export function normalizeOwnerCandidates(commands, whatsapp) {
+  const toE164 = (v) => String(v).trim().replace(/^whatsapp:/i, "");
+  const isE164 = (v) => /^\+\d{7,15}$/.test(v);
+  const ownerAllowFrom = (commands?.ownerAllowFrom ?? []).map(String);
+  const configuredOwners = [...new Set(ownerAllowFrom.filter((v) => !/^[a-z][a-z0-9-]*:/i.test(v) || /^whatsapp:/i.test(v)).map(toE164).filter(isE164))];
+  const channelAllowFrom = (whatsapp?.allowFrom ?? []).map(String);
+  return { raw: [...ownerAllowFrom, ...channelAllowFrom], configuredOwners, channelOnly: channelAllowFrom.map(toE164).filter((v) => isE164(v) && !configuredOwners.includes(v)) };
 }
 
 async function simulate(config, ownerE164, workspaceDir) {
@@ -73,9 +81,9 @@ async function simulate(config, ownerE164, workspaceDir) {
   const base = { config, agentId: "main", sessionKey, workspaceDir, messageProvider: "whatsapp", messageChannel: "whatsapp", chatType: "direct" };
   const flush = { trigger: "memory", memoryFlushWritePath: `memory/${new Date().toISOString().slice(0, 10)}.md` };
   const cases = {
-    owner_turn: { ...base, senderIsOwner: true, senderE164: ownerE164, senderId: ownerE164 },
+    owner_turn: { ...base, senderIsOwner: true, senderE164: ownerE164 ?? "+10000000000", senderId: ownerE164 ?? "+10000000000" },
     flush_upstream: { ...base, ...flush, senderIsOwner: false },
-    flush_patched: { ...base, ...flush, senderIsOwner: true, senderE164: ownerE164, senderId: ownerE164 },
+    ...(ownerE164 ? { flush_patched: { ...base, ...flush, senderIsOwner: true, senderE164: ownerE164, senderId: ownerE164 } } : {}),
     flush_impostor: { ...base, ...flush, senderIsOwner: false, senderE164: impostor, senderId: impostor },
   };
   const results = {};
@@ -101,11 +109,12 @@ async function simulate(config, ownerE164, workspaceDir) {
   return results;
 }
 
-function verdict(sim) {
+export function verdict(sim, ownerVerified = true) {
   if (!sim || sim.error) return "simulation unavailable";
   const { owner_turn: o, flush_upstream: u, flush_patched: p, flush_impostor: i } = sim;
   if (i?.write && !u?.write) return "UNSAFE: a non-owner sender identity gains write in the flush — review tools.toolsBySender before deploying";
   if (u?.write) return "flush already keeps write without the patch; the patch is harmless here";
+  if (!ownerVerified) return "OWNER UNVERIFIED: no WhatsApp E.164 owner in commands.ownerAllowFrom — the patch fails closed and the flush stays anonymous (add the owner to commands.ownerAllowFrom; config decision needed)";
   if (p?.write) return "identity propagation is the cause: the BASHT patch restores the append-only flush writer";
   if (o?.write === false) return "operator tool policy removes write for the owner too (config decision needed; the patch alone cannot fix it)";
   return "write is removed for the flush even with owner identity: see writeRemovedBy for the blocking policy step";
@@ -155,6 +164,8 @@ async function main() {
   report.ownerIdentity = {
     configuredOwnerEntries: owners.raw.map(maskId),
     configuredForms: [...new Set(owners.raw.map(classifyWhatsAppId))],
+    verifiedOwners: owners.configuredOwners.map(maskId),
+    allowedButNotOwner: owners.channelOnly.map(maskId),
   };
 
   const sessions = cli(["sessions", "list", "--json", "--limit", "200"]);
@@ -187,18 +198,19 @@ async function main() {
   try {
     // Simulation runs in a throwaway workspace so even OpenClaw's tool construction cannot touch /data.
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "basht-flush-doctor-"));
-    report.simulation = await simulate(config, owners.e164[0], scratch);
+    report.simulation = await simulate(config, owners.configuredOwners[0], scratch);
     fs.rmSync(scratch, { recursive: true, force: true });
   } catch (err) {
     report.simulation = { error: err.message };
   }
-  report.verdict = verdict(report.simulation);
+  report.verdict = verdict(report.simulation, owners.configuredOwners.length > 0);
 
   if (JSON_OUT) {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log(`BASHT memory-flush doctor — OpenClaw ${report.openclawVersion ?? "?"}, patch ${report.patchApplied ? "APPLIED" : "not applied"}`);
     console.log(`Owner entries: ${report.ownerIdentity.configuredOwnerEntries.join(", ") || "none"} (forms: ${report.ownerIdentity.configuredForms.join(", ")})`);
+    console.log(`Verified owners (commands.ownerAllowFrom): ${report.ownerIdentity.verifiedOwners.join(", ") || "NONE"}; allowed but not owner: ${report.ownerIdentity.allowedButNotOwner.join(", ") || "none"}`);
     for (const s of report.whatsappSessions) console.log(`Session ${s.key}: key=${s.keyIdForm} origin=${s.originForm} chat=${s.chatType} tokens=${s.totalTokens} flush=${JSON.stringify(s.memoryFlush)}`);
     console.log(`Policy: ${JSON.stringify(report.policy)}`);
     for (const [name, r] of Object.entries(report.simulation ?? {})) {
