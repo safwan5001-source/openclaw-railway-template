@@ -19,13 +19,31 @@ Production state (read-only): the OpenClaw service runs commit `60ee51b` (= `mai
 | V7 | Low | `npm install -g clawhub@latest` → non-reproducible image (0.26.0 → 0.27.0 on 2026-11-19). | npm registry timeline. | Pinned `clawhub@0.27.0`; invariant test forbids `@latest`/`@next`. |
 | V8 | Low | `auto-close-spam.yml` exempted the **upstream** owner (`arjunkomath`); in this fork the owner's own short-titled PRs would be auto-closed. | Code. | Exempt `context.repo.owner` and OWNER/MEMBER/COLLABORATOR. |
 | V9 | Low | No anti-framing headers on admin pages; `?lines=abc` returned the whole log. | Code. | `X-Frame-Options: DENY`, `frame-ancestors 'none'`, `no-store` on `/setup/api`, input validation. |
+| V10 | **High** (availability, unauthenticated) | A client that resets its TCP connection during a WebSocket handshake raised an unhandled `error` on the raw socket and **killed the wrapper process** — gateway and WhatsApp down until Railway restarts the container, repeatable at will by anyone. Present on `main`. | Lab, real gateway: 21 anonymous resets crash both `main` and the first PR head. Regression test (64 resets) fails before, passes after. | `socket.on("error")` first thing in the upgrade handler; WebSocket proxy errors destroy the socket. |
+| V11 | Medium (availability of memory) | On a **fresh volume** (first boot, or disaster recovery onto a new volume) `skill-sync` runs as root after `chown -R /data`, leaving `/data/workspace` and `skills/` root-owned: the agent cannot write memory until the next reboot. | Container on an empty volume: `drwxr-xr-x root root /data/workspace`. | Entrypoint hands both directories back to `openclaw` after the sync; simulation test. |
+
+### Final verification of V1 (old code vs fix, real gateway, production-like: public domain + external client IP)
+
+| Step | `main` | This PR |
+|---|---|---|
+| Anonymous `GET /openclaw` | 302 → `?token=<gateway token>` | 401, no token |
+| Anonymous HTTP `/tools/invoke` (memory, sessions, message, web_fetch, browser) | executed | 401 |
+| Anonymous WebSocket with its own device identity, using the harvested token | pairing request created | no token → `AUTH_TOKEN_MISSING`, nothing created |
+| Cross-site POST `/setup/api/devices/approve` riding the operator's login | approved the attacker's device | 403 |
+| Attacker reconnects | **`operator.admin` session** | — |
+| Spoofed `X-Real-IP: 127.0.0.1` | — | rejected; wrapper stays up (V10) |
+
+The WebSocket path itself never trusted the injected HTTP header (the gateway reads the token from the connect frame),
+so the WS risk was the token handed out by `/openclaw` plus V2 — both closed. Token never found in wrapper, gateway or
+container logs. The operator flow still works: setup login → `/openclaw` → Control UI connects and removes the token
+from the address bar itself.
 
 ## 2. Potential risks (need verification or an owner decision; not changed)
 
 | # | Risk | What to verify / do |
 |---|---|---|
 | R1 | Wrapper, gateway and agent tools run as the same uid in one container: a prompt-injected agent with `exec` can read the wrapper's `/proc/<pid>/environ` (SETUP_PASSWORD, gateway token) and every variable set on the service (API keys, a GitHub token, broker/bridge tokens). | Remove variables the agent does not need; give any GitHub token the narrowest scope (read-only, or none). With `main` unprotected and auto-deploy without CI, a write-scoped GitHub token = the agent can ship code to production. |
-| R2 | `/setup` export = every secret, protected by legacy ZipCrypto with the setup password on `zip`'s command line. Import buffers up to 250 MB in RAM and extracts without a size cap. | Treat exports as secrets; prefer Railway volume backups. Optional: AES (`7z`) and a size cap. |
+| R2 | `/setup` export = every secret, protected by legacy ZipCrypto with the setup password on `zip`'s command line. Import buffers up to 250 MB in RAM and extracts without a size cap. | Use the encrypted backup (docs/BACKUP.md) instead; seal any legacy export locally right away. Optional: a size cap on import. |
 | R3 | `X-Real-IP` trust: if Railway's edge forwards a client-supplied value, per-client throttling can be spread across keys (global ceiling still applies). | Confirm on Railway docs/support. |
 | R4 | `browser.noSandbox=true` when `OPENCLAW_BROWSER=1`: a Chromium exploit runs as the agent user (which already holds all secrets, R1). | Prefer the cloud browser (Browserbase/Steel), keep the local browser off. Variable value not read. |
 | R5 | Homebrew installer fetched from `Homebrew/install@HEAD` and piped to bash at build time; base images use tags, not digests. | Pin the installer commit and image digests if build reproducibility matters. |
@@ -35,17 +53,54 @@ Production state (read-only): the OpenClaw service runs commit `60ee51b` (= `mai
 
 ## 3. Deploy plan (owner approval required — nothing here was deployed)
 
-1. Back up: Railway → OpenClaw → Volume → **Backups → Create backup** (restore creates a new volume; the old one stays).
-2. Note the rollback target: the currently active deployment (commit `60ee51b`).
-3. Review + merge the PR to `main` (auto-deploys).
-4. Verify within 10 minutes:
-   - `GET /setup/healthz` → 200, `gatewayReachable: true`.
-   - `/setup` in the browser → password prompt, wizard loads, Devices/Logs work.
-   - `/openclaw` → password prompt, then Control UI connects.
-   - From a private window, `curl -X POST https://<domain>/tools/invoke -d '{"tool":"session_status"}'` → **401**.
-   - WhatsApp: send a test message to BASHT and receive a reply; Daftra read via the broker works.
-   - Logs: no repeated 401/429 from other services.
-5. Rollback: Railway → Deployments → the noted deployment → **Rollback** (or revert the merge commit). No data migration involved.
+Compatibility checked: WhatsApp (Baileys plugin, outbound only, no inbound HTTP route), Daftra broker (OpenClaw calls
+the broker on the private network; the broker never calls OpenClaw), browser bridges (OpenClaw calls them; their
+variables reference only the cloud-browser APIs). None depends on the token the wrapper used to inject.
+Railway switches traffic only after `/setup/healthz` passes, so a build or boot failure leaves the old deployment live.
+
+1. **Backup first** (Railway Hobby has none): `/setup` → Export Data, then seal it locally — `docs/BACKUP.md`
+   "Before the security deploy". Note the rollback target: the active deployment (commit `60ee51b`).
+2. Review + merge the PR to `main` (auto-deploys). Optionally in the same change: set `BASHT_BACKUP_PUBLIC_KEY`.
+3. **Acceptance tests (within 10 minutes)** — any failure → rollback (step 5):
+
+   | # | Check | Expected |
+   |---|---|---|
+   | A1 | `curl -s https://<domain>/setup/healthz` | 200, `"gatewayReachable":true` |
+   | A2 | `curl -s -o /dev/null -w '%{http_code}' -X POST https://<domain>/tools/invoke -d '{"tool":"session_status"}'` | **401** |
+   | A3 | `curl -s -o /dev/null -w '%{http_code}' https://<domain>/openclaw` | **401** (no `Location` with a token) |
+   | A4 | `curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://example.org' -u x:<SETUP_PASSWORD> https://<domain>/setup/api/pairing/approve` (harmless: empty body) | **403** (400 would mean the CSRF guard is off) |
+   | A5 | Browser: `/setup` → password → wizard, Devices, Logs load | works |
+   | A6 | Browser: `/openclaw` → password → Control UI connected | works |
+   | A7 | WhatsApp: message BASHT from the owner's phone | reply received |
+   | A8 | Ask BASHT for a Daftra read (e.g. last 5 invoices) | answered via the broker |
+   | A9 | Railway logs, 15 min | no crash/restart loop; no new 401/429 from sibling services |
+   | A10 | If the key is set: `/setup` → Download Encrypted Backup; `inspect` it locally | `.bkp`, correct key id, gateway back within seconds |
+
+4. **Rotate after the deploy is accepted** (not before — the old code would hand the new token out again):
+
+   | Secret | Why | How | Order |
+   |---|---|---|---|
+   | `OPENCLAW_GATEWAY_TOKEN` | handed to every visitor of `/openclaw` until now | `openssl rand -hex 32` → Railway variable → redeploy. Verified in the lab: the old token is rejected immediately (the CLI flag overrides the copy in `openclaw.json`; update that copy via `/setup` → Config to keep CLI tools consistent). | 1 |
+   | Paired devices | device tokens survive a gateway-token rotation | Control UI → Devices (or `openclaw devices list` in the Railway shell): remove every device you do not recognise | 2 |
+   | `SETUP_PASSWORD` | was inherited by the gateway and the agent's tools | new long random value → Railway variable → redeploy | 3 |
+   | WhatsApp | an attacker with operator access could have linked a session | phone → WhatsApp → Linked devices: remove unknown entries | 4 |
+   | Provider / API keys in `openclaw.json` and service variables | only if the logs show anonymous `/tools/invoke`, `/v1/*` or WebSocket activity, or step 2 found an unknown device | rotate at each provider, then update | 5 (conditional) |
+
+   Evidence to check before deciding step 5: Railway HTTP logs for `POST /tools/invoke`, `GET /openclaw` (302) and
+   WebSocket upgrades from addresses that are not yours, since the domain went public.
+5. **Rollback:** Railway → Deployments → the noted deployment → **Rollback** (or revert the merge commit). No data
+   migration is involved; rotated tokens stay valid with the old code (but the old code would expose them again, so
+   roll forward with a fix rather than staying on the old code).
+
+## 3b. Incident containment
+
+| Signal | Immediate action | Then |
+|---|---|---|
+| Health check fails / restart loop after deploy | Rollback (step 5) | Read the deploy logs; reproduce with `scripts/smoke-openclaw-image.sh` |
+| WhatsApp stops answering, service healthy | Check logs for the WhatsApp channel; restart once | Rollback if it started with the deploy; WhatsApp session is in the backup |
+| Unknown paired device / anonymous tool calls in logs | Rotate gateway token + setup password, remove devices (step 4, rows 1–4) | Take an encrypted backup for forensics *before* cleaning; rotate provider keys; review `sessions` for data exposure |
+| Volume near full | Nothing is lost: boot no longer depends on the Homebrew copy | Enable `DIAG_STORAGE=1` (PR #26) to see what grows; restore needs free space (docs/BACKUP.md) |
+| Data loss / corrupted volume | Stop changes; new volume | Restore the latest `.bkp` (docs/BACKUP.md, drilled end to end) |
 
 ## 4. CI/CD
 
@@ -60,5 +115,7 @@ Production state (read-only): the OpenClaw service runs commit `60ee51b` (= `mai
 - Fallback until Actions is back: `bash scripts/ci-local.sh [--with-openclaw]` in an isolated dev container
   (e.g. a Claude Code cloud session). Results per commit in `.ci-results/<sha>.summary|.log`; paste the summary in
   the PR. Docker image builds still need Actions or a Docker host.
+- `basht-ci.yml` job `image` (PRs / manual): builds the real image, runs `scripts/smoke-openclaw-image.sh` (19 checks)
+  and `scripts/restore-drill.sh` (14 checks). Both also run on any Docker host.
 - Recommended once Actions runs: protect `main` (PR required, required checks `suite (node 26)` and
   `daftra-tests (node 26)`, no force-push) and enable Railway **Wait for CI** (`checkSuites`) on the OpenClaw service.

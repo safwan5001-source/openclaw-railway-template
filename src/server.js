@@ -22,6 +22,7 @@ import {
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
+import { registerBackupRoute } from "./backup.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
@@ -1685,6 +1686,17 @@ app.post(
 
 // Official Daftra invoice PDFs created by the `pdf` command, behind the existing setup login.
 registerExportDownload(app, requireSetupAuth, WORKSPACE_DIR);
+
+// Encrypted off-Railway backup (opt-in via BASHT_BACKUP_PUBLIC_KEY; the server holds only the public key).
+registerBackupRoute(app, requireSetupAuth, {
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  publicKeyPem: process.env.BASHT_BACKUP_PUBLIC_KEY,
+  stopGateway: stopGatewayProcess,
+  startGateway: ensureGatewayRunning,
+  isGatewayRunning: () => gatewayProc !== null,
+  log,
+});
 
 app.get("/logs", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));

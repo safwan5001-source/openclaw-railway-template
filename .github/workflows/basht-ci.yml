@@ -49,3 +49,21 @@ jobs:
           name: basht-ci-node${{ matrix.node }}
           path: .ci-results/
           retention-days: 14
+
+  image:
+    # Builds the real OpenClaw image and runs it with synthetic env only: security smoke (anonymous access, token,
+    # env, non-root, full-volume boot) and the encrypted backup -> empty volume -> restore drill. PRs and manual runs only.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Build the OpenClaw image (no push, no registry login)
+        run: docker build -f Dockerfile -t basht-openclaw-ci .
+      - name: Image security smoke test
+        run: bash scripts/smoke-openclaw-image.sh basht-openclaw-ci
+      - name: Backup and restore drill (synthetic data)
+        run: bash scripts/restore-drill.sh basht-openclaw-ci

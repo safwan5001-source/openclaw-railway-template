@@ -170,6 +170,13 @@ test("CSRF: cross-site state-changing requests to /setup are refused before they
   assert.equal(same.status, 400, "same-origin UI requests still reach the handler");
 });
 
+test("encrypted backup stays off (503) until BASHT_BACKUP_PUBLIC_KEY is set, and pauses nothing", async () => {
+  const r = await request("POST", "/setup/api/backup", { headers: { authorization: BASIC, origin: base } });
+  assert.equal(r.status, 503);
+  assert.match(r.json.error, /BASHT_BACKUP_PUBLIC_KEY/);
+  assert.ok(!/gateway paused/.test(output));
+});
+
 test("admin pages: anti-framing and no-store headers", async () => {
   const r = await request("GET", "/setup/api/logs?lines=abc", { headers: { authorization: BASIC } });
   assert.equal(r.status, 200);

@@ -585,6 +585,20 @@
             </button>
           </div>
 
+          <div class="action-card action-emerald">
+            <div class="action-card-header">
+              <div class="action-icon">
+                <svg class="icon-md" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+              </div>
+              <span class="action-title">Encrypted Backup</span>
+            </div>
+            <p class="action-desc">Consistent, encrypted backup (config, WhatsApp session, memory, conversations). Pauses the gateway for a few seconds. Only your offline private key can open it.</p>
+            <!-- A plain same-origin form: the browser streams the file to disk (no in-memory blob on phones). -->
+            <form method="post" action="/setup/api/backup">
+              <button type="submit" :disabled="loading || importing" class="action-btn">Download Encrypted Backup</button>
+            </form>
+          </div>
+
           <div class="action-card action-violet">
             <div class="action-card-header">
               <div class="action-icon">
