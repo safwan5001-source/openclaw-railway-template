@@ -1732,6 +1732,11 @@ const proxy = httpProxy.createProxyServer({
 
 proxy.on("error", (err, _req, res) => {
   log.error("proxy", String(err));
+  // WebSocket proxying passes the raw client socket here (no headersSent): close it instead of leaving it open.
+  if (res && typeof res.headersSent === "undefined" && typeof res.destroy === "function") {
+    res.destroy();
+    return;
+  }
   if (res && typeof res.headersSent !== "undefined" && !res.headersSent) {
     res.writeHead(503, { "Content-Type": "text/html" });
     try {
@@ -1874,6 +1879,12 @@ const server = app.listen(PORT, () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
+  // A client may reset the TCP connection at any point of the handshake. Without a listener that 'error' is unhandled
+  // and kills the whole wrapper (and with it the gateway and WhatsApp): any anonymous client could do that at will.
+  socket.on("error", (err) => {
+    if (err?.code !== "ECONNRESET" && err?.code !== "EPIPE") log.warn("websocket", `client socket error: ${err?.code || err?.message}`);
+    socket.destroy();
+  });
   if (!isConfigured()) {
     socket.destroy();
     return;

@@ -81,6 +81,7 @@ before(async () => {
       SETUP_PASSWORD: PASSWORD,
     },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true, // own process group: teardown also reaps the gateway child if the wrapper died
   });
   wrapper.stdout.on("data", (d) => (output += d));
   wrapper.stderr.on("data", (d) => (output += d));
@@ -101,6 +102,11 @@ after(async () => {
     wrapper.kill("SIGTERM");
     await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
   }
+  try {
+    process.kill(-wrapper.pid, "SIGKILL");
+  } catch {}
+  wrapper?.stdout?.destroy();
+  wrapper?.stderr?.destroy();
   fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
@@ -179,6 +185,29 @@ test("throttling counts failures only: normal use never locks the operator out",
     assert.equal(r.status, 200, `request ${i}`);
   }
   for (let i = 0; i < 20; i++) assert.equal((await request("GET", "/setup")).status, 401, "no credentials is not a failure");
+});
+
+test("abrupt client resets during WebSocket/HTTP handshakes never crash the wrapper (was: unauthenticated DoS)", async () => {
+  const reset = (raw, delay) =>
+    new Promise((resolve) => {
+      const s = net.connect(port, "127.0.0.1", () => {
+        s.write(raw);
+        setTimeout(() => {
+          s.resetAndDestroy();
+          resolve();
+        }, delay);
+      });
+      s.on("error", resolve);
+    });
+  const ws = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+  const post = "POST /tools/invoke HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100000\r\n\r\n{";
+  const jobs = [];
+  for (const delay of [0, 0, 1, 2, 5, 10, 20, 50]) for (let i = 0; i < 4; i++) jobs.push(reset(ws, delay), reset(post, delay));
+  await Promise.all(jobs);
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(wrapper.exitCode, null, "wrapper process must still be running:\n" + output.slice(-800));
+  assert.equal((await request("GET", "/setup/healthz")).status, 200);
+  assert.equal((await upgrade()).status, 101, "websocket proxying still works afterwards");
 });
 
 // Must run last: it locks the test client out.
