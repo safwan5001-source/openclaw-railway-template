@@ -1,0 +1,51 @@
+name: BASHT CI
+# Full offline suite on EVERY push and pull request (no path filters, so a change to src/, Dockerfile, skills/ or the
+# security tests can never skip CI). It runs the same script developers run locally (scripts/ci-local.sh), so a local
+# PASS and a CI PASS mean the same thing. No secrets, no Railway access, no deploy; read-only token.
+# Docker image builds stay in basht-daftra-ci.yml.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: basht-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['24', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reader libraries for export validation (test-time only)
+        run: python3 -m pip install --disable-pip-version-check openpyxl python-docx
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: BASHT CI (offline suite + pinned OpenClaw checks)
+        run: bash scripts/ci-local.sh --with-openclaw
+      - name: Summary
+        if: always()
+        run: cat .ci-results/*.summary >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: basht-ci-node${{ matrix.node }}
+          path: .ci-results/
+          retention-days: 14

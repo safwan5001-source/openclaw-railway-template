@@ -4,12 +4,23 @@ set -e
 chown -R openclaw:openclaw /data
 chmod 700 /data
 
+# Homebrew lives on the volume so agent-installed packages survive redeploys. The copy is staged and renamed into
+# place, so a failed copy (e.g. a full volume) never leaves a half tree that later boots would trust, and it never
+# stops the service: this boot then keeps using the image's Homebrew and the next boot retries.
 if [ ! -d /data/.linuxbrew ]; then
-  cp -a /home/linuxbrew/.linuxbrew /data/.linuxbrew
+  rm -rf /data/.linuxbrew.partial
+  if cp -a /home/linuxbrew/.linuxbrew /data/.linuxbrew.partial && mv /data/.linuxbrew.partial /data/.linuxbrew; then
+    echo "[entrypoint] Homebrew copied to the volume" >&2
+  else
+    rm -rf /data/.linuxbrew.partial || true
+    echo "[entrypoint] could not copy Homebrew to the volume (full?); using the image copy for this boot" >&2
+  fi
 fi
 
-rm -rf /home/linuxbrew/.linuxbrew
-ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
+if [ -d /data/.linuxbrew ]; then
+  rm -rf /home/linuxbrew/.linuxbrew
+  ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
+fi
 
 # BASHT Daftra skill: refresh the read-only reference copy inside the persistent workspace. A sync problem must
 # never stop the Gateway from starting. No secrets are involved here or anywhere in this container.

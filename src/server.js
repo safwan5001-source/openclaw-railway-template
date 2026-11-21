@@ -9,6 +9,14 @@ import { pathToFileURL } from "node:url";
 import express from "express";
 import httpProxy from "http-proxy";
 import {
+  authenticateSetupRequest,
+  createFailureLimiter,
+  createRequireSetupAuth,
+  mayInjectGatewayToken,
+  rejectCrossSiteRequests,
+  setupSecurityHeaders,
+} from "./setup-auth.js";
+import {
   canServeGatewayRequest,
   describeGatewayHealth,
   isGatewayStartupReady,
@@ -26,6 +34,8 @@ const WORKSPACE_DIR =
   path.join(STATE_DIR, "workspace");
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+// The gateway, the agent's tools and every CLI child inherit process.env: the admin password must not travel with it.
+delete process.env.SETUP_PASSWORD;
 
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
@@ -533,68 +543,25 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
-const setupRateLimiter = {
-  attempts: new Map(),
-  windowMs: 60_000,
-  maxAttempts: 50,
-  cleanupInterval: setInterval(function () {
-    const now = Date.now();
-    for (const [ip, data] of setupRateLimiter.attempts) {
-      if (now - data.windowStart > setupRateLimiter.windowMs) {
-        setupRateLimiter.attempts.delete(ip);
-      }
-    }
-  }, 60_000),
-
-  isRateLimited(ip) {
-    const now = Date.now();
-    const data = this.attempts.get(ip);
-    if (!data || now - data.windowStart > this.windowMs) {
-      this.attempts.set(ip, { windowStart: now, count: 1 });
-      return false;
-    }
-    data.count++;
-    return data.count > this.maxAttempts;
-  },
+// Failed-login throttling (per client and global); successful requests are never counted. See src/setup-auth.js.
+const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN?.trim() || "";
+const setupLoginLimiter = createFailureLimiter();
+const setupLimiterSweep = setInterval(() => setupLoginLimiter.sweep(), 60_000);
+setupLimiterSweep.unref();
+const setupAuthOptions = {
+  password: SETUP_PASSWORD,
+  limiter: setupLoginLimiter,
+  railwayPublicDomain: RAILWAY_PUBLIC_DOMAIN,
 };
-
-function requireSetupAuth(req, res, next) {
-  if (!SETUP_PASSWORD) {
-    return res
-      .status(500)
-      .type("text/plain")
-      .send(
-        "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
-      );
-  }
-
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
-  if (setupRateLimiter.isRateLimited(ip)) {
-    return res.status(429).type("text/plain").send("Too many requests. Try again later.");
-  }
-
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
-  if (!isValid) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
-  }
-  return next();
-}
+const requireSetupAuth = createRequireSetupAuth(setupAuthOptions);
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+// Admin surface: anti-framing/no-store headers and a same-origin check on every state-changing request (CSRF).
+app.use(["/setup", "/logs"], setupSecurityHeaders, rejectCrossSiteRequests({ railwayPublicDomain: RAILWAY_PUBLIC_DOMAIN }));
+// JSON parsing only for the wrapper's own API: a global parser would consume the body of proxied gateway requests
+// (e.g. JSON /hooks/* webhooks), which then reach the gateway empty and time out.
+app.use("/setup", express.json({ limit: "1mb" }));
 
 app.get("/styles.css", (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
@@ -1727,7 +1694,8 @@ app.get("/setup/api/logs", requireSetupAuth, async (_req, res) => {
   try {
     const content = fs.readFileSync(LOG_FILE, "utf8");
     const lines = content.split("\n").filter(Boolean);
-    const limit = Math.min(Number.parseInt(_req.query.lines ?? "500", 10), 5000);
+    const requested = Number.parseInt(String(_req.query.lines ?? "500"), 10);
+    const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 5000) : 500;
     return res.json({ ok: true, lines: lines.slice(-limit) });
   } catch (err) {
     if (err.code === "ENOENT") {
@@ -1782,10 +1750,30 @@ const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : GATEWAY_TARGET;
 
-proxy.on("proxyReq", (proxyReq, req, res) => {
-  if (!req.url?.startsWith("/hooks/")) {
+// The gateway token is attached ONLY to requests that carry the valid setup password (decided per request in
+// classifyProxiedRequest). Anonymous internet traffic reaches the gateway with its own credentials, so the gateway's
+// own auth applies; previously every anonymous request was upgraded to full operator access.
+const INJECT_GATEWAY_TOKEN = Symbol("injectGatewayToken");
+const CARRIES_SETUP_PASSWORD = Symbol("carriesSetupPassword");
+
+function classifyProxiedRequest(req) {
+  const auth = authenticateSetupRequest(req, setupAuthOptions);
+  req[INJECT_GATEWAY_TOKEN] = mayInjectGatewayToken(req.url, auth);
+  req[CARRIES_SETUP_PASSWORD] = auth === "ok";
+  return auth;
+}
+
+function setProxiedAuthorization(proxyReq, req) {
+  if (req[INJECT_GATEWAY_TOKEN] === true) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  } else if (req[CARRIES_SETUP_PASSWORD] === true) {
+    // e.g. /hooks/* opened in a logged-in browser: never forward the admin password upstream.
+    proxyReq.removeHeader("Authorization");
   }
+}
+
+proxy.on("proxyReq", (proxyReq, req, res) => {
+  setProxiedAuthorization(proxyReq, req);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
   rebuildForwardedHeaders(
     proxyReq,
@@ -1795,7 +1783,7 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
-  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  setProxiedAuthorization(proxyReq, req);
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
   rebuildForwardedHeaders(
     proxyReq,
@@ -1838,8 +1826,25 @@ app.use(async (req, res) => {
     }
   }
 
+  const auth = classifyProxiedRequest(req);
+  if (auth === "blocked") {
+    res.set("Retry-After", String(Math.ceil(setupLoginLimiter.windowMs / 1000)));
+    return res.status(429).type("text/plain").send("Too many failed logins. Try again later.");
+  }
+  if (auth === "invalid") {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).type("text/plain").send("Invalid password");
+  }
+
   if (req.path === "/openclaw" && !req.query.token) {
-    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
+    // The token-bearing link is handed out only after the setup login (it used to be given to any visitor).
+    if (auth !== "ok") {
+      res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+      return res.status(401).type("text/plain").send("Auth required");
+    }
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    return res.redirect(`/openclaw?token=${encodeURIComponent(OPENCLAW_GATEWAY_TOKEN)}`);
   }
 
   return proxy.web(req, res, { target: GATEWAY_TARGET });
@@ -1880,6 +1885,12 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+  const auth = classifyProxiedRequest(req);
+  if (auth === "blocked" || auth === "invalid") {
+    const status = auth === "blocked" ? "429 Too Many Requests" : "401 Unauthorized";
+    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    return;
+  }
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
@@ -1887,9 +1898,7 @@ async function gracefulShutdown(signal) {
   log.info("wrapper", `received ${signal}, shutting down`);
   shuttingDown = true;
 
-  if (setupRateLimiter.cleanupInterval) {
-    clearInterval(setupRateLimiter.cleanupInterval);
-  }
+  clearInterval(setupLimiterSweep);
 
   server.close();
 
