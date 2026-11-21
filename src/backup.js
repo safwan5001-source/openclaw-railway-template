@@ -60,6 +60,11 @@ export async function writeEncryptedArchive({ stateDir, workspaceDir, publicKey,
   let stderr = "";
   find.stderr.on("data", (d) => (stderr += d));
   tar.stderr.on("data", (d) => (stderr += d));
+  // Both ends of the file-list pipe get error handlers: when the archive side fails and tar is killed, pending
+  // writes into tar.stdin fail with EPIPE, which would otherwise be an unhandled 'error' and crash the wrapper.
+  const swallow = () => {};
+  tar.stdin.on("error", swallow);
+  find.stdout.on("error", swallow);
   find.stdout.pipe(tar.stdin);
   const enc = createEncryptStream(publicKey, { content: "tar.gz", roots: existing, ...meta });
   const out = fs.createWriteStream(outFile, { flags: "wx", mode: 0o600 });
@@ -70,8 +75,11 @@ export async function writeEncryptedArchive({ stateDir, workspaceDir, publicKey,
       waitExit(tar, "tar"),
     ]);
   } catch (err) {
+    const settled = (c) => (c.exitCode !== null || c.signalCode !== null ? null : new Promise((r) => c.once("close", r)));
+    find.stdout.unpipe(tar.stdin);
     find.kill("SIGKILL");
     tar.kill("SIGKILL");
+    await Promise.all([settled(find), settled(tar)]); // no child outlives the request
     fs.rmSync(outFile, { force: true });
     throw new Error(`${err.message}${stderr ? `: ${stderr.slice(0, 300)}` : ""}`);
   }

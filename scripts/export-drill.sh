@@ -53,6 +53,7 @@ touch "$D/done2"; sleep 2
 echo "      import: $(echo "$R" | grep -o 'HTTP[0-9]*') of $(stat -c %s "$D/export.zip") bytes, container memory peak $(cat "$D/peak2" 2>/dev/null) MiB"
 chk "B: import of the large archive accepted" 'echo "$R" | grep -q "\"ok\":true.*HTTP200"'
 chk "B: gateway reachable after restore" 'health true 120'
+chk "B: bundled skills (basht-daftra, basht-accounting) present after restore" 'docker exec exB bash -c "[ -f /data/workspace/skills/basht-daftra/SKILL.md ] && [ -f /data/workspace/skills/basht-accounting/SKILL.md ]"'
 manifest exB > "$D/after.sha"
 chk "B: all $(wc -l < "$D/before.sha") protected files byte-identical" 'diff -q <(awk "{print \$2, \$1}" "$D/before.sha" | grep -v plugin-skills | sort) <(awk "{print \$2, \$1}" "$D/after.sha" | grep -v plugin-skills | sort) >/dev/null'
 echo "RESULT pass=$pass fail=$fail"; [ "$fail" = 0 ]

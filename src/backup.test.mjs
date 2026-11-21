@@ -290,3 +290,16 @@ test("route: a backup started while the gateway is still booting does not leave 
   assert.ok(reachable, `gateway back within 15 s (was: stuck ~60 s, then "restart failed"); took ${Date.now() - t0} ms`);
   assert.ok(!/gateway restart failed/.test(output), "no failed restart logged");
 });
+
+test("archive: an output failure with find still listing files rejects cleanly (no unhandled EPIPE crash)", async () => {
+  const { writeEncryptedArchive } = await import("./backup.js");
+  const many = path.join(T, "many");
+  for (let i = 0; i < 3000; i++) put(`many/state/f-${i}.txt`, "x".repeat(200));
+  fs.mkdirSync(path.join(many, "ws"), { recursive: true });
+  const publicKey = loadPublicKey(fs.readFileSync(keys.pub, "utf8"));
+  await assert.rejects(
+    writeEncryptedArchive({ stateDir: path.join(many, "state"), workspaceDir: path.join(many, "ws"), publicKey, outFile: path.join(T, "no-such-dir", "x.bkp") }),
+  );
+  await new Promise((r) => setTimeout(r, 500)); // an unhandled EPIPE would have crashed this process by now
+  fs.rmSync(many, { recursive: true, force: true });
+});

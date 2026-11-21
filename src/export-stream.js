@@ -87,6 +87,7 @@ export function registerStreamingExport(app, requireAuth, { stateDir, workspaceD
       zip.stdin.end();
     });
     zip.stdin.on("error", () => {});
+    find.stdout.on("error", () => {});
     let stderr = "";
     zip.stderr.on("data", (d) => (stderr = (stderr + d).slice(-500)));
 

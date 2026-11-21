@@ -57,6 +57,7 @@ R=$(curl -s -w ' HTTP%{http_code}' -X POST -H "Authorization: Basic $B" -H "Orig
   -H "X-Archive-Password: $(printf %s "$BASHT_IMPORT_PASSWORD" | base64)" --data-binary @$D/restore.zip http://127.0.0.1:$P/setup/api/import)
 chk "B: /setup Import accepted the restore archive" 'echo "$R" | grep -q "\"ok\":true.*HTTP200"'
 chk "B: configured and real gateway reachable after restore" 'health true 120'
+chk "B: bundled skills (basht-daftra, basht-accounting) present after restore" 'docker exec drillB bash -c "[ -f /data/workspace/skills/basht-daftra/SKILL.md ] && [ -f /data/workspace/skills/basht-accounting/SKILL.md ]"'
 manifest drillB > $D/after.sha
 chk "B: every protected file is byte-identical ($(wc -l < $D/before.sha) files: config, WhatsApp session, memory, exports, plugins)" 'diff -q $D/before.sha $D/after.sha >/dev/null'
 for db in $(docker exec drillB bash -c 'cd /data && find .openclaw -name "*.sqlite" ! -path "*/tmp/*"'); do
