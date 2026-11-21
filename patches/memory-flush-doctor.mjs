@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Read-only memory-flush diagnostic for the BASHT OpenClaw container.
 //
-//   node /app/patches/memory-flush-doctor.mjs            # human report
-//   node /app/patches/memory-flush-doctor.mjs --json     # machine report
+//   gosu openclaw node /app/patches/memory-flush-doctor.mjs            # human report
+//   gosu openclaw node /app/patches/memory-flush-doctor.mjs --json     # machine report
+// (refuses to run as root; see main())
 //
 // It never writes config, sessions or memory, never restarts the gateway and never sends messages. It reads the
 // live config through `openclaw config get`, the session list through `openclaw sessions list --json`, and then
@@ -111,6 +112,12 @@ function verdict(sim) {
 }
 
 async function main() {
+  // Reading the session store as root could leave root-owned SQLite side files on /data that the gateway user can no
+  // longer write. Refuse and print the safe invocation instead.
+  if (typeof process.getuid === "function" && process.getuid() === 0 && !process.argv.includes("--allow-root")) {
+    console.error("[memory-flush-doctor] refusing to run as root; use: gosu openclaw node /app/patches/memory-flush-doctor.mjs");
+    process.exit(2);
+  }
   const report = { generatedAt: new Date().toISOString(), host: os.hostname(), packageRoot: PKG };
   try {
     report.openclawVersion = JSON.parse(fs.readFileSync(path.join(PKG, "package.json"), "utf8")).version;

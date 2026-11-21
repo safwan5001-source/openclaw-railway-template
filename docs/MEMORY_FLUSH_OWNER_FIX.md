@@ -71,8 +71,11 @@ The doctor ships in the image (`/app/patches/memory-flush-doctor.mjs`). Before o
 console:
 
 ```bash
-node /app/patches/memory-flush-doctor.mjs          # or --json
+gosu openclaw node /app/patches/memory-flush-doctor.mjs          # or --json
 ```
+
+Run it as the `openclaw` user (the doctor refuses root): reading the session store as root could leave root-owned
+SQLite side files on `/data` that the gateway can no longer write.
 
 It reads config via `openclaw config get`, sessions via `openclaw sessions list --json`, replays OpenClaw's own tool
 policy in a throwaway workspace and prints which policy step removes `write` for: owner turn, upstream flush, patched
