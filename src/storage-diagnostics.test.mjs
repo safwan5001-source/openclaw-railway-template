@@ -37,6 +37,11 @@ function fixture() {
   put(root, "workspace/memory/2026-11-01.md", 4_000, 30);
   put(root, "workspace/memory/old.tmp", 4_000, 30);
   put(root, ".openclaw/state.sqlite", 6_000, 30);
+  // backups of sensitive files outside protected directories stay protected, never candidates
+  put(root, "workspace/customers.sqlite.bak", 6_000, 30);
+  put(root, "workspace/IDENTITY.md.bak", 2_000, 30);
+  put(root, "workspace/creds.json.old", 2_000, 30);
+  put(root, "workspace/openclaw.json.bak.1", 2_000, 30);
   // unprotected, measurable candidates
   put(root, "tmp/old.tmp", 10_000, 20);
   put(root, "workspace/notes.md.bak", 7_000, 20);
@@ -57,7 +62,9 @@ function fixture() {
 test("names: protected and unsafe names are classified conservatively", () => {
   for (const n of ["MEMORY.md", "memory", "sessions", "whatsapp", "credentials", "creds.json", "x.sqlite", "openclaw.json.bak", ".env", "IDENTITY.md", "a.jsonl"])
     assert.ok(isProtectedName(n), n);
-  for (const n of ["workspace", "exports", ".linuxbrew", "tmp"]) assert.ok(!isProtectedName(n), n);
+  for (const n of ["customers.sqlite.bak", "IDENTITY.md.bak", "creds.json.old", "openclaw.json.bak.1", "MEMORY.md~", "x.db-wal.bak"])
+    assert.ok(isProtectedName(n), n);
+  for (const n of ["workspace", "exports", ".linuxbrew", "tmp", "notes.md.bak", "old.tmp", "~"]) assert.ok(!isProtectedName(n), n);
   assert.ok(!isSafeName("+966501234567.json"));
   assert.ok(!isSafeName("a".repeat(40)));
   assert.ok(!isSafeName("0123456789abcdef0123"));

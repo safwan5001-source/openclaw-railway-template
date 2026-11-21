@@ -47,8 +47,18 @@ const BACKUP_FILE = /\.(bak|old|orig|rej|backup)$|\.(bak|backup)\.[^.]+$/i;
 const LOG_FILE = /\.log(\.\d+)?(\.gz)?$/i;
 const CACHE_DIR = /^(tmp|temp|cache|\.cache|_cacache|\.npm|\.pnpm-store|code cache|gpucache|shadercache|crashpad)$/i;
 
+// Backup/temp variants of a protected name stay protected (customers.sqlite.bak, IDENTITY.md.bak, creds.json.1 ...).
+const VARIANT_SUFFIX = /(\.(bak|old|orig|rej|backup|tmp|temp|swp|part|partial)|~|\.\d+)$/i;
+
 export function isProtectedName(name) {
-  return PROTECTED_NAMES.some((re) => re.test(name));
+  let n = name;
+  for (let i = 0; i < 4; i++) {
+    if (PROTECTED_NAMES.some((re) => re.test(n))) return true;
+    const stripped = n.replace(VARIANT_SUFFIX, "");
+    if (!stripped || stripped === n) break;
+    n = stripped;
+  }
+  return false;
 }
 
 // Only plain, short, non-identifying names are ever printed.
