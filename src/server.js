@@ -16,6 +16,7 @@ import {
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
+import { startStorageDiagnostics } from "./storage-diagnostics.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -1850,6 +1851,8 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `configured: ${isConfigured()}`);
   void probeDeviceBootstrapSdk();
+  // Opt-in (DIAG_STORAGE=1), read-only volume size heartbeat; returns null and does nothing otherwise.
+  startStorageDiagnostics({ log, env: process.env });
 
   if (isConfigured()) {
     (async () => {
