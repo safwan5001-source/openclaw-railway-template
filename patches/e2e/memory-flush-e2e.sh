@@ -32,20 +32,34 @@ for d in base patched; do
 done
 
 DATE=$(date -u +%F)
-run_case() { # label pkgdir port [env...]
-  local label=$1 pkg=$2 port=$3; shift 3
-  local r="$WORK/runs/$label"; rm -rf "$r"; mkdir -p "$r/state" "$r/ws"
-  cat > "$r/state/openclaw.json" <<JSON
+# One state template per install: config + the REAL @openclaw/whatsapp plugin, so OpenClaw resolves the
+# "whatsapp:+E164" owner entries exactly as the production gateway does (no WhatsApp account is linked).
+make_template() { # pkgdir -> $WORK/tmpl-<name>/state
+  local pkg=$1 tmpl="$WORK/tmpl-$(basename "$1")"
+  [ -f "$tmpl/.ready" ] && return 0
+  rm -rf "$tmpl"; mkdir -p "$tmpl/state"
+  cat > "$tmpl/state/openclaw.json" <<JSON
 {
-  "models": { "mode": "merge", "providers": { "fake": { "baseUrl": "http://127.0.0.1:$port/v1", "apiKey": "fake", "api": "openai-completions",
+  "models": { "mode": "merge", "providers": { "fake": { "baseUrl": "http://127.0.0.1:18570/v1", "apiKey": "fake", "api": "openai-completions",
     "models": [ { "id": "m1", "name": "Fake", "reasoning": false, "input": ["text"], "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0}, "contextWindow": 100000, "maxTokens": 4096 } ] } } },
-  "agents": { "defaults": { "model": { "primary": "fake/m1" }, "workspace": "$r/ws", "compaction": { "memoryFlush": { "enabled": true } } },
+  "agents": { "defaults": { "model": { "primary": "fake/m1" }, "workspace": "/placeholder", "compaction": { "memoryFlush": { "enabled": true } } },
     "entries": { "main": { "tools": { "alsoAllow": ["message", "browser"] } } } },
   "tools": { "profile": "coding", "toolsBySender": { "e164:$OWNER": { "allow": ["*"] }, "*": { "deny": ["write", "edit", "exec", "apply_patch"] } } },
   "channels": { "whatsapp": { "dmPolicy": "allowlist", "allowFrom": ["$OWNER"] } },
   "commands": { "ownerAllowFrom": ["whatsapp:$OWNER"] }
 }
 JSON
+  (cd "$tmpl" && OPENCLAW_STATE_DIR="$tmpl/state" node "$pkg/node_modules/openclaw/openclaw.mjs" plugins install "@openclaw/whatsapp@$VERSION" >/dev/null)
+  touch "$tmpl/.ready"
+}
+
+run_case() { # label pkgdir [env...]
+  local label=$1 pkg=$2; shift 2
+  local port=18570 r="$WORK/runs/$label"
+  make_template "$pkg"
+  rm -rf "$r"; mkdir -p "$r/ws"; cp -a "$WORK/tmpl-$(basename "$pkg")/state" "$r/state"
+  local revoke=0; case " $* " in *" BASHT_E2E_REVOKE_OWNER=1 "*) revoke=1 ;; esac
+  node -e 'const f=process.argv[1],c=JSON.parse(require("fs").readFileSync(f,"utf8"));c.agents.defaults.workspace=process.argv[2];if(process.argv[3]==="1")delete c.commands.ownerAllowFrom;require("fs").writeFileSync(f,JSON.stringify(c,null,2))' "$r/state/openclaw.json" "$r/ws" "$revoke"
   LOG="$r/llm.jsonl" PORT=$port RECALL_PATH="memory/$DATE.md" node "$HERE/fake-llm.mjs" > "$r/llm.out" 2>&1 &
   local llm=$!
   sleep 1
@@ -56,6 +70,7 @@ JSON
       || echo "exit=$?" >> "$r/agent.out"
   done
   kill "$llm" 2>/dev/null || true
+  wait "$llm" 2>/dev/null || true
 }
 
 FAIL=0
@@ -73,16 +88,19 @@ check() { # label expect_write expect_recall
   [ $ok = 1 ] || FAIL=1
 }
 
-run_case A-upstream-owner        "$WORK/base"    18571 BASHT_E2E_WHATSAPP_OWNER=$OWNER
-run_case B-patched-owner         "$WORK/patched" 18572 BASHT_E2E_WHATSAPP_OWNER=$OWNER
-run_case C-patched-spoofed-flag  "$WORK/patched" 18573 BASHT_E2E_WHATSAPP_OWNER=$OWNER BASHT_E2E_SENDER=$IMPOSTOR
-run_case D-patched-non-owner     "$WORK/patched" 18574 BASHT_E2E_WHATSAPP_OWNER=$OWNER BASHT_E2E_OWNER_FLAG=0
-run_case E-patched-cli-no-sender "$WORK/patched" 18575
+run_case A-upstream-owner         "$WORK/base"    BASHT_E2E_WHATSAPP_OWNER=$OWNER
+run_case B-patched-owner          "$WORK/patched" BASHT_E2E_WHATSAPP_OWNER=$OWNER
+run_case C-patched-spoofed-flag   "$WORK/patched" BASHT_E2E_WHATSAPP_OWNER=$OWNER BASHT_E2E_SENDER=$IMPOSTOR
+run_case D-patched-non-owner      "$WORK/patched" BASHT_E2E_WHATSAPP_OWNER=$OWNER BASHT_E2E_OWNER_FLAG=0
+run_case E-patched-cli-no-sender  "$WORK/patched"
+# F: owner flag + owner number, but the owner was removed from commands.ownerAllowFrom (no authority, not configured)
+run_case F-patched-owner-revoked  "$WORK/patched" BASHT_E2E_WHATSAPP_OWNER=$OWNER BASHT_E2E_REVOKE_OWNER=1
 
-echo "---- results (A reproduces the production bug; B is the fix; C-E must stay read-only)"
+echo "---- results (A reproduces the production bug; B is the fix; C-F must stay read-only)"
 check A-upstream-owner no
 check B-patched-owner yes
 check C-patched-spoofed-flag no
 check D-patched-non-owner no
 check E-patched-cli-no-sender no
+check F-patched-owner-revoked no
 exit $FAIL

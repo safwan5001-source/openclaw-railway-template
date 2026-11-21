@@ -9,12 +9,18 @@
 // "memory flush cannot persist memory/<date>.md: no write tool survived this agent's tool policy".
 // Writes that do survive are tagged with "untrusted" provenance because the run claims a non-owner sender.
 //
-// Patch: when — and only when — the source turn was an owner turn (senderIsOwner === true), its transcript is
-// not tainted, the flush uses the file arm (append-only `write` locked to memory/<date>.md), and the source turn
-// carries a concrete sender identity, the flush run keeps that identity (senderIsOwner + SenderId/E164/Name/
-// Username). If the source turn has a bound command-owner authority it is re-asserted before every model
-// attempt, so a revoked owner cannot flush. Everything else (non-owner sessions, tainted turns, tools-arm
-// providers, owner-only tool deny list, append-only projection) is unchanged.
+// Patch (fail-closed): the flush keeps the owner identity only when ALL hold —
+//   * the source turn was an owner turn (senderIsOwner === true) and its transcript is not tainted;
+//   * the flush uses the file arm (tools projected to `read` + append-only `write` locked to memory/<date>.md);
+//   * ownership is proven again at flush time by OpenClaw's own channel-owner rule (get-reply isCurrentChannelOwner):
+//     a bound command-owner authority must be current (revoked => denied, no fallback), otherwise the sender must
+//     match commands.ownerAllowFrom in the live config (wildcards never count);
+//   * only the sender identifiers that individually prove ownership are propagated.
+// The proof is repeated before every model attempt. WhatsApp (OpenClaw 2026.10.9) marks its sender identifier
+// "asserted", not "verified", so it never yields a command-owner authority; its owner basis is the configured-owner
+// match — the same basis OpenClaw already uses to grant that sender the owner's tools on the live turn.
+// Everything else (non-owner sessions, tainted turns, tools-arm providers, owner-only tool deny list, append-only
+// projection) is unchanged.
 //
 // The patch is exact-match and version-pinned: any drift (different OpenClaw version, different file hash, an
 // anchor that matches zero or several times) fails the image build instead of shipping a half-patched runtime.
@@ -30,7 +36,7 @@ export const PATCH_MARKER = "basht-patch:memory-flush-owner-identity";
 const CONTENT_INVENTORY = "dist/postinstall-content-inventory.json";
 
 const IMPORT_ANCHOR = `import { t as createSessionMaintenanceFollowup } from "./run-C50ZeOtw.mjs";\n`;
-const IMPORT_ADDITION = `import { u as captureCommandOwnerAssertion } from "./command-auth-BHrKDij6.mjs";\n`;
+const IMPORT_ADDITION = `import { d as getCommandOwnerAuthority, t as isConfiguredCommandOwner } from "./command-auth-BHrKDij6.mjs";\nimport { r as getRuntimeConfig } from "./io.runtime-B134MOMz.mjs";\n`;
 
 const RUN_ANCHOR = `		auth: params.followupRun.run
 	}).run;
@@ -46,7 +52,7 @@ const RUN_ADDITION = `	// ${PATCH_MARKER}: keep the verified owner identity for 
 		memoryFlushLog.debug("memory flush keeps verified owner identity", {
 			event: "memory_flush_owner_identity",
 			sourceSessionKey: params.sessionKey,
-			hasCommandOwnerAuthority: bashtOwnerFlushIdentity.hasCommandOwnerAuthority
+			ownerBasis: bashtOwnerFlushIdentity.ownerBasis
 		});
 	}
 `;
@@ -58,31 +64,46 @@ const CTX_REPLACEMENT = `					sessionCtx: bashtOwnerFlushIdentity ? bashtOwnerFl
 
 const EXPORT_ANCHOR = `export { runSessionCompactionIfNeeded as n, runMemoryFlushIfNeeded as t };`;
 const HELPER = `//#region ${PATCH_MARKER}
-/** Owner identity for a file-arm memory flush, or undefined to keep upstream's anonymous maintenance identity. */
+/**
+* Owner identity for a file-arm memory flush, or undefined to keep upstream's anonymous maintenance identity.
+* Fails closed. The propagated senderIsOwner flag alone is never sufficient: the sender must ALSO be proven to be the
+* owner now, by the same rule OpenClaw uses for channel-owner cron authority (get-reply: isCurrentChannelOwner):
+*   bound command-owner authority  -> authority.isCurrent()        (revoked/expired => denied, no fallback)
+*   no bound authority             -> isConfiguredCommandOwner(live config, sender)  (commands.ownerAllowFrom,
+*                                     wildcards never count)
+* Only identifiers that individually prove ownership are propagated; the proof is repeated before every attempt.
+*/
 function resolveBashtOwnerMemoryFlushIdentity(params) {
 	const run = params.sourceRun;
 	if (!run || run.senderIsOwner !== true || params.sourceTurnTainted === true) return;
 	if (typeof params.memoryFlushWritePath !== "string" || !params.memoryFlushWritePath.trim()) return;
 	const text = (value) => typeof value === "string" && value.trim() ? value.trim() : void 0;
-	const sender = {
-		SenderId: text(run.senderId),
-		SenderE164: text(run.senderE164),
-		SenderName: text(run.senderName),
-		SenderUsername: text(run.senderUsername)
+	const channel = text(run.messageProvider);
+	if (!channel) return;
+	const accountId = text(run.agentAccountId);
+	const authority = getCommandOwnerAuthority(run);
+	const candidates = { SenderId: text(run.senderId), SenderE164: text(run.senderE164) };
+	const provesOwner = (senderId) => {
+		try {
+			if (authority) return authority.isCurrent() === true;
+			return isConfiguredCommandOwner(getRuntimeConfig(), { channel, accountId, senderId });
+		} catch {
+			return false;
+		}
 	};
+	const sender = {};
+	for (const [key, value] of Object.entries(candidates)) if (value && provesOwner(value)) sender[key] = value;
 	if (!sender.SenderId && !sender.SenderE164) return;
-	for (const key of Object.keys(sender)) if (sender[key] === void 0) delete sender[key];
+	const name = text(run.senderName);
+	const username = text(run.senderUsername);
+	if (name) sender.SenderName = name;
+	if (username) sender.SenderUsername = username;
 	Object.freeze(sender);
-	const assertOwner = captureCommandOwnerAssertion(run);
-	try {
-		assertOwner?.();
-	} catch {
-		return;
-	}
+	const verifiedIds = [sender.SenderE164, sender.SenderId].filter(Boolean);
 	return Object.freeze({
-		hasCommandOwnerAuthority: Boolean(assertOwner),
+		ownerBasis: authority ? "command-owner-authority" : "configured-owner",
 		currentSessionCtx: () => {
-			assertOwner?.();
+			if (!verifiedIds.every(provesOwner)) throw new Error("Memory flush owner identity is no longer current; the flush was not run as owner.");
 			return { ...sender };
 		}
 	});
