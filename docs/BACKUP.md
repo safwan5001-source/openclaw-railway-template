@@ -59,17 +59,43 @@ node scripts/basht-backup.mjs keygen ~/basht-backup-keys
 3. Keep two copies: the computer and one cloud folder (iCloud/Google Drive/OneDrive — ciphertext only).
 4. Retention: last 8 weekly + last 3 monthly.
 
-### Before the security deploy (endpoint not live yet)
+### Before the security deploy — using only what production has today
 
-The current production already has `/setup` → **Export Data** (ZIP protected with the setup password, weak ZipCrypto).
-As a pre-deploy safety net: export, then immediately seal it with the public key and delete the plain ZIP:
+The encrypted backup above ships with PR #27 and is **not** in production yet. Production (commit `60ee51b`) has
+`/setup` → **Export Data**. Verified on an image built from that exact commit (synthetic data):
+
+- the ZIP contains everything needed: `openclaw.json`, `credentials/whatsapp/default/*` (WhatsApp session),
+  `state/openclaw.sqlite`, `agents/*/agent/*.sqlite` (conversations), `workspace/MEMORY.md`, `memory/`, `exports/`;
+  not `/data/.linuxbrew` (rebuilt from the image). It also carries rebuildable cache/tmp/log files.
+- it is a **live copy** (the gateway keeps running). A WAL database written continuously during the export restored
+  with `integrity_check = ok` and all committed rows — good, but not a guarantee: export at a quiet moment.
+- restore through `/setup` → Import onto an **empty** volume worked; files byte-identical, gateway healthy.
+- the ZIP password is the `SETUP_PASSWORD` **at export time**; after rotating it, Import needs the old one in the
+  "archive password" field (without it the import is refused). Keep the old password with the backup.
+- Import accepts at most **250 MB**. Check the ZIP size; above that, restore needs another route (ask first).
+- protection is legacy ZipCrypto and the ZIP holds every secret: encrypt it locally right away (below).
+
+Operator steps (own computer; nothing from PR #27 needed):
 
 ```bash
-node scripts/basht-backup.mjs seal openclaw-export-<ts>.zip ~/basht-backup-keys/basht-backup-public.pem export-<ts>.bkp
-rm openclaw-export-<ts>.zip
+# 1. /setup → Export Data (quiet moment, no active WhatsApp conversation). Then, in the download folder:
+export OLD_PW='<current SETUP_PASSWORD>'          # store it in the password manager with the backup date
+unzip -tq -P "$OLD_PW" openclaw-export-*.zip && ls -lh openclaw-export-*.zip      # valid + size (< 250 MB)
+unzip -Z1 openclaw-export-*.zip | grep -E 'credentials/whatsapp/default/creds.json|state/openclaw.sqlite|workspace/MEMORY.md'
+
+# 2. integrity of every database (macOS ships sqlite3), inside a private temp dir that is deleted afterwards
+T=$(mktemp -d) && unzip -q -P "$OLD_PW" openclaw-export-*.zip -d "$T" \
+  && find "$T" -name '*.sqlite' -exec sh -c 'printf "%s: " "${1#'"$T"'/}"; sqlite3 "$1" "PRAGMA integrity_check"' _ {} \; \
+  ; rm -rf "$T"
+
+# 3. encrypt (macOS, AES-256 disk image; asks for a new passphrase) and remove the plain ZIP
+mkdir basht-export && mv openclaw-export-*.zip basht-export/ \
+  && hdiutil create -encryption AES-256 -srcfolder basht-export -fs APFS basht-export-$(date +%F).dmg \
+  && rm -rf basht-export
 ```
 
-(The export is a live copy — the gateway is not paused — so it is a safety net, not the primary backup.)
+Keep the `.dmg` on the computer and one cloud folder; the passphrase and `OLD_PW` in the password manager. (On
+Windows/Linux: 7-Zip with AES-256, `7z a -p -mhe=on`.) Exporting copies production data: owner approval first.
 
 ## Restore
 

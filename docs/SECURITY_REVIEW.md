@@ -50,6 +50,7 @@ from the address bar itself.
 | R6 | `chown -R /data` on every boot rewrites ctime of every file. Measured: 0.25 s / 100k files on local disk (targeted `find` 0.14 s). | Low impact; revisit if PR #26 diagnostics show >500k files. `.linuxbrew` size on the volume will also be visible in PR #26 output. |
 | R7 | `openclaw.json.bak-*` is written on every config save and never pruned (contains secrets, uses volume space). | Decide a retention; not deleted automatically (production data). |
 | R8 | Other services reaching the wrapper over the private network got the token injected too. After V1 they need their own gateway token. | After deploy, watch logs for new 401s from sibling services. |
+| R9 | The broker's own volume (HMAC-signed proposals + approval ledger) has no backup path at all; neither Export nor the new backup covers it. This PR does not change any broker image input. | Decide whether the ledger must survive a volume loss (Daftra stays the source of truth); a broker export is a separate change. |
 
 ## 3. Deploy plan (owner approval required — nothing here was deployed)
 
@@ -58,10 +59,22 @@ the broker on the private network; the broker never calls OpenClaw), browser bri
 variables reference only the cloud-browser APIs). None depends on the token the wrapper used to inject.
 Railway switches traffic only after `/setup/healthz` passes, so a build or boot failure leaves the old deployment live.
 
-1. **Backup first** (Railway Hobby has none): `/setup` → Export Data, then seal it locally — `docs/BACKUP.md`
-   "Before the security deploy". Note the rollback target: the active deployment (commit `60ee51b`).
-2. Review + merge the PR to `main` (auto-deploys). Optionally in the same change: set `BASHT_BACKUP_PUBLIC_KEY`.
-3. **Acceptance tests (within 10 minutes)** — any failure → rollback (step 5):
+Nothing below depends on a feature that is not deployed: the pre-deploy backup uses production's existing
+`/setup` → Export Data, verified end to end on an image of the production commit (docs/BACKUP.md).
+
+1. **[approval: copy production data]** Export at a quiet moment, verify (ZIP valid, size < 250 MB, key paths
+   present, every `.sqlite` `integrity_check = ok`), encrypt locally, store the current `SETUP_PASSWORD` with it
+   (docs/BACKUP.md, "Before the security deploy"). Rollback target: the active deployment (commit `60ee51b`).
+2. **[approval, optional: reduce exposure until the deploy]** Remove the OpenClaw service's public domain
+   (Railway → Settings → Networking). Closes V1/V2/V10 from the internet at once. Unaffected: WhatsApp (outbound
+   connection), the broker (private network, OpenClaw calls it), the browser bridges (OpenClaw calls them), Railway's
+   health check (internal). Unavailable meanwhile: `/setup`, Control UI/web chat, any inbound `/hooks/*` webhook.
+   Worth it only if the merge is not immediate. Do it **after** step 1 (the export needs the domain).
+3. **[approval: merge]** Merge the PR to `main` (auto-deploys; traffic switches only after the health check passes).
+   If step 2 was done: once the deploy is healthy, generate the domain again and redeploy once so the new
+   `RAILWAY_PUBLIC_DOMAIN` is applied (allowed origin + forwarded headers are set at start). Expect a new hostname
+   unless the old prefix is still available (Settings → Networking → edit).
+4. **Acceptance tests (within 10 minutes)** — any failure → rollback (step 7):
 
    | # | Check | Expected |
    |---|---|---|
@@ -74,9 +87,9 @@ Railway switches traffic only after `/setup/healthz` passes, so a build or boot 
    | A7 | WhatsApp: message BASHT from the owner's phone | reply received |
    | A8 | Ask BASHT for a Daftra read (e.g. last 5 invoices) | answered via the broker |
    | A9 | Railway logs, 15 min | no crash/restart loop; no new 401/429 from sibling services |
-   | A10 | If the key is set: `/setup` → Download Encrypted Backup; `inspect` it locally | `.bkp`, correct key id, gateway back within seconds |
 
-4. **Rotate after the deploy is accepted** (not before — the old code would hand the new token out again):
+5. **[approval] Rotate after the deploy is accepted** (not before — the old code would hand the new token out
+   again). Keep the pre-rotation `SETUP_PASSWORD` with the export: restoring that ZIP needs it.
 
    | Secret | Why | How | Order |
    |---|---|---|---|
@@ -88,17 +101,19 @@ Railway switches traffic only after `/setup/healthz` passes, so a build or boot 
 
    Evidence to check before deciding step 5: Railway HTTP logs for `POST /tools/invoke`, `GET /openclaw` (302) and
    WebSocket upgrades from addresses that are not yours, since the domain went public.
-5. **Rollback:** Railway → Deployments → the noted deployment → **Rollback** (or revert the merge commit). No data
-   migration is involved; rotated tokens stay valid with the old code (but the old code would expose them again, so
-   roll forward with a fix rather than staying on the old code).
+6. **[approval, optional] Encrypted backups:** set `BASHT_BACKUP_PUBLIC_KEY`, take the first encrypted backup,
+   verify it, then retire the plain export.
+7. **Rollback:** Railway → Deployments → the noted deployment → **Rollback** (or revert the merge commit). No data
+   migration is involved. The old code re-exposes V1/V2/V10: if a rollback is needed, also remove the public domain
+   (step 2) until a fixed build is live.
 
 ## 3b. Incident containment
 
 | Signal | Immediate action | Then |
 |---|---|---|
-| Health check fails / restart loop after deploy | Rollback (step 5) | Read the deploy logs; reproduce with `scripts/smoke-openclaw-image.sh` |
+| Health check fails / restart loop after deploy | Rollback (step 7) | Read the deploy logs; reproduce with `scripts/smoke-openclaw-image.sh` |
 | WhatsApp stops answering, service healthy | Check logs for the WhatsApp channel; restart once | Rollback if it started with the deploy; WhatsApp session is in the backup |
-| Unknown paired device / anonymous tool calls in logs | Rotate gateway token + setup password, remove devices (step 4, rows 1–4) | Take an encrypted backup for forensics *before* cleaning; rotate provider keys; review `sessions` for data exposure |
+| Unknown paired device / anonymous tool calls in logs | Rotate gateway token + setup password, remove devices (step 5, rows 1–4) | Take an encrypted backup for forensics *before* cleaning; rotate provider keys; review `sessions` for data exposure |
 | Volume near full | Nothing is lost: boot no longer depends on the Homebrew copy | Enable `DIAG_STORAGE=1` (PR #26) to see what grows; restore needs free space (docs/BACKUP.md) |
 | Data loss / corrupted volume | Stop changes; new volume | Restore the latest `.bkp` (docs/BACKUP.md, drilled end to end) |
 
