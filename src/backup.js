@@ -2,7 +2,8 @@
 //
 // Opt-in: does nothing until BASHT_BACKUP_PUBLIC_KEY (an RSA public key, PEM) is set. The server never holds a key that
 // can decrypt (see backup-format.js). Flow:
-//   1. stop the gateway (SQLite databases and the WhatsApp session must not change mid-copy),
+//   1. take the gateway maintenance lock and stop it (SQLite databases and the WhatsApp session must not change
+//      mid-copy; nothing can restart it until step 3),
 //   2. archive state + workspace (regular files and directories only; rebuildable caches excluded) through gzip and
 //      encryption into the container's temporary disk — plaintext is never written anywhere, and nothing is written to
 //      the volume,
@@ -78,7 +79,7 @@ export async function writeEncryptedArchive({ stateDir, workspaceDir, publicKey,
 }
 
 export function registerBackupRoute(app, requireAuth, opts) {
-  const { stateDir, workspaceDir, publicKeyPem, stopGateway, startGateway, isGatewayRunning, log } = opts;
+  const { stateDir, workspaceDir, publicKeyPem, pauseGateway, resumeGateway, log } = opts;
   let publicKey = null;
   let configError = "Backup is not configured: set BASHT_BACKUP_PUBLIC_KEY (RSA public key, PEM). See docs/BACKUP.md.";
   if (publicKeyPem?.trim()) {
@@ -97,17 +98,27 @@ export function registerBackupRoute(app, requireAuth, opts) {
     if (busy) return res.status(409).json({ ok: false, error: "A backup is already running." });
     busy = true;
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "basht-backup-"));
-    const outFile = path.join(tmpDir, `basht-backup-${ts}.bkp`);
-    const wasRunning = isGatewayRunning();
+    let tmpDir = null;
     const started = Date.now();
     try {
-      if (wasRunning) await stopGateway();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "basht-backup-"));
+      const outFile = path.join(tmpDir, `basht-backup-${ts}.bkp`);
+      try {
+        // The maintenance lock keeps every start path (requests, WebSocket reconnects, timers) away until the
+        // snapshot is complete; it also cancels a start that is still in flight.
+        await pauseGateway("backup");
+      } catch (err) {
+        return res.status(409).json({ ok: false, error: `Gateway maintenance in progress (${err.message}).` });
+      }
       let result;
       try {
         result = await writeEncryptedArchive({ stateDir, workspaceDir, publicKey, outFile, meta: { host: "basht-openclaw" } });
       } finally {
-        if (wasRunning) startGateway().catch((err) => log.error("backup", `gateway restart failed: ${err.message}`));
+        busy = false; // the snapshot is done; sending the file does not need the lock
+        resumeGateway().catch((err) =>
+          // "paused" = another maintenance (backup/import) took the lock first; it restarts the gateway itself.
+          /paused/.test(err.message) ? log.info("backup", err.message) : log.error("backup", `gateway restart failed: ${err.message}`),
+        );
       }
       log.info("backup", `encrypted backup ready: ${result.bytes} bytes, gateway paused ${Date.now() - started} ms`);
       res.set({
@@ -126,7 +137,7 @@ export function registerBackupRoute(app, requireAuth, opts) {
         res.destroy();
       }
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       busy = false;
     }
   });

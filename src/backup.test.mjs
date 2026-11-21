@@ -84,6 +84,7 @@ before(async () => {
       OPENCLAW_PERSONA_SEED: "0",
       SETUP_PASSWORD: PASSWORD,
       BASHT_BACKUP_PUBLIC_KEY: fs.readFileSync(keys.pub, "utf8"),
+      FAKE_GATEWAY_START_LOG: path.join(T, "gateway-starts.log"),
     },
   });
   wrapper.stdout.on("data", (d) => (output += d));
@@ -238,4 +239,54 @@ test("seal: a legacy export ZIP can be encrypted locally and opened only with th
   assert.equal(tool(["decrypt", sealed, keys.priv, back]).status, 0);
   assert.equal(fs.readFileSync(back, "utf8"), `PK legacy ${CANARY}`);
   assert.notEqual(tool(["decrypt", sealed, keys.priv, path.join(T, "x")], { BASHT_BACKUP_PASSPHRASE: "wrong-passphrase-123" }).status, 0);
+});
+
+test("route: traffic during the backup cannot restart the gateway mid-archive (one restart, after the snapshot)", async () => {
+  // ~40 MB of incompressible data keeps the archive step busy long enough to race requests against it.
+  put("data/workspace/exports/big.bin", crypto.randomBytes(40 * 1024 * 1024));
+  const starts = () => fs.readFileSync(path.join(T, "gateway-starts.log"), "utf8").trim().split("\n").length;
+  for (let i = 0; i < 100; i++) {
+    if ((await (await fetch(`http://127.0.0.1:${port}/setup/healthz`)).json()).gatewayReachable) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const before = starts();
+  const backup = post("/setup/api/backup").then(async (r) => ({ status: r.status, bytes: (await r.arrayBuffer()).byteLength }));
+  const statuses = [];
+  let done = false;
+  backup.finally(() => (done = true));
+  await new Promise((r) => setTimeout(r, 30));
+  while (!done) {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/models`).catch(() => null);
+    if (r) {
+      statuses.push(r.status);
+      await r.arrayBuffer();
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  const res = await backup;
+  assert.equal(res.status, 200);
+  assert.ok(statuses.length > 3, "requests were raced against the backup");
+  assert.ok(statuses.includes(503), "requests during the snapshot get the 503 loading page instead of starting the gateway");
+  for (let i = 0; i < 100 && starts() < before + 1; i++) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(starts(), before + 1, `gateway must start exactly once (after the archive); started ${starts() - before} times`);
+  fs.rmSync(path.join(T, "data/workspace/exports/big.bin"));
+});
+
+test("route: a backup started while the gateway is still booting does not leave it down", async () => {
+  // Back-to-back backups: the second one pauses the gateway while the first one's restart is still in flight.
+  const first = await post("/setup/api/backup");
+  assert.equal(first.status, 200);
+  await first.arrayBuffer();
+  const second = await post("/setup/api/backup");
+  assert.equal(second.status, 200);
+  await second.arrayBuffer();
+  let reachable = false;
+  const t0 = Date.now();
+  while (!reachable && Date.now() - t0 < 15_000) {
+    reachable = (await (await fetch(`http://127.0.0.1:${port}/setup/healthz`)).json()).gatewayReachable === true;
+    if (!reachable) await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(reachable, `gateway back within 15 s (was: stuck ~60 s, then "restart failed"); took ${Date.now() - t0} ms`);
+  assert.ok(!/gateway restart failed/.test(output), "no failed restart logged");
 });

@@ -390,11 +390,41 @@ async function probeGatewayOnce(opts = {}) {
   return { ok: false, endpoint: null };
 }
 
+// Maintenance lock: while a backup or an import holds the gateway down, nothing may start it (proxied requests,
+// WebSocket reconnects, the auto-restart timer). Otherwise a request arriving mid-snapshot or mid-swap would restart the
+// gateway and let it write to the databases / WhatsApp session that are being copied or replaced.
+let gatewayPausedFor = null;
+
+async function pauseGateway(reason) {
+  if (gatewayPausedFor) throw new Error(`gateway is already paused for ${gatewayPausedFor}`);
+  gatewayPausedFor = reason;
+  // A start already in flight sees the lock, stops waiting and settles; then the process is stopped.
+  try {
+    await gatewayStarting;
+  } catch {}
+  try {
+    await stopGatewayProcess();
+  } catch (err) {
+    gatewayPausedFor = null;
+    throw err;
+  }
+}
+
+async function resumeGateway() {
+  gatewayPausedFor = null;
+  gatewayRestartCount = 0;
+  return ensureGatewayRunning();
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
+    if (gatewayPausedFor) {
+      log.info("gateway", `start abandoned: paused for ${gatewayPausedFor}`);
+      return false;
+    }
     const probe = await probeGatewayOnce();
     if (probe.ok) {
       log.info("gateway", `ready at ${probe.endpoint}`);
@@ -408,6 +438,7 @@ async function waitForGatewayReady(opts = {}) {
 
 async function startGateway() {
   if (gatewayProc) return;
+  if (gatewayPausedFor) throw new Error(`Gateway is paused for ${gatewayPausedFor}`);
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -495,6 +526,7 @@ async function startGateway() {
 }
 
 async function ensureGatewayRunning() {
+  if (gatewayPausedFor) throw new Error(`Gateway is paused for ${gatewayPausedFor}`);
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
   const probe = await probeGatewayOnce();
@@ -520,7 +552,9 @@ async function ensureGatewayRunning() {
       await startGateway();
       const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
       if (!ready) {
-        throw new Error("Gateway did not become ready in time");
+        throw new Error(
+          gatewayPausedFor ? `Gateway start cancelled: paused for ${gatewayPausedFor}` : "Gateway did not become ready in time",
+        );
       }
     })().finally(() => {
       gatewayStarting = null;
@@ -1646,8 +1680,9 @@ app.post(
 
       // Now that the archive is fully extracted and validated, take down the
       // gateway. From here through the rename swap, downtime is unavoidable.
-      gatewayWasStopped = gatewayProc !== null;
-      if (gatewayWasStopped) await stopGatewayProcess();
+      // Hold the maintenance lock for the whole swap (also when the gateway was not running).
+      await pauseGateway("import");
+      gatewayWasStopped = true;
 
       for (const { target, source } of validReplacements) {
         const backup = `${target}.bak-${ts}`;
@@ -1665,7 +1700,8 @@ app.post(
       backups.length = 0;
 
       log.info("import", `restored ${buf.length} bytes from archive`);
-      await restartGateway();
+      gatewayWasStopped = false;
+      await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });
     } catch (err) {
       const status = err.status ?? 500;
@@ -1676,7 +1712,7 @@ app.post(
         try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
         try { fs.renameSync(backup, target); } catch {}
       }
-      if (gatewayWasStopped) await ensureGatewayRunning().catch(() => {});
+      if (gatewayWasStopped) await resumeGateway().catch(() => {});
       return res.status(status).json({ ok: false, error: err.message, ...extra });
     } finally {
       cleanup();
@@ -1692,9 +1728,8 @@ registerBackupRoute(app, requireSetupAuth, {
   stateDir: STATE_DIR,
   workspaceDir: WORKSPACE_DIR,
   publicKeyPem: process.env.BASHT_BACKUP_PUBLIC_KEY,
-  stopGateway: stopGatewayProcess,
-  startGateway: ensureGatewayRunning,
-  isGatewayRunning: () => gatewayProc !== null,
+  pauseGateway,
+  resumeGateway,
   log,
 });
 

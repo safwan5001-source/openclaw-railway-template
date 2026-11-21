@@ -2,6 +2,7 @@
 // `gateway run --port N` starts a loopback HTTP server that ECHOES what the wrapper forwarded (Authorization header,
 // body, whether SETUP_PASSWORD leaked into its environment). Every other subcommand succeeds without doing anything.
 // No network beyond 127.0.0.1, no real OpenClaw, no secrets.
+import fs from "node:fs";
 import http from "node:http";
 
 const args = process.argv.slice(2);
@@ -13,6 +14,8 @@ if (args[0] === "--version") {
 
 if (args[0] === "gateway" && args[1] === "run") {
   const port = Number(args[args.indexOf("--port") + 1]);
+  // Optional start counter (tests): one line per gateway start, outside the backed-up directories.
+  if (process.env.FAKE_GATEWAY_START_LOG) fs.appendFileSync(process.env.FAKE_GATEWAY_START_LOG, `${Date.now()}\n`);
   const envHasSetupPassword = Object.prototype.hasOwnProperty.call(process.env, "SETUP_PASSWORD");
   const server = http.createServer((req, res) => {
     if (req.url === "/startupz") {
