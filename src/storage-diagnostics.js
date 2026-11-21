@@ -315,8 +315,9 @@ export function startStorageDiagnostics({
     try {
       const fsInfo = await getFsInfo(root, statfs);
       const report = await scanTree(root, { fs: fsImpl, now: now() });
-      const pct = fsInfo?.pct ?? 0;
-      const { state, emit } = nextAlertState(alert, pct, now());
+      // Without a usage measurement there is no evidence either way: keep the previous alert state, emit nothing.
+      const pct = fsInfo ? fsInfo.pct : null;
+      const { state, emit } = pct === null ? { state: alert, emit: null } : nextAlertState(alert, pct, now());
       alert = state;
       const [summary, detail] = buildLines(report, fsInfo, state.level);
       log.info("storage-diag", summary);

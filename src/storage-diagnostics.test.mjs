@@ -149,6 +149,31 @@ test("start: disabled by default and touches nothing", () => {
   assert.equal(touched, false);
 });
 
+test("start: a statfs failure keeps the previous alert state and emits no false recovery", async () => {
+  const root = fixture();
+  const lines = [];
+  const log = { info: (c, m) => lines.push(["info", m]), warn: (c, m) => lines.push(["warn", m]) };
+  let fail = false;
+  const h = startStorageDiagnostics({
+    log,
+    env: { DIAG_STORAGE: "1", DIAG_STORAGE_ROOT: root },
+    statfs: async () => {
+      if (fail) throw new Error("statfs unavailable");
+      return { blocks: 1000, bsize: 1_000_000, bfree: 30, bavail: 30 }; // 97% used
+    },
+    setTimeoutFn: () => ({ unref() {} }),
+  });
+  assert.equal((await h.runOnce()).emit, "crit");
+  fail = true;
+  const r = await h.runOnce();
+  assert.equal(r.emit, null);
+  assert.equal(JSON.parse(r.summary).level, "crit", "level preserved");
+  assert.equal(JSON.parse(r.summary).fs, null);
+  assert.ok(!lines.some(([, m]) => /back below/.test(m)), "no false recovery message");
+  h.stop();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("start: opt-in runOnce logs two compact lines and a single warning above 85%", async () => {
   const root = fixture();
   const lines = [];
