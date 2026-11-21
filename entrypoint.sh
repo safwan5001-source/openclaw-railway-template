@@ -30,4 +30,11 @@ fi
 /app/skill-sync.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw basht-accounting \
   || echo "[entrypoint] accounting skill sync skipped (see message above); OpenClaw starts normally" >&2
 
+# skill-sync runs as root after the ownership pass above: on a fresh volume it creates the workspace and its skills/
+# directory root-owned, and the agent could not write its memory there until the next boot. Hand them back.
+WS_DIR="${OPENCLAW_WORKSPACE_DIR:-/data/workspace}"
+for d in "$WS_DIR" "$WS_DIR/skills"; do
+  if [ -d "$d" ] && [ ! -L "$d" ]; then chown -h openclaw:openclaw "$d" || true; fi
+done
+
 exec gosu openclaw node src/server.js

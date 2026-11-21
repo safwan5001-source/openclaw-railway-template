@@ -36,7 +36,7 @@ chmod +x "$TMP/bin/"*
 sandbox() {
   local R="$TMP/$1"; rm -rf "$R"; mkdir -p "$R/data" "$R/home/linuxbrew/.linuxbrew/bin" "$R/app"
   echo brew-v1 > "$R/home/linuxbrew/.linuxbrew/bin/brew"
-  printf '#!/bin/bash\nexit 0\n' > "$R/app/skill-sync.sh"; chmod +x "$R/app/skill-sync.sh"
+  printf '#!/bin/bash\nmkdir -p "$2/skills"\nexit 0\n' > "$R/app/skill-sync.sh"; chmod +x "$R/app/skill-sync.sh"
   sed -e "s#/home/linuxbrew#$R/home/linuxbrew#g" -e "s#/data#$R/data#g" -e "s#/app/#$R/app/#g" \
     "$ROOT/entrypoint.sh" > "$R/entrypoint.sh"
   echo "$R"
@@ -44,7 +44,7 @@ sandbox() {
 run() { # <root> [env...]
   local R="$1"; shift
   rm -f "$R/log"
-  env FAKE_LOG="$R/log" PATH="$TMP/bin:$PATH" "$@" bash "$R/entrypoint.sh" >"$R/out" 2>&1
+  env FAKE_LOG="$R/log" PATH="$TMP/bin:$PATH" OPENCLAW_WORKSPACE_DIR="$R/data/workspace" "$@" bash "$R/entrypoint.sh" >"$R/out" 2>&1
 }
 
 R="$(sandbox fresh)"; run "$R"; rc=$?
@@ -52,6 +52,8 @@ check "fresh volume: boots (gosu reached)" '[ $rc -eq 0 ] && grep -q "GOSU openc
 check "fresh volume: Homebrew copied to the volume" '[ "$(cat "$R/data/.linuxbrew/bin/brew")" = brew-v1 ]'
 check "fresh volume: image path is a symlink to the volume copy" '[ -L "$R/home/linuxbrew/.linuxbrew" ] && [ "$(readlink "$R/home/linuxbrew/.linuxbrew")" = "$R/data/.linuxbrew" ]'
 check "fresh volume: no staging leftovers" '[ ! -e "$R/data/.linuxbrew.partial" ]'
+
+check "fresh volume: workspace and skills dirs created by skill-sync are handed to openclaw" 'grep -q "CHOWN -h openclaw:openclaw $R/data/workspace$" "$R/log" && grep -q "CHOWN -h openclaw:openclaw $R/data/workspace/skills$" "$R/log"'
 
 R="$(sandbox existing)"; mkdir -p "$R/data/.linuxbrew/bin"; echo brew-on-volume > "$R/data/.linuxbrew/bin/brew"; run "$R"; rc=$?
 check "existing volume copy is kept (not overwritten) and used" '[ $rc -eq 0 ] && [ "$(cat "$R/data/.linuxbrew/bin/brew")" = brew-on-volume ] && [ -L "$R/home/linuxbrew/.linuxbrew" ]'
