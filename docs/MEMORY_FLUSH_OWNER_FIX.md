@@ -26,12 +26,20 @@ summarized the conversation away — facts the owner stated were lost from durab
 
 ## 3. Fix (build-time, version-pinned patch — `patches/openclaw-memory-flush-owner.mjs`)
 
-For the **file-arm** flush only, when the source turn is a **verified owner turn** (`senderIsOwner === true`), its
-transcript is **not tainted**, and it carries a concrete sender identity (`SenderId` or `SenderE164`):
+For the **file-arm** flush only, the flush keeps the owner's identity (`senderIsOwner: true` + the owner's
+`SenderId/SenderE164`) **only when all of the following hold — otherwise it fails closed to upstream's anonymous
+identity**:
 
-* the flush run keeps `senderIsOwner: true` and the owner's `SenderId/SenderE164/SenderName/SenderUsername`;
-* if a command-owner authority is bound to the source run it is asserted when the flush is prepared (revoked → falls
-  back to upstream anonymous identity) **and again before every model attempt** (revoked mid-flush → attempt aborts).
+1. the source turn was an owner turn (`run.senderIsOwner === true`) and its transcript is not tainted;
+2. the flush uses the file arm (`memoryFlushWritePath` set — never the tools arm);
+3. ownership is **proven again at flush time** with OpenClaw's own channel-owner rule
+   (`get-reply-XXltnwYw.mjs:3847`, `isCurrentChannelOwner`):
+   * a bound `commandOwnerAuthority` must be **current** — revoked/expired/throwing ⇒ denied, **no fallback**;
+   * with no bound authority, the sender must match `commands.ownerAllowFrom` in the **live** config
+     (`isConfiguredCommandOwner(getRuntimeConfig(), …)`; wildcards are stripped and never count);
+4. only identifiers that **individually** prove ownership are propagated (an impostor `SenderId` next to an owner
+   `SenderE164` is dropped);
+5. the proof is **repeated before every model attempt** — a revocation mid-flush aborts the attempt.
 
 Unchanged: non-owner sessions, tainted turns, tools-arm providers, CLI/webchat turns without a sender, the owner-only
 core-tool deny list, the flush tool projection (**exactly `read` + append-only `write` locked to `memory/<date>.md`**,
@@ -41,26 +49,54 @@ Safety rails: the patch is four exact-match edits; the build **fails** if the Op
 (`afee1159…7641`) or any anchor differs. OpenClaw's own `postinstall-content-inventory.json` entry is updated so update
 and integrity tooling stays consistent.
 
+### 3.1 How owner identity is established (OpenClaw 2026.10.9 source)
+
+| Source of `senderIsOwner` on a live turn | WhatsApp in 2026.10.9 |
+|---|---|
+| `senderIsOwnerByIdentity` — adapter-supplied `SenderId`/`SenderE164` match `commands.ownerAllowFrom` (`command-auth-BHrKDij6.mjs:439`) | **This is the only basis.** |
+| `senderIsOwnerByScope` — internal channel with `operator.admin` scope (`:440`) | n/a (internal channels only) |
+| `commandOwnerAuthority` — bound only for a **verified** stable-id principal (`runtime-DMtpNGYN.mjs:1275`) | **Never produced**: the WhatsApp plugin declares its sender identity without `authentication`, so it defaults to `"asserted"`, not `"verified"` (`@openclaw/whatsapp` `monitor-DVzumwCI.mjs:188-212`, core `runtime-DMtpNGYN.mjs:28`). |
+
+So requiring `commandOwnerAuthority` unconditionally would make the fix inert on WhatsApp, while accepting the
+propagated flag alone (the original revision) trusted a boolean. The fail-closed revision re-derives ownership from the
+same evidence the gateway used — the channel-asserted sender id against the configured owner list — and honours a
+command-owner authority wherever one exists. A sender that is admitted by `channels.whatsapp.allowFrom` but is **not**
+in `commands.ownerAllowFrom` is never treated as owner.
+
+### 3.2 Why the flush can never exceed the real owner's rights
+
+* The flush tool set is projected to `read` + append-only `write` **before** any policy layer
+  (`core-coding-tools-DFJcX7yX.mjs:123-140`); policy can only remove tools.
+* For `trigger === "memory"` OpenClaw disables ring-zero tools (`agent-tools-Bpi7xWYy.mjs`), tool-search/code-mode
+  (`tool-surface-bridge-Ccc1MrSf.mjs:1584-1593`), client tools and bundle MCP/LSP tools
+  (`builtin-openclaw-BxzDR6yL.mjs:604-620`), and forces workspace-only file access (`prepared-tool-surface-uIlMCUI4.mjs:13`).
+* The append-only writer rejects any path other than `memory/<date>.md` (including `@`-prefixed and escaping paths),
+  never truncates, and refuses replayed content (`agent-tools.read-KaO_d_Xi.mjs:521-575`).
+
 ## 4. Verification
 
 | Layer | What | Result |
 |---|---|---|
-| Unit | patch transform, drift refusal, reversibility, helper gates (owner / non-owner / tainted / tools-arm / no identity / revoked authority), doctor helpers | 7/7 |
-| Integration (real `openclaw@2026.10.9` dist) | hash pin; patched module links; real tool-policy matrix | 3/3 |
-| End-to-end (`patches/e2e/memory-flush-e2e.sh`) | real `openclaw agent --local` turns → flush → compaction → recall, loopback fake model | 5/5 |
-| Regression | full repo suite | 496/496 |
+| Unit — security gates | `senderIsOwner=true` + sender, **no** authority, **not** configured ⇒ denied; configured owner ⇒ allowed; owner removed from live config mid-flush ⇒ attempt aborts; authority current ⇒ allowed; authority revoked/expired/throwing ⇒ denied **without** config fallback; impostor number / mixed ids / other channel / no channel; non-owner, tainted, tools-arm, identity-less, config-read failure | 6/6 |
+| Unit — patch & doctor | transform, drift refusal, reversibility, version/hash refusal, PN/LID helpers, doctor applies the same owner gate | 5/5 |
+| Integration (real `openclaw@2026.10.9` dist) | hash pin; patched module links; real tool-policy matrix; helper with **real** `isConfiguredCommandOwner` / `getCommandOwnerAuthority` (wildcard, prefixed-entry-without-plugin fail closed, revoked bound authority); **real** append-only writer: 6 forbidden paths rejected, replay rejected, append preserves existing entries, other files untouched | 5/5 |
+| End-to-end (`patches/e2e/memory-flush-e2e.sh`) | real `openclaw agent --local` turns with the **real `@openclaw/whatsapp` plugin** → flush → compaction → recall | 6/6 |
+| Regression | full repo suite | 502/502 |
 | Packaging | `check-dockerfiles` + entrypoint simulations | 10/10 |
-| Runtime | patched gateway boots (`/startupz` 200, `/healthz` 200, DB integrity gate passed) | pass |
+| Image | Dockerfile builds with the patch (sha `2812f12a…`); image boots via entrypoint (`/setup/healthz` 200, gateway ready) | pass |
+| Security review | dedicated security review of the full diff against OpenClaw + WhatsApp plugin source | 0 findings ≥ 8/10 |
 
-End-to-end matrix (owner `+15550001234` has an owner-only `toolsBySender` grant; `*` denies `write`):
+End-to-end matrix (owner `+15550001234` is in `commands.ownerAllowFrom` as `whatsapp:+15550001234` and has an
+owner-only `toolsBySender` grant; `*` denies `write`):
 
-| Case | Flush tools | Saved to `memory/<date>.md` | Recall after compaction |
-|---|---|---|---|
-| A upstream, owner turn | `read` | no — "no write tool survived" | NOT-FOUND (**production bug**) |
-| B patched, owner turn | `read, write` | yes | **ZEBRA-4417** |
-| C patched, owner flag spoofed with another number | `read` | no | NOT-FOUND |
-| D patched, non-owner turn | `read` | no | NOT-FOUND |
-| E patched, CLI turn without sender | `read` | no (= upstream) | NOT-FOUND |
+| Case | Owner identity kept | Flush tools | Saved | Recall after compaction | Result |
+|---|---|---|---|---|---|
+| A upstream, owner turn | — | `read` | no — "no write tool survived" | NOT-FOUND (**production bug**) | PASS (bug reproduced) |
+| B patched, owner turn | yes (configured-owner) | `read, write` | yes | **ZEBRA-4417** | PASS |
+| C patched, owner flag spoofed with another number | **no** (gate) | `read` | no | NOT-FOUND | PASS |
+| D patched, non-owner turn | no | `read` | no | NOT-FOUND | PASS |
+| E patched, CLI turn without sender | no (= upstream) | `read` | no | NOT-FOUND | PASS |
+| F patched, owner flag + owner number, owner **not** in `ownerAllowFrom` | **no** (gate) | `read` | no | NOT-FOUND | PASS |
 
 The E2E uses test-only instrumentation that gives the CLI maintenance run the same fields a WhatsApp owner reply turn
 carries; it is applied identically to baseline and patched installs and never ships in the image.
@@ -96,6 +132,8 @@ flush, impostor flush — plus PN/LID forms and the latest memory files. Numbers
 | Prompt-injected transcript writes junk memory | Tainted turns keep upstream behaviour; append-only writes with duplicate rejection; non-owner sessions unchanged. |
 | Owner revoked between turn and flush | Command-owner assertion at prepare time and before every attempt. |
 | Production config blocks `write` for everyone | Doctor reports it; requires an explicit config decision (§5). |
+| Owner not listed in `commands.ownerAllowFrom` (only in `channels.whatsapp.allowFrom`) | Patch fails closed (flush stays anonymous); doctor reports `OWNER UNVERIFIED`. Adding the owner is a config decision. |
+| Provenance (residual, accepted): owner flush notes are tagged `agent` instead of upstream's `untrusted`, so they become eligible for dreaming promotion. Turn-taint only covers the latest turn, so injected text from earlier turns in the flushed window could reach a promotable note. | Same trust model OpenClaw applies to the owner's live turns (which see the same history with more tools). If stricter labelling is wanted, keep `senderIsOwner:false` for provenance only — a one-line follow-up. |
 
 ## 7. Other production findings (out of scope, not changed)
 
