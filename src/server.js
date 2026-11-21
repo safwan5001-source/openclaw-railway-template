@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerBackupRoute } from "./backup.js";
+import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
 
@@ -1469,57 +1470,50 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
     .json({ ok: result.code === 0, output: result.output });
 });
 
-app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const zipName = `openclaw-export-${timestamp}.zip`;
-  const tmpZip = path.join(os.tmpdir(), zipName);
+// Streaming export (src/export-stream.js): starts sending at once, no temp file, one at a time, stops with the client.
+registerStreamingExport(app, requireSetupAuth, {
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  password: SETUP_PASSWORD,
+  log,
+});
 
-  try {
-    const dirsToExport = [];
-    if (fs.existsSync(STATE_DIR)) dirsToExport.push(STATE_DIR);
-    if (fs.existsSync(WORKSPACE_DIR)) dirsToExport.push(WORKSPACE_DIR);
+const IMPORT_MAX_BYTES = 1024 * 1024 * 1024;
 
-    if (dirsToExport.length === 0) {
-      return res.status(404).json({ ok: false, error: "No data directories found to export." });
-    }
-
-    const zipArgs = ["-r", "-P", SETUP_PASSWORD, tmpZip, ...dirsToExport];
-    const result = await runCmd("zip", zipArgs);
-
-    if (result.code !== 0 || !fs.existsSync(tmpZip)) {
-      return res.status(500).json({ ok: false, error: "Failed to create export archive.", output: result.output });
-    }
-
-    const stat = fs.statSync(tmpZip);
-    res.set({
-      "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${zipName}"`,
-      "Content-Length": String(stat.size),
-    });
-
-    const stream = fs.createReadStream(tmpZip);
-    stream.pipe(res);
-    stream.on("end", () => {
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
-    });
-    stream.on("error", (err) => {
-      log.error("export", `stream error: ${err.message}`);
-      try { fs.rmSync(tmpZip, { force: true }); } catch {}
-      if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "Stream error during export." });
+/** Streams a request body to `file` (created exclusively, 0600), enforcing `max` bytes. Resolves to the byte count. */
+function receiveUpload(req, file, max) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(file, { flags: "wx", mode: 0o600 });
+    let n = 0;
+    req.on("data", (chunk) => {
+      n += chunk.length;
+      if (n > max) {
+        req.unpipe(out);
+        out.destroy();
+        const e = new Error(`Archive too large (max ${Math.round(max / 1e6)} MB).`);
+        e.status = 413;
+        reject(e);
+        req.resume();
       }
     });
-  } catch (err) {
-    try { fs.rmSync(tmpZip, { force: true }); } catch {}
-    log.error("export", `error: ${err.message}`);
-    return res.status(500).json({ ok: false, error: `Export failed: ${err.message}` });
-  }
-});
+    req.on("aborted", () => {
+      out.destroy();
+      const e = new Error("Upload interrupted.");
+      e.status = 400;
+      reject(e);
+    });
+    out.on("error", (err) => {
+      err.status = /ENOSPC/.test(String(err.code)) ? 507 : 500;
+      reject(err);
+    });
+    out.on("finish", () => resolve(n));
+    req.pipe(out);
+  });
+}
 
 app.post(
   "/setup/api/import",
   requireSetupAuth,
-  express.raw({ type: "application/zip", limit: "250mb" }),
   async (req, res) => {
     const dataRoot = "/data";
     const isUnder = (p) => {
@@ -1534,9 +1528,26 @@ app.post(
       });
     }
 
-    const buf = req.body;
-    if (!Buffer.isBuffer(buf) || buf.length === 0) {
-      return res.status(400).json({ ok: false, error: "Empty or invalid request body." });
+    // The upload is streamed to the volume (it used to be buffered in memory, up to 250 MB). Refuse early when it
+    // cannot fit: the archive and its extracted copy both live on the volume until the swap.
+    if (!/^application\/zip\b/i.test(String(req.get("content-type") || ""))) {
+      return res.status(415).json({ ok: false, error: "Upload must be application/zip." });
+    }
+    const declared = Number(req.get("content-length") || 0);
+    if (declared > IMPORT_MAX_BYTES) {
+      return res.status(413).json({ ok: false, error: `Archive too large (max ${Math.round(IMPORT_MAX_BYTES / 1e6)} MB).` });
+    }
+    if (declared > 0) {
+      try {
+        const st = fs.statfsSync(dataRoot);
+        const free = Number(st.bavail) * Number(st.bsize);
+        if (free < declared * 2.2 + 200e6) {
+          return res.status(507).json({
+            ok: false,
+            error: `Not enough free space on the volume for this restore: needs about ${Math.round((declared * 2.2 + 200e6) / 1e6)} MB, ${Math.round(free / 1e6)} MB free.`,
+          });
+        }
+      } catch {}
     }
 
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1595,7 +1606,8 @@ app.post(
     const backups = [];
     let gatewayWasStopped = false;
     try {
-      fs.writeFileSync(tmpZip, buf);
+      const uploaded = await receiveUpload(req, tmpZip, IMPORT_MAX_BYTES);
+      if (uploaded === 0) throw reject(400, "Empty or invalid request body.");
 
       // Pre-validate every archive entry. Reject anything that isn't under one
       // of the configured state/workspace prefixes — the archive is gated by
@@ -1699,7 +1711,7 @@ app.post(
       }
       backups.length = 0;
 
-      log.info("import", `restored ${buf.length} bytes from archive`);
+      log.info("import", `restored ${uploaded} bytes from archive`);
       gatewayWasStopped = false;
       await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });

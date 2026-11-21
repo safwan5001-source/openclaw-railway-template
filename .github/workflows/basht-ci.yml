@@ -67,3 +67,5 @@ jobs:
         run: bash scripts/smoke-openclaw-image.sh basht-openclaw-ci
       - name: Backup and restore drill (synthetic data)
         run: bash scripts/restore-drill.sh basht-openclaw-ci
+      - name: Large export -> restore drill (streaming, ~900 MB synthetic)
+        run: bash scripts/export-drill.sh basht-openclaw-ci 900
