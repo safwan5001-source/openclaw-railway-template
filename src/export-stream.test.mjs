@@ -193,3 +193,42 @@ test("export remains behind the setup login", async () => {
   const p = await fetch(`http://127.0.0.1:${port}/setup/api/export/plan`);
   assert.equal(p.status, 401);
 });
+
+test("essential scope: config, WhatsApp, databases, memory — without the bulky PDF copies; plan shows the largest folders", async () => {
+  const r = await fetch(`http://127.0.0.1:${port}/setup/api/export/plan?scope=essential`, { headers: { authorization: BASIC } });
+  const j = await r.json();
+  assert.equal(j.scope, "essential");
+  assert.ok(j.bytes < 1024 * 1024, `essential is small (${j.bytes} bytes)`);
+  const full = await (await fetch(`http://127.0.0.1:${port}/setup/api/export/plan?scope=full`, { headers: { authorization: BASIC } })).json();
+  assert.ok(full.largest.length > 0 && full.largest[0].dir.endsWith("/exports"), JSON.stringify(full.largest));
+  assert.ok(full.largest.every((d) => !/big-\d+\.bin/.test(d.dir)), "folder names only, never file names");
+});
+
+test("one-time link: needs the login + same origin to issue; downloads without credentials exactly once", async () => {
+  const base = `http://127.0.0.1:${port}`;
+  const anon = await fetch(`${base}/setup/api/export/link`, { method: "POST" });
+  assert.equal(anon.status, 401);
+  const cross = await fetch(`${base}/setup/api/export/link`, { method: "POST", headers: { authorization: BASIC, origin: "https://evil.example" } });
+  assert.equal(cross.status, 403, "cross-site pages cannot mint a link");
+  const issued = await fetch(`${base}/setup/api/export/link`, {
+    method: "POST",
+    headers: { authorization: BASIC, origin: base, "content-type": "application/json" },
+    body: JSON.stringify({ scope: "essential" }),
+  });
+  assert.equal(issued.status, 200);
+  const { url, expiresInSeconds } = await issued.json();
+  assert.match(url, /^\/setup\/api\/export\/download\/[A-Za-z0-9_-]{43}$/);
+  assert.equal(expiresInSeconds, 120);
+  const zip = path.join(T, "essential.zip");
+  const dl = await fetch(base + url); // no Authorization header, like an iOS download manager
+  assert.equal(dl.status, 200);
+  assert.match(dl.headers.get("content-disposition"), /openclaw-export-essential-/);
+  fs.writeFileSync(zip, Buffer.from(await dl.arrayBuffer()));
+  const entries = spawnSync("unzip", ["-Z1", zip], { encoding: "utf8" }).stdout;
+  assert.match(entries, /credentials\/whatsapp\/default\/creds\.json/);
+  assert.match(entries, /workspace\/MEMORY\.md/);
+  assert.doesNotMatch(entries, /exports\/big-/, "essential export leaves out the PDF/export copies");
+  assert.equal(spawnSync("unzip", ["-tq", "-P", PASSWORD, zip]).status, 0);
+  assert.equal((await fetch(base + url)).status, 404, "single use");
+  assert.equal((await fetch(`${base}/setup/api/export/download/${"A".repeat(43)}`)).status, 404, "unknown tokens refused");
+});

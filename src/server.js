@@ -1480,6 +1480,18 @@ registerStreamingExport(app, requireSetupAuth, {
 
 const IMPORT_MAX_BYTES = 1024 * 1024 * 1024;
 
+/** Re-installs the bundled skills into the workspace with the same script the entrypoint runs at boot. */
+async function resyncBundledSkills() {
+  const script = path.join(process.cwd(), "skill-sync.sh");
+  const source = path.join(process.cwd(), "skills");
+  if (!fs.existsSync(script) || !fs.existsSync(source)) return;
+  for (const name of ["basht-daftra", "basht-accounting"]) {
+    const r = await runCmd("bash", [script, source, WORKSPACE_DIR, "-", name]);
+    if (r.code === 0) log.info("import", `bundled skill ${name} re-installed`);
+    else log.warn("import", `bundled skill ${name} not re-installed (exit ${r.code}); it returns at the next restart`);
+  }
+}
+
 /** Streams a request body to `file` (created exclusively, 0600), enforcing `max` bytes. Resolves to the byte count. */
 function receiveUpload(req, file, max) {
   return new Promise((resolve, reject) => {
@@ -1712,6 +1724,9 @@ app.post(
       backups.length = 0;
 
       log.info("import", `restored ${uploaded} bytes from archive`);
+      // Exports and backups leave out the bundled skills (they ship with the image); the swap removed the previous
+      // workspace, so install them again now, as the entrypoint does at boot (fail-soft).
+      await resyncBundledSkills();
       gatewayWasStopped = false;
       await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });

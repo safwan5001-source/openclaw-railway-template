@@ -102,8 +102,9 @@ Windows/Linux: 7-Zip with AES-256, `7z a -p -mhe=on`.) Exporting copies producti
 The Export in production before this PR cannot handle real data (see SECURITY_REVIEW V12): **do not retry it** —
 every attempt builds another full copy on the server and can get the gateway OOM-killed. After this PR is deployed:
 
-- `https://<domain>/setup/api/export/plan` (Safari) shows files and MB before anything is copied; Import accepts up
-  to 1 GB, and refuses a restore up front if the volume cannot hold it.
+- `/setup` → **Export Essential** / **Export Everything**: the log shows files, MB and the largest folders before
+  anything is copied (`/setup/api/export/plan?scope=essential|full`); Import accepts up to 1 GB, and refuses a restore
+  up front if the volume cannot hold it. After a restore the bundled skills are re-installed automatically.
 - `https://<domain>/setup/api/export` streams the ZIP (same password and format as before): bytes start at once,
   ~1 CPU and < 100 MB of memory on the server, nothing written to disk, stops cleanly if the phone gives up, only one
   at a time. Use Wi-Fi, keep Safari in front; the iPhone needs free space ≈ 2× the ZIP (ZIP + Cryptomator copy).
@@ -117,9 +118,12 @@ The `.bkp` format above needs a computer (Node) for `keygen` / `decrypt`; until 
    Settings → [name] → iCloud → iCloud Backup for the duration (the plain ZIP must not reach any cloud).
 2. Save the current `SETUP_PASSWORD` (Railway → OpenClaw → Variables) in the Passwords app as
    "BASHT export password <date>". It is the ZIP password and the restore password after rotation.
-3. Check the size first: `https://<domain>/setup/api/export/plan` (must be under the 1 GB Import limit). Then open
-   `https://<domain>/setup/api/export` in Safari → sign in → Download (one attempt; if it fails, wait and retry once).
-4. Files → On My iPhone → Downloads → long-press the ZIP → Get Info: size > 0 and **< 1 GB**.
+3. Open `https://<domain>/setup` in Safari → sign in → **Export Essential** first (config, WhatsApp session,
+   databases, memory; small, finishes in seconds). The log shows the size and the largest folders; the download goes
+   through a single-use link (valid 2 minutes), so the browser does not need to resend the login. Then, if wanted,
+   **Export Everything** (adds the official PDF copies). One export at a time; if one fails, start it again from the
+   button (the old link is used up).
+4. Files → On My iPhone → Downloads → long-press the ZIP → Get Info: size > 0 and **< 1 GB** (Import limit).
 5. Check it: extract it in an archive app that supports password ZIPs (into On My iPhone) with the password from
    step 2 — a successful extraction verifies the password and every file's CRC. Confirm `data/.openclaw/credentials/
    whatsapp/default/`, `data/.openclaw/state/openclaw.sqlite`, `data/workspace/MEMORY.md` exist, then delete the

@@ -23,14 +23,17 @@ export const STATE_EXCLUDES = ["cache", "tmp", "logs", "server.log", "media/play
 export const WORKSPACE_EXCLUDES = ["skills/basht-daftra", "skills/basht-accounting", "node_modules", ".cache"];
 
 /** Arguments for `find` (run with cwd "/"): regular files and directories only, excluded paths pruned. */
-export function buildFindArgs(stateDir, workspaceDir) {
+/** Extra exclusions of the "essential" export: bulky, re-obtainable content (official PDFs, media). */
+export const ESSENTIAL_EXTRA = { state: ["media"], workspace: ["exports"] };
+
+export function buildFindArgs(stateDir, workspaceDir, extra = { state: [], workspace: [] }) {
   const rel = (p) => path.resolve(p).replace(/^\/+/, "");
   const stateRel = rel(stateDir);
   const wsRel = rel(workspaceDir);
   const roots = wsRel === stateRel || wsRel.startsWith(stateRel + "/") ? [stateRel] : [stateRel, wsRel];
   const pruned = [
-    ...STATE_EXCLUDES.map((e) => `${stateRel}/${e}`),
-    ...WORKSPACE_EXCLUDES.map((e) => `${wsRel}/${e}`),
+    ...[...STATE_EXCLUDES, ...(extra.state ?? [])].map((e) => `${stateRel}/${e}`),
+    ...[...WORKSPACE_EXCLUDES, ...(extra.workspace ?? [])].map((e) => `${wsRel}/${e}`),
   ];
   const prune = pruned.flatMap((p, i) => (i ? ["-o", "-path", p] : ["-path", p]));
   return {
@@ -60,6 +63,11 @@ export async function writeEncryptedArchive({ stateDir, workspaceDir, publicKey,
   let stderr = "";
   find.stderr.on("data", (d) => (stderr += d));
   tar.stderr.on("data", (d) => (stderr += d));
+  // Both ends of the file-list pipe get error handlers: when the archive side fails and tar is killed, pending
+  // writes into tar.stdin fail with EPIPE, which would otherwise be an unhandled 'error' and crash the wrapper.
+  const swallow = () => {};
+  tar.stdin.on("error", swallow);
+  find.stdout.on("error", swallow);
   find.stdout.pipe(tar.stdin);
   const enc = createEncryptStream(publicKey, { content: "tar.gz", roots: existing, ...meta });
   const out = fs.createWriteStream(outFile, { flags: "wx", mode: 0o600 });
@@ -70,8 +78,11 @@ export async function writeEncryptedArchive({ stateDir, workspaceDir, publicKey,
       waitExit(tar, "tar"),
     ]);
   } catch (err) {
+    const settled = (c) => (c.exitCode !== null || c.signalCode !== null ? null : new Promise((r) => c.once("close", r)));
+    find.stdout.unpipe(tar.stdin);
     find.kill("SIGKILL");
     tar.kill("SIGKILL");
+    await Promise.all([settled(find), settled(tar)]); // no child outlives the request
     fs.rmSync(outFile, { force: true });
     throw new Error(`${err.message}${stderr ? `: ${stderr.slice(0, 300)}` : ""}`);
   }
