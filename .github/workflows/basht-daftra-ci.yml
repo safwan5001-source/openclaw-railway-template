@@ -54,6 +54,8 @@ jobs:
       # Independent readers used by the export tests to prove the XLSX/DOCX files really open (no repo code, test-time only).
       - name: Install reader libraries for export validation
         run: python3 -m pip install --disable-pip-version-check openpyxl python-docx
+      - name: Install wrapper dependencies (frozen lockfile)
+        run: npx -y pnpm@11.24.0 install --frozen-lockfile --prod
       - name: Node version
         run: node --version
       - name: Install wrapper dependencies with locked production versions
