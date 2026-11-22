@@ -13,6 +13,7 @@ on:
       - 'skills/basht-daftra/**'
       - 'src/**'
       - 'scripts/**'
+      - 'patches/**'
       - 'Dockerfile'
       - 'Dockerfile.*'
       - 'entrypoint.sh'
@@ -22,6 +23,7 @@ on:
       - 'railway.broker.toml'
       - '.dockerignore'
       - 'docs/DAFTRA_*.md'
+      - 'docs/MEMORY_FLUSH_OWNER_FIX.md'
       - 'package.json'
       - '.github/workflows/basht-daftra-ci.yml'
   workflow_dispatch:
@@ -120,3 +122,30 @@ jobs:
           node node_modules/openclaw/openclaw.mjs --version
       - name: Skill is discovered as a workspace skill; eligible only when DAFTRA_* env is present
         run: bash scripts/verify-skill-eligibility.sh "$RUNNER_TEMP/oc"
+
+  openclaw-memory-flush:
+    # BASHT memory-flush owner-identity patch: unit tests, integration against the real pinned OpenClaw dist, and the
+    # end-to-end save -> compaction -> recall proof with a loopback fake model (no WhatsApp, no Railway, no real model).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install the PINNED OpenClaw (same version as the Dockerfile), scripts disabled
+        run: |
+          mkdir -p "$RUNNER_TEMP/flush/base" && cd "$RUNNER_TEMP/flush/base"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9
+      - name: Install OpenClaw + the real WhatsApp plugin for the owner-rule parity test (separate dir; the E2E keeps base)
+        run: |
+          mkdir -p "$RUNNER_TEMP/flush/parity" && cd "$RUNNER_TEMP/flush/parity"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9 @openclaw/whatsapp@2026.10.9
+      - name: Patch unit + integration tests (real OpenClaw tool policy, real WhatsApp owner rule)
+        env:
+          OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
+          OPENCLAW_STATE_DIR: ${{ runner.temp }}/flush/state
+        run: node --test patches/*.test.mjs
+      - name: End-to-end (upstream reproduces the bug; patched owner saves and recalls; non-owners stay read-only)
+        run: bash patches/e2e/memory-flush-e2e.sh "$RUNNER_TEMP/flush"

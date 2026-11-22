@@ -19,3 +19,4 @@ npm-debug.log*
 .tmpdata/
 __pycache__/
 *.pyc
+.ci-results/

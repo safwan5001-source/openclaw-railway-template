@@ -12,3 +12,6 @@ npm-debug.log*
 # tests/fixtures never ship in either image (the skill is copied from skills/basht-daftra/scripts)
 skills/**/*.test.mjs
 skills/**/*.test-helper.mjs
+# memory-flush patch: tests and the E2E rig never ship (only the patch and the read-only doctor are copied)
+patches/**/*.test.mjs
+patches/e2e

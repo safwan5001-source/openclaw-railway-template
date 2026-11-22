@@ -46,7 +46,8 @@ RUN npm install -g \
     openclaw@2026.10.9 \
   && node --version | grep -Eq '^v26\.' \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
-RUN npm install -g clawhub@latest
+# Pinned (was @latest): a rebuild must produce the same tool the previous build had. Bump deliberately.
+RUN npm install -g clawhub@0.27.0
 
 WORKDIR /app
 
@@ -57,6 +58,13 @@ RUN npm install -g pnpm@11.24.0 \
 COPY src ./src
 # Self-contained BASHT Daftra skill; entrypoint.sh syncs it into the persistent workspace at boot (skill-sync.sh).
 COPY skills ./skills
+# BASHT memory-flush owner-identity patch for the pinned OpenClaw (docs/MEMORY_FLUSH_OWNER_FIX.md). Exact-match and
+# hash-checked: the build fails if the installed OpenClaw differs from the version the patch was validated against.
+# patches/memory-flush-doctor.mjs and patches/owner-check.mjs are read-only diagnostics for the Railway console.
+COPY patches/openclaw-memory-flush-owner.mjs patches/memory-flush-doctor.mjs patches/owner-check.mjs patches/whatsapp-owner.mjs ./patches/
+RUN node patches/openclaw-memory-flush-owner.mjs /usr/local/lib/node_modules/openclaw \
+  && grep -q 'basht-patch:memory-flush-owner-identity' /usr/local/lib/node_modules/openclaw/dist/agent-runner-memory-BkOUjtvi.mjs \
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 skill-sync.sh ./skill-sync.sh
 
