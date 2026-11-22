@@ -55,16 +55,18 @@ chk "DIAG_STORAGE=0: no [storage-diag] line" '[ "$(logs | grep -c "storage-diag"
 docker rm -f $N >/dev/null
 
 # ---- 2. DIAG_STORAGE=1
-run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6
+# CI may need substantial startup time for OpenClaw doctor and 40k seeded files.
+# Explicitly defer only the first diagnostic scan; production retains the 90s default.
+run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6 -e DIAG_STORAGE_FIRST_DELAY_MS=240000
 chk "DIAG_STORAGE=1: gateway healthy" 'wait_gw'
 chk "DIAG_STORAGE=1: one 'enabled' line" '[ "$(logs | grep -c "storage-diag.*enabled root=/data every 6h")" = 1 ]'
 GW0=$(docker exec $N pgrep -f openclaw-gateway | head -1)
 SEED_SUM=$(docker exec $N bash -c "$HASH_CMD")
 chk "baseline hash taken before the first scan" '[ "$(logs | grep -c "\[storage-diag\] {")" = 0 ]'
 LAT=$(mktemp); STATS=$(mktemp)
-( end=$((SECONDS+140)); while [ $SECONDS -lt $end ]; do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://127.0.0.1:$P/setup/healthz; sleep 0.2; done ) > "$LAT" &
-( end=$((SECONDS+140)); while [ $SECONDS -lt $end ]; do docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' $N; done ) > "$STATS" &
-for _ in $(seq 1 75); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done
+( end=$((SECONDS+300)); while [ $SECONDS -lt $end ]; do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://127.0.0.1:$P/setup/healthz; sleep 0.2; done ) > "$LAT" &
+( end=$((SECONDS+300)); while [ $SECONDS -lt $end ]; do docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' $N; done ) > "$STATS" &
+for _ in $(seq 1 150); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done
 wait
 SUMMARY=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"level"' | head -1 | sed 's/.*\[storage-diag\] //')
 echo "summary: $SUMMARY"
