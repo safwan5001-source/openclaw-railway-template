@@ -24,6 +24,11 @@ for (const name of names) {
     const base = path.join(root, name);
     const file = path.join(base, 'SKILL.md');
     assert.ok(fs.statSync(file).isFile());
+    const playbook = path.join(base, 'references', 'PLAYBOOK.md');
+    assert.ok(fs.statSync(playbook).isFile(), 'playbook required');
+    const reference = fs.readFileSync(playbook, 'utf8');
+    assert.ok(reference.length > 450, 'domain-specific detail required');
+    assert.ok(content.includes('references/PLAYBOOK.md'), 'SKILL must link its playbook');
     const content = fs.readFileSync(file, 'utf8');
     assert.ok(content.startsWith('---\n'));
     const front = content.match(/^---\n([\s\S]*?)\n---\n/);
@@ -35,10 +40,21 @@ for (const name of names) {
     assert.match(content, /نشر خارجي/);
     assert.match(content, /تصرّح|صرّح|صرّح|القيود/);
     assert.ok(Buffer.byteLength(content, 'utf8') < 16000, 'avoid bloated prompt');
+    assert.doesNotMatch(content + reference, /(?:sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,})/, 'no access tokens');
   });
 }
 test('production installer is intentionally NOT enabled for these skills', () => {
   const sync = fs.readFileSync('skill-sync.sh', 'utf8');
   assert.ok(sync.includes('basht-daftra|basht-accounting'));
   for (const name of names) assert.equal(sync.includes(name), false);
+});
+
+test('domain-specific verification guidance exists', () => {
+  const read = (name) => fs.readFileSync(path.join(root, name, 'references', 'PLAYBOOK.md'), 'utf8');
+  assert.match(read('basht-performance-analytics'), /CTR=clicks\/impressions/);
+  assert.match(read('basht-performance-analytics'), /zero denominator|zero denominator|zero denominator|N\/A/);
+  assert.match(read('basht-ads-campaigns'), /No connectors|No connectors|no creation|No connectors/);
+  assert.match(read('basht-marketing-automation'), /Idempotency/);
+  assert.match(read('basht-market-intelligence'), /SAR 12\/kg/);
+  assert.match(read('basht-conversion-optimization'), /percentage-point/);
 });
