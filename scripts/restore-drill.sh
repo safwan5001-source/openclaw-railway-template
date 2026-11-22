@@ -30,14 +30,43 @@ echo "2026-11-21: synthetic note" > /data/workspace/memory/2026-11-21.md
 head -c 3000000 /dev/urandom > /data/workspace/exports/invoice-1-0123456789abcdef0123456789abcdef.pdf'
 docker restart drillA >/dev/null; chk "A: real gateway up with synthetic data" 'health true 120'
 manifest drillA > $D/before.sha
+# Diagnose volume growth using synthetic file metadata only; never read file contents or output credentials.
+# Exclude server.log to match the du threshold below.
+volume_files() { docker exec drillA bash -c 'find /data -type f ! -name server.log -printf "%P\\t%s\\n" | LC_ALL=C sort'; }
+volume_files > "$D/volume-before.tsv"
 USED_BEFORE=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
 T0=$(date +%s%N)
 CODE=$(curl -s -o $D/drill.bkp -w '%{http_code}' -X POST -H "Authorization: Basic $B" -H "Origin: http://127.0.0.1:$P" http://127.0.0.1:$P/setup/api/backup)
 T1=$(date +%s%N)
 chk "A: backup downloaded (HTTP 200, $(stat -c %s $D/drill.bkp 2>/dev/null) bytes, $(( (T1-T0)/1000000 )) ms)" '[ "$CODE" = 200 ]'
 USED_AFTER=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
+volume_files > "$D/volume-after.tsv"
 echo "      volume used before/after backup: $USED_BEFORE / $USED_AFTER bytes (delta $((USED_AFTER-USED_BEFORE)))"
 chk "A: backup wrote nothing significant to the volume (< 1 MB delta: logs only)" '[ $((USED_AFTER-USED_BEFORE)) -lt 1048576 ]'
+if [ $((USED_AFTER-USED_BEFORE)) -ge 1048576 ]; then
+  # File-size deltas only. Keep the original 1 MiB assertion unchanged.
+  python3 - "$D/volume-before.tsv" "$D/volume-after.tsv" <<'PY'
+import sys
+from pathlib import Path
+
+def read_sizes(filename):
+    result = {}
+    for row in Path(filename).read_text(errors="replace").splitlines():
+        name, sep, size = row.rpartition("\\t")
+        if sep and size.isdigit():
+            result[name] = int(size)
+    return result
+
+before, after = [read_sizes(arg) for arg in sys.argv[1:]]
+changes = sorted(((after.get(name, 0) - before.get(name, 0), name)
+                  for name in before.keys() | after.keys()
+                  if before.get(name) != after.get(name)), reverse=True)
+print("      volume growth diagnostics (synthetic file metadata; top 20 by absolute delta):")
+for delta, name in sorted(changes, key=lambda t: abs(t[0]), reverse=True)[:20]:
+    print(f"      {delta:+d} bytes: {name}")
+print(f"      changed files: {len(changes)}; net file size delta: {sum(d for d, _ in changes):+d} bytes")
+PY
+fi
 chk "A: no backup leftovers in the container temp dir" '[ -z "$(docker exec drillA bash -c "ls /tmp | grep basht-backup")" ]'
 chk "A: gateway restarted by itself after the backup" 'health true 60'
 docker logs drillA 2>&1 | grep -o "encrypted backup ready.*" | tail -1 | sed 's/^/      /'
