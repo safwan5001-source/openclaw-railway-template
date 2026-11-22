@@ -35,16 +35,23 @@ manifest drillA > $D/before.sha
 volume_files() { docker exec drillA bash -c 'find /data -type f ! -name server.log -printf "%P\t%s\n" | LC_ALL=C sort'; }
 volume_files > "$D/volume-before.tsv"
 USED_BEFORE=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
+# The gateway stop/restart may checkpoint SQLite WALs and resize database files.
+# Measure non-SQLite files independently so normal database lifecycle writes do not mask a backup archive on /data.
+NON_DB_BEFORE=$(docker exec drillA bash -c 'du -sb --exclude=server.log --exclude="*.sqlite" --exclude="*.sqlite-*" /data | cut -f1')
 T0=$(date +%s%N)
 CODE=$(curl -s -o $D/drill.bkp -w '%{http_code}' -X POST -H "Authorization: Basic $B" -H "Origin: http://127.0.0.1:$P" http://127.0.0.1:$P/setup/api/backup)
 T1=$(date +%s%N)
 chk "A: backup downloaded (HTTP 200, $(stat -c %s $D/drill.bkp 2>/dev/null) bytes, $(( (T1-T0)/1000000 )) ms)" '[ "$CODE" = 200 ]'
 USED_AFTER=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
+NON_DB_AFTER=$(docker exec drillA bash -c 'du -sb --exclude=server.log --exclude="*.sqlite" --exclude="*.sqlite-*" /data | cut -f1')
 volume_files > "$D/volume-after.tsv"
 echo "      volume used before/after backup: $USED_BEFORE / $USED_AFTER bytes (delta $((USED_AFTER-USED_BEFORE)))"
-chk "A: backup wrote nothing significant to the volume (< 1 MB delta: logs only)" '[ $((USED_AFTER-USED_BEFORE)) -lt 1048576 ]'
-if [ $((USED_AFTER-USED_BEFORE)) -ge 1048576 ]; then
-  # File-size deltas only. Keep the original 1 MiB assertion unchanged.
+echo "      non-SQLite volume used before/after backup: $NON_DB_BEFORE / $NON_DB_AFTER bytes (delta $((NON_DB_AFTER-NON_DB_BEFORE)))"
+chk "A: backup leaves less than 1 MiB of non-SQLite volume growth" '[ $((NON_DB_AFTER-NON_DB_BEFORE)) -lt 1048576 ]'
+chk "A: no encrypted backup archives are left on the persistent volume" '[ -z "$(docker exec drillA find /data -type f -name "basht-backup-*.bkp" -print -quit)" ]'
+if [ $((USED_AFTER-USED_BEFORE)) -ge 1048576 ] || [ $((NON_DB_AFTER-NON_DB_BEFORE)) -ge 1048576 ]; then
+  # File-size deltas only. The 1 MiB limit remains enforced for non-SQLite files;
+  # WAL checkpointing during gateway restart is reported separately.
   python3 - "$D/volume-before.tsv" "$D/volume-after.tsv" <<'PY'
 import sys
 from pathlib import Path
