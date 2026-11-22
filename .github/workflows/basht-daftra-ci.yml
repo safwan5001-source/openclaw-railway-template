@@ -56,6 +56,8 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check openpyxl python-docx
       - name: Node version
         run: node --version
+      - name: Install wrapper dependencies with locked production versions
+        run: npx -y pnpm@11.24.0 install --frozen-lockfile --prod
       - name: Node tests (wrapper + Daftra skill, offline fakes only)
         run: node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
       - name: Skill frontmatter is valid and self-contained
@@ -137,10 +139,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/flush/base" && cd "$RUNNER_TEMP/flush/base"
           npm init -y >/dev/null
           npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9
-      - name: Patch unit + integration tests (real OpenClaw tool policy)
+      - name: Install OpenClaw + the real WhatsApp plugin for the owner-rule parity test (separate dir; the E2E keeps base)
+        run: |
+          mkdir -p "$RUNNER_TEMP/flush/parity" && cd "$RUNNER_TEMP/flush/parity"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9 @openclaw/whatsapp@2026.10.9
+      - name: Patch unit + integration tests (real OpenClaw tool policy, real WhatsApp owner rule)
         env:
-          OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/base/node_modules/openclaw
+          OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
           OPENCLAW_STATE_DIR: ${{ runner.temp }}/flush/state
-        run: node --test patches/*.test.mjs
+        run: node --test --test-concurrency=1 patches/*.test.mjs
       - name: End-to-end (upstream reproduces the bug; patched owner saves and recalls; non-owners stay read-only)
         run: bash patches/e2e/memory-flush-e2e.sh "$RUNNER_TEMP/flush"
