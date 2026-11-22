@@ -157,9 +157,14 @@ check that must not touch a live production volume, `owner-check.mjs` avoids the
 
 * reads `openclaw.json` (JSON or JSON5) and the agent session stores' bytes with `O_RDONLY` file handles — no SQLite
   connection, so no WAL/SHM/lock interaction with the running gateway;
-* replays OpenClaw's tool-policy assembly in a child process whose `HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
-  `OPENCLAW_STATE_DIR` and workspace all live in one temp directory (deleted before exit), with a minimal environment
-  (no inherited secrets); the child's stdout/stderr go to `/dev/null` and its result returns on a private pipe;
+* replays OpenClaw's tool-policy assembly in a child process that receives **only an allowlist of tool-policy fields**
+  (`profile/allow/alsoAllow/deny/byProvider/toolsBySender` for `tools` and each agent — no `agentDir`, workspace or
+  `session.store` paths, no API keys), whose `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `OPENCLAW_STATE_DIR` and workspace all
+  live in one temp directory (deleted before exit), with a minimal environment (no inherited secrets) and
+  `OPENCLAW_LOG_LEVEL=silent` (OpenClaw's file logger ignores `TMPDIR` and would otherwise append to the live gateway's
+  `/tmp/openclaw/*.log`); the child's stdout/stderr go to `/dev/null` and its result returns on a private pipe;
+* simulates every agent that holds the owner's WhatsApp DM (not only `main`) and counts only owner entries OpenClaw
+  accepts (`whatsapp:+E164` / `+E164`); legacy or `${ENV}` entries, `$include` and `${ENV}` in policy fields are `BLOCKED`;
 * prints exactly one line `BASHT_OWNER_CHECK {json}`: booleans, counts, policy-step names and a verdict
   (`READY` / `BLOCKED: <reason>` / `REFUSED`); 7+ digit runs are masked; errors are reduced to their type;
 * refuses root and any OpenClaw version other than 2026.10.9.
@@ -168,8 +173,11 @@ check that must not touch a live production volume, `owner-check.mjs` avoids the
 gosu openclaw node /app/patches/owner-check.mjs     # after deploy (or copy the file to /tmp first)
 ```
 
-Verified by `patches/owner-check.test.mjs` (synthetic state, run unprivileged, full before/after file snapshot,
-secret and digit leak checks) and E2E case G (real OpenClaw SQLite session store).
+Verified by `patches/owner-check.test.mjs` (synthetic state, run unprivileged, full before/after file snapshot incl. a
+private `TMPDIR`, a live WAL database referenced from config and `/tmp/openclaw` logs; secret and digit leak checks; one
+regression test per security-review finding F1–F7) and E2E case G (real OpenClaw SQLite store with `-wal`/`-shm`/lock
+files). An independent security review found F1–F7 in the first version (two High: a log append to the live gateway log,
+and opening a live database through a forwarded `agentDir`); all are fixed and covered by tests.
 
 ## 6. Risks
 
