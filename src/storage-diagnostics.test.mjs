@@ -313,7 +313,7 @@ test("start: first scan defaults to 90s and explicit delay is bounded", () => {
     const env = { DIAG_STORAGE: "1", ...(requested === undefined ? {} : { DIAG_STORAGE_FIRST_DELAY_MS: requested }) };
     const h = startStorageDiagnostics({
       log, env,
-      setTimeoutFn: (ms) => { delays.push(ms); return { unref() {} }; },
+      setTimeoutFn: (_callback, ms) => { delays.push(ms); return { unref() {} }; },
     });
     assert.deepEqual(delays, [expected], `initial delay for ${String(requested)}`);
     h.stop();
