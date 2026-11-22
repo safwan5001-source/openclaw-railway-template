@@ -67,6 +67,7 @@ RUN node patches/openclaw-memory-flush-owner.mjs /usr/local/lib/node_modules/ope
   && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 skill-sync.sh ./skill-sync.sh
+COPY --chmod=755 scripts/install-marketing-skills.sh ./install-marketing-skills.sh
 
 RUN useradd -m -s /bin/bash openclaw \
   && chown -R openclaw:openclaw /app \
