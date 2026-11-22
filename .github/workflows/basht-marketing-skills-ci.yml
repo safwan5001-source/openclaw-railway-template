@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - feature/basht-marketing-skills-v1
-    paths:
-      - 'skills/basht-*/**'
-      - 'scripts/marketing-skills.test.mjs'
-      - '.github/workflows/basht-marketing-skills-ci.yml'
-      - 'package.json'
   pull_request:
     paths:
       - 'skills/basht-*/**'
