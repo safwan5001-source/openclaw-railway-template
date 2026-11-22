@@ -104,6 +104,12 @@ function label(parts) {
       out.push("<doctor-snapshot>");
       break;
     }
+    // plugin-captures/<instance>/...: instance/run names are OpenClaw-internal and never printed (a root narrowed to
+    // <state>/tmp would otherwise print them at depth 2)
+    if (PLUGIN_CAPTURES_DIR.test(p)) {
+      out.push("<plugin-captures>");
+      break;
+    }
     out.push(isSafeName(p) ? p : "<other>");
   }
   return "/" + out.join("/");
@@ -116,10 +122,43 @@ function emptyClass() {
   return { n: 0, bytes: 0 };
 }
 
+// The scan root can be any directory (DIAG_STORAGE_ROOT), including one INSIDE a protected tree such as
+// <workspace>/memory or <state>/agents/main/sessions. Protection is a property of the path, not only of what the walk
+// discovers below the root, so it is derived from every component of the resolved root path and of its real path
+// (the root may be a symlink). Only protective contexts are inherited: cache/exports classification is deliberately NOT
+// inherited, so a narrowed root can only ever reduce what is reported as a candidate, never enlarge it.
+export async function rootContext(root, ops = {}) {
+  const paths = [path.resolve(root)];
+  if (typeof ops.realpath === "function") {
+    try {
+      const real = await ops.realpath(root);
+      if (real) paths.push(real);
+    } catch {
+      /* unresolvable root: the scan itself reports the errno code */
+    }
+  }
+  const ctx = { prot: false, doc: false, pcap: false };
+  for (const p of paths) {
+    for (const part of p.split(path.sep)) {
+      if (!part) continue;
+      if (isProtectedName(part)) ctx.prot = true;
+      if (isDoctorSnapshotName(part)) ctx.doc = true;
+      if (PLUGIN_CAPTURES_DIR.test(part)) ctx.pcap = true;
+    }
+  }
+  return ctx;
+}
+
+// Root as it may appear in logs: protected / identifying components are replaced, never printed.
+export function rootLabel(root) {
+  const parts = path.resolve(root).split(path.sep).filter(Boolean);
+  return parts.length ? label(parts) : "/";
+}
+
 export async function scanTree(root, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const now = o.now ?? Date.now();
-  const ops = o.fs ?? { readdir: fsp.readdir, lstat: fsp.lstat };
+  const ops = o.fs ?? { readdir: fsp.readdir, lstat: fsp.lstat, realpath: fsp.realpath };
   const started = Date.now();
   const cpu0 = process.cpuUsage();
   const lag = monitorEventLoopDelay({ resolution: 20 });
@@ -163,7 +202,10 @@ async function walk(root, o, now, ops, started, cpu0, lag) {
     map.set(key, e);
   };
 
-  const stack = [{ abs: root, rel: [], prot: false, cache: false, exp: false, pcap: false, doc: false }];
+  const ctx = await rootContext(root, ops);
+  // A root inside a protected / recovery tree: nothing below it may be named, and everything is counted as such.
+  const anon = ctx.prot ? "/<protected>" : ctx.doc ? "/<doctor-snapshot>" : ctx.pcap ? "/<plugin-captures>" : null;
+  const stack = [{ abs: root, rel: [], prot: ctx.prot, cache: false, exp: false, pcap: ctx.pcap, doc: ctx.doc }];
   let seen = 0;
   while (stack.length) {
     const dir = stack.pop();
@@ -224,9 +266,10 @@ async function walk(root, o, now, ops, started, cpu0, lag) {
       res.bytes += bytes;
       if (isProt) res.protectedBytes += bytes;
 
-      const l1 = dir.rel.length === 0 ? "/(root-files)" : label([dir.rel[0]]);
+      const l1 = anon ?? (dir.rel.length === 0 ? "/(root-files)" : label([dir.rel[0]]));
       let l2 = null;
-      if (dir.rel.length >= 2) l2 = label(dir.rel.slice(0, 2));
+      if (anon) l2 = null;
+      else if (dir.rel.length >= 2) l2 = label(dir.rel.slice(0, 2));
       else if (dir.rel.length === 1) l2 = protName ? `${label([dir.rel[0]])}/<protected>` : `${label([dir.rel[0]])}/(files)`;
       bump(res.level1, l1, bytes, mod);
       if (l2) bump(res.level2, l2, bytes, mod);
@@ -361,6 +404,17 @@ export async function getFsInfo(root, statfs = fsp.statfs) {
   }
 }
 
+// DIAG_STORAGE_FIRST_DELAY_SEC: delay of the first scan after boot (default 90 s). Integer seconds, clamped to
+// 5..3600; anything else falls back to the default. Exists so a slow start (boot-time `openclaw doctor --fix` plus
+// gateway start took ~112 s on a CI runner) can be given a deterministic margin in container tests.
+export function parseFirstDelayMs(raw) {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (!/^\d{1,5}$/.test(s)) return DEFAULTS.firstDelayMs;
+  const sec = Number(s);
+  if (sec < 5) return DEFAULTS.firstDelayMs;
+  return Math.min(sec, 3600) * 1000;
+}
+
 export function startStorageDiagnostics({
   log,
   env = process.env,
@@ -372,6 +426,7 @@ export function startStorageDiagnostics({
   if (env.DIAG_STORAGE !== "1") return null;
   const root = (env.DIAG_STORAGE_ROOT || "/data").trim();
   const hours = Math.min(168, Math.max(1, Number(env.DIAG_STORAGE_INTERVAL_HOURS) || DEFAULTS.intervalHours));
+  const firstDelayMs = parseFirstDelayMs(env.DIAG_STORAGE_FIRST_DELAY_SEC);
   let alert = { level: "ok", lastEmit: 0 };
   let running = false;
   let stopped = false;
@@ -415,8 +470,13 @@ export function startStorageDiagnostics({
     }, delayMs);
     timer?.unref?.();
   }
-  schedule(DEFAULTS.firstDelayMs);
-  log.info("storage-diag", `enabled root=${root} every ${hours}h (read-only: readdir/lstat/statfs)`);
+  schedule(firstDelayMs);
+  // The configured root is printed only as a sanitised label: it may point inside a protected tree.
+  log.info(
+    "storage-diag",
+    `enabled root=${rootLabel(root)} every ${hours}h (read-only: readdir/lstat/statfs)` +
+      (firstDelayMs === DEFAULTS.firstDelayMs ? "" : ` first scan after ${firstDelayMs / 1000}s`),
+  );
   return {
     runOnce,
     stop() {

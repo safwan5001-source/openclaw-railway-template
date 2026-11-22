@@ -12,6 +12,9 @@ import {
   isProtectedName,
   isSafeName,
   nextAlertState,
+  parseFirstDelayMs,
+  rootContext,
+  rootLabel,
   scanTree,
   startStorageDiagnostics,
 } from "./storage-diagnostics.js";
@@ -303,5 +306,185 @@ test("start: a scan failure logs only the error code, never a path", async () =>
   assert.equal(await h.runOnce(), null);
   const fail = lines.filter((m) => m.startsWith("scan failed"));
   assert.deepEqual(fail, ["scan failed: ENOENT"]);
+  assert.ok(!lines.join("\n").includes("966501234567"), "the configured root (with an identifying name) is never logged");
   h.stop();
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Regression: DIAG_STORAGE_ROOT pointing INSIDE a protected tree (PR #26 review finding). Before the fix the walk started
+// with prot:false, so `<workspace>/memory` as root printed person-named folders ("/Alice") and counted backups there as
+// cleanup candidates, with protectedMB = 0.
+// ---------------------------------------------------------------------------------------------------------------------
+const LEAK = [CANARY, "966501234567", "Alice", "notes", "draft", "memory", "MEMORY", "sessions", "whatsapp", "creds", "credentials",
+  "abc.jsonl", "IDENTITY", "customers", "token", "AGENTS.md", "pre-doctor", "doctor-backup", "inst1", "update-captures"];
+
+function protectedRootFixture() {
+  const vol = fs.mkdtempSync(path.join(os.tmpdir(), "diag-root-"));
+  put(vol, "workspace/memory/Alice/notes.md.bak", 9_000, 30);
+  put(vol, "workspace/memory/Alice/draft.tmp", 9_000, 30);
+  put(vol, "workspace/memory/Alice/old.log", 9_000, 30);
+  put(vol, "workspace/memory/+966501234567.md", 4_000, 30);
+  put(vol, "workspace/memory/2026-11-01.md", 4_000, 30);
+  put(vol, ".openclaw/agents/main/sessions/abc.jsonl", 8_000, 30);
+  put(vol, ".openclaw/agents/main/sessions/Bob/x.tmp", 8_000, 30);
+  put(vol, ".openclaw/credentials/whatsapp/default/creds.json.old", 3_000, 30);
+  put(vol, "workspace/AGENTS.md.doctor-backup-2026-11-01T10-00-00-000Z/Carol/x.bak", 5_000, 30);
+  put(vol, ".openclaw/tmp/plugin-captures/inst1/Dave/cap.tmp", 7_000, 30);
+  put(vol, "workspace/notes.md.bak", 6_000, 30); // an ordinary unprotected candidate, for contrast
+  return vol;
+}
+
+function leaks(r) {
+  const [summary, detail] = buildLines(r, { total: 5e9, used: 3.9e9, free: 1.1e9, pct: 78 }, "ok");
+  const all = summary + detail;
+  return { all, summary: JSON.parse(summary), detail: JSON.parse(detail), found: LEAK.filter((b) => all.includes(b)) };
+}
+
+test("root inside a protected tree: everything is an anonymous protected total, no candidates, no names", async () => {
+  const vol = protectedRootFixture();
+  for (const rel of ["workspace/memory", "workspace/memory/Alice", ".openclaw/agents/main/sessions", ".openclaw/agents/main/sessions/Bob",
+    ".openclaw/credentials/whatsapp/default", ".openclaw/credentials"]) {
+    const root = path.join(vol, rel);
+    const r = await scanTree(root, { now: Date.now() });
+    const { summary, detail, found } = leaks(r);
+    assert.ok(r.files > 0 && r.protectedBytes === r.bytes && r.bytes > 0, `${rel}: all bytes protected`);
+    assert.deepEqual(found, [], `${rel}: leaked ${found}`);
+    for (const k of Object.keys(summary.candidates)) assert.equal(summary.candidates[k].n, 0, `${rel}: candidate ${k}`);
+    assert.equal(summary.possibleDupes.n, 0, rel);
+    assert.deepEqual(detail.dirs.map((d) => d.p), ["/<protected>"], rel);
+    assert.deepEqual(detail.sub, [], rel);
+    assert.ok(summary.protectedMB >= 0 && r.protectedBytes > 0, rel);
+  }
+  fs.rmSync(vol, { recursive: true, force: true });
+});
+
+test("root inside a doctor snapshot or plugin-captures: counted as recovery, anonymous, never a candidate", async () => {
+  const vol = protectedRootFixture();
+  const doc = await scanTree(path.join(vol, "workspace/AGENTS.md.doctor-backup-2026-11-01T10-00-00-000Z/Carol"), { now: Date.now() });
+  assert.equal(doc.recovery.doctor.n, 1);
+  assert.equal(doc.candidates.backup.n, 0);
+  assert.deepEqual(leaks(doc).found, []);
+  const pc = await scanTree(path.join(vol, ".openclaw/tmp/plugin-captures/inst1/Dave"), { now: Date.now() });
+  assert.equal(pc.recovery.pluginCaptures.n, 1);
+  assert.equal(pc.candidates.tmp.n, 0, "plugin-captures is OpenClaw-owned, not a tmp candidate");
+  assert.deepEqual(leaks(pc).found, []);
+  assert.deepEqual(leaks(pc).detail.dirs.map((d) => d.p), ["/<plugin-captures>"]);
+  fs.rmSync(vol, { recursive: true, force: true });
+});
+
+test("root context follows a symlinked root into a protected tree (real path), and stays normal for an ordinary target", async () => {
+  const vol = protectedRootFixture();
+  fs.symlinkSync(path.join(vol, "workspace/memory"), path.join(vol, "innocent-link"));
+  fs.symlinkSync(path.join(vol, "workspace"), path.join(vol, "plain-link"));
+  const viaLink = await scanTree(path.join(vol, "innocent-link"), { now: Date.now() });
+  assert.equal(viaLink.protectedBytes, viaLink.bytes);
+  assert.deepEqual(leaks(viaLink).found, []);
+  assert.equal(viaLink.candidates.backup.n, 0);
+  assert.deepEqual(await rootContext(path.join(vol, "plain-link"), { realpath: fs.promises.realpath }), { prot: false, doc: false, pcap: false });
+  const plain = await scanTree(path.join(vol, "plain-link"), { now: Date.now() });
+  assert.equal(plain.candidates.backup.n, 1, "only workspace/notes.md.bak; memory/Alice/notes.md.bak stays protected");
+  assert.deepEqual(leaks(plain).found.filter((b) => b !== "notes" && b !== "memory"), []);
+  fs.rmSync(vol, { recursive: true, force: true });
+});
+
+test("narrowing the root can only reduce candidates and never leaks: every directory of the volume used as a root", async () => {
+  const vol = protectedRootFixture();
+  put(vol, ".cache/Homebrew/dl.tar.gz", 20_000, 20);
+  const full = await scanTree(vol, { now: Date.now() });
+  const dirs = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) if (e.isDirectory()) { dirs.push(path.join(d, e.name)); walk(path.join(d, e.name)); }
+  })(vol);
+  assert.ok(dirs.length >= 15);
+  for (const root of dirs) {
+    const rel = path.relative(vol, root);
+    const r = await scanTree(root, { now: Date.now() });
+    const { found, summary } = leaks(r);
+    for (const k of Object.keys(r.candidates)) assert.ok(r.candidates[k].n <= full.candidates[k].n, `${rel}: ${k} candidates grew when narrowing`);
+    assert.ok(r.recovery.doctor.n <= full.recovery.doctor.n && r.recovery.pluginCaptures.n <= full.recovery.pluginCaptures.n, rel);
+    // a root outside every protected tree may print safe folder names, but never a protected / identifying one
+    const bad = found.filter((b) => !(b === "notes" && !/memory|sessions|credentials|doctor|plugin/.test(rel)));
+    assert.deepEqual(bad, [], `${rel}: leaked ${bad}`);
+    void summary;
+  }
+  fs.rmSync(vol, { recursive: true, force: true });
+});
+
+test("rootContext/rootLabel: protection comes from the path; the label never prints protected or identifying parts", async () => {
+  assert.deepEqual(await rootContext("/data"), { prot: false, doc: false, pcap: false });
+  assert.equal((await rootContext("/data/workspace/memory/Alice")).prot, true);
+  assert.equal((await rootContext("/data/.openclaw/agents/main/sessions")).prot, true);
+  assert.equal((await rootContext("/data/workspace/customers.sqlite.bak")).prot, true, "backup variant of a database name");
+  assert.equal((await rootContext("/data/.openclaw.update-captures/x")).prot, true);
+  assert.equal((await rootContext("/data/.openclaw.update-captures/x")).doc, true);
+  assert.equal((await rootContext("/data/.openclaw/tmp/plugin-captures/inst1")).pcap, true);
+  // cache / exports ancestry is intentionally NOT inherited (narrowing must not enlarge candidates)
+  assert.deepEqual(await rootContext("/data/.cache/Homebrew"), { prot: false, doc: false, pcap: false });
+  assert.equal(rootLabel("/data"), "/data");
+  assert.equal(rootLabel("/data/workspace/memory/Alice"), "/data/workspace/<protected>");
+  assert.equal(rootLabel("/data/+966501234567/x"), "/data/<other>/<other>".replace("/<other>/<other>", "/<other>/x"));
+  assert.ok(!rootLabel("/data/workspace/memory/Alice").includes("memory") && !rootLabel("/x/+966501234567").includes("966"));
+});
+
+test("start: the enabled line never prints a protected or identifying root", () => {
+  const lines = [];
+  for (const root of ["/data/workspace/memory/Alice", "/data/.openclaw/agents/main/sessions", `/tmp/diag-+966501234567`]) {
+    const h = startStorageDiagnostics({
+      log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
+      env: { DIAG_STORAGE: "1", DIAG_STORAGE_ROOT: root },
+      setTimeoutFn: () => ({ unref() {} }),
+    });
+    h.stop();
+  }
+  const all = lines.join("\n");
+  for (const bad of ["memory", "Alice", "sessions", "agents", "966501234567"]) assert.ok(!all.includes(bad), `enabled line leaked ${bad}`);
+  assert.equal(lines.filter((m) => m.startsWith("enabled root=")).length, 3);
+});
+
+test("scan: only readdir/lstat/realpath are used (realpath is called once, on the root)", async () => {
+  const vol = protectedRootFixture();
+  const calls = [];
+  const spy = {
+    readdir: (...a) => (calls.push("readdir"), fs.promises.readdir(...a)),
+    lstat: (...a) => (calls.push("lstat"), fs.promises.lstat(...a)),
+    realpath: (...a) => (calls.push(`realpath:${a[0] === vol}`), fs.promises.realpath(...a)),
+  };
+  await scanTree(vol, { now: Date.now(), fs: spy });
+  assert.deepEqual([...new Set(calls)].sort(), ["lstat", "readdir", "realpath:true"]);
+  assert.equal(calls.filter((c) => c.startsWith("realpath")).length, 1);
+  fs.rmSync(vol, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Regression: first-scan delay (container test race; the gateway needed ~112 s on a CI runner, the scan fired at 90 s).
+// ---------------------------------------------------------------------------------------------------------------------
+test("parseFirstDelayMs: default 90 s; integer seconds clamped to 5..3600; anything else falls back", () => {
+  assert.equal(parseFirstDelayMs(undefined), 90_000);
+  assert.equal(parseFirstDelayMs(""), 90_000);
+  assert.equal(parseFirstDelayMs("240"), 240_000);
+  assert.equal(parseFirstDelayMs(" 30 "), 30_000);
+  assert.equal(parseFirstDelayMs("5"), 5_000);
+  assert.equal(parseFirstDelayMs("99999"), 3_600_000);
+  for (const bad of ["abc", "-5", "0", "4", "1.5", "1e3", "600000", "0x10", null, 240]) assert.equal(parseFirstDelayMs(bad), 90_000, JSON.stringify(bad));
+});
+
+test("start: the first scan fires at the default 90 s, or at DIAG_STORAGE_FIRST_DELAY_SEC, and the enabled line says so", () => {
+  const run = (extra) => {
+    const delays = [];
+    const lines = [];
+    const h = startStorageDiagnostics({
+      log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
+      env: { DIAG_STORAGE: "1", ...extra },
+      setTimeoutFn: (fn, ms) => (delays.push(ms), { unref() {} }),
+    });
+    h.stop();
+    return { delays, line: lines.find((m) => m.startsWith("enabled")) };
+  };
+  const d = run({});
+  assert.deepEqual(d.delays, [90_000]);
+  assert.match(d.line, /^enabled root=\/data every 6h \(read-only: readdir\/lstat\/statfs\)$/, "unchanged production line");
+  const c = run({ DIAG_STORAGE_FIRST_DELAY_SEC: "240" });
+  assert.deepEqual(c.delays, [240_000]);
+  assert.match(c.line, /^enabled root=\/data every 6h .* first scan after 240s$/);
+  assert.deepEqual(run({ DIAG_STORAGE_FIRST_DELAY_SEC: "nope" }).delays, [90_000]);
 });
