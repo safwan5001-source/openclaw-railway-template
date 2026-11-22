@@ -30,12 +30,27 @@ echo "2026-11-21: synthetic note" > /data/workspace/memory/2026-11-21.md
 head -c 3000000 /dev/urandom > /data/workspace/exports/invoice-1-0123456789abcdef0123456789abcdef.pdf'
 docker restart drillA >/dev/null; chk "A: real gateway up with synthetic data" 'health true 120'
 manifest drillA > $D/before.sha
+# Print only aggregate byte counts for fixed directories (never filenames, paths to credentials, or contents).
+storage_bytes() {
+  docker exec drillA bash -c 'for p in /data/.openclaw /data/workspace /data/.linuxbrew; do if [ -e "$p" ]; then du -sb --exclude=server.log "$p" | cut -f1; else echo 0; fi; done'
+}
+STORAGE_BEFORE="$(storage_bytes)"
 USED_BEFORE=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
 T0=$(date +%s%N)
 CODE=$(curl -s -o $D/drill.bkp -w '%{http_code}' -X POST -H "Authorization: Basic $B" -H "Origin: http://127.0.0.1:$P" http://127.0.0.1:$P/setup/api/backup)
 T1=$(date +%s%N)
 chk "A: backup downloaded (HTTP 200, $(stat -c %s $D/drill.bkp 2>/dev/null) bytes, $(( (T1-T0)/1000000 )) ms)" '[ "$CODE" = 200 ]'
 USED_AFTER=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
+STORAGE_AFTER="$(storage_bytes)"
+if [ $((USED_AFTER-USED_BEFORE)) -ge 1048576 ]; then
+  readarray -t before_parts <<< "$STORAGE_BEFORE"
+  readarray -t after_parts <<< "$STORAGE_AFTER"
+  for idx in 0 1 2; do
+    case "$idx" in 0) group=state;; 1) group=workspace;; 2) group=homebrew;; esac
+    echo "      storage diagnostic ($group): before=${before_parts[$idx]} after=${after_parts[$idx]} delta=$((after_parts[idx]-before_parts[idx])) bytes"
+  done
+fi
+
 echo "      volume used before/after backup: $USED_BEFORE / $USED_AFTER bytes (delta $((USED_AFTER-USED_BEFORE)))"
 chk "A: backup wrote nothing significant to the volume (< 1 MB delta: logs only)" '[ $((USED_AFTER-USED_BEFORE)) -lt 1048576 ]'
 chk "A: no backup leftovers in the container temp dir" '[ -z "$(docker exec drillA bash -c "ls /tmp | grep basht-backup")" ]'
