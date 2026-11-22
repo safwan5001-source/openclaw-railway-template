@@ -44,6 +44,8 @@ const PROTECTED_NAMES = [
   /^backups?$/i,
   /^basht-backup/i,
   /\.bkp$/i,
+  // OpenClaw private Doctor capture root <stateDir>.update-captures/: a full pre-repair copy of state (incl. credentials)
+  /\.update-captures$/i,
   /\.(db|sqlite3?|db-wal|db-shm|sqlite-wal|sqlite-shm|key|pem|p12|pfx|jsonl|token)$/i,
 ];
 // Files that are (or may be) in active use.
@@ -59,9 +61,12 @@ const VARIANT_SUFFIX = /(\.(bak|old|orig|rej|backup|tmp|temp|swp|part|partial)|~
 
 // OpenClaw doctor / state-migration artifacts (openclaw@2026.10.x): <f>.jsonl.pre-doctor-*-repair-<ts>.bak,
 // AGENTS.md.doctor-backup-<ts>, TOOLS.md.doctor-importing-<ts>, .<f>.doctor-importing, <f>.doctor-scrub-*,
-// <f>.quarantined-<ts>, <f>.migrated[-<ts>|.raw], <f>.pre-startup-migration-<ts>.bak. `openclaw doctor --fix` runs on
-// every boot, so these accumulate; they are recovery copies of protected data, measured but never candidates.
-const DOCTOR_SUFFIX = /\.(?:pre-doctor-|doctor-(?:backup|importing|scrub)|quarantined-|migrated(?=$|[-.])|pre-startup-migration-).*$/i;
+// <f>.quarantined-<ts>, <f>.migrated[-<ts>|.raw], <f>.pre-startup-migration-<ts>.bak, and the private Doctor capture
+// root <stateDir>.update-captures/ (full pre-repair state copy, kept per container; older copies retired after 30 days).
+// `openclaw doctor --fix` runs on every boot, so these accumulate; they are recovery copies of protected data,
+// measured but never candidates.
+const DOCTOR_SUFFIX =
+  /\.(?:pre-doctor-|doctor-(?:backup|importing|scrub)|quarantined-|migrated(?=$|[-.])|pre-startup-migration-).*$|\.update-captures$/i;
 // OpenClaw plugin source captures: <stateDir>/tmp/plugin-captures/<instance>/... (owner-leased, OpenClaw cleans them).
 const PLUGIN_CAPTURES_DIR = /^plugin-captures$/i;
 

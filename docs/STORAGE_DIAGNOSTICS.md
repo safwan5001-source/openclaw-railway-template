@@ -25,7 +25,7 @@ reported in their own bucket so their growth is visible without ever suggesting 
 
 | Bucket | Matches (openclaw@2026.10.9) | Notes |
 |---|---|---|
-| `recovery.doctor` | `*.pre-doctor-*` (e.g. `<session>.jsonl.pre-doctor-branch-repair-<ts>.bak`), `*.doctor-backup-*`, `*.doctor-importing*`, `*.doctor-scrub-*`, `*.quarantined-*`, `*.migrated`, `*.migrated-*`, `*.migrated.*`, `*.pre-startup-migration-*`; whole directories with these suffixes | counted inside and outside protected trees; a doctor copy of a protected file stays `<protected>` |
+| `recovery.doctor` | the private Doctor capture root `<stateDir>.update-captures/` (on Railway `/data/.openclaw.update-captures/`: a **full pre-repair copy of state, credentials included**, kept per container; OpenClaw retires other copies after 30 days); `*.pre-doctor-*` (e.g. `<session>.jsonl.pre-doctor-branch-repair-<ts>.bak`), `*.doctor-backup-*`, `*.doctor-importing*`, `*.doctor-scrub-*`, `*.quarantined-*`, `*.migrated`, `*.migrated-*`, `*.migrated.*`, `*.pre-startup-migration-*`; whole directories with these suffixes | counted inside and outside protected trees; `.update-captures` is also protected (shown only as `<protected>`); a doctor copy of a protected file stays `<protected>` |
 | `recovery.pluginCaptures` | everything under a `plugin-captures/` directory (default `<stateDir>/tmp/plugin-captures/<instance>/…`) | lease-owned by OpenClaw (`owner.sqlite`) and reclaimed by it; previously this fell under the `tmp` cache rule — now excluded from `cache` |
 
 `recovery` can overlap `protectedMB` (both are anonymous totals). Names of these files are never printed; a directory
@@ -57,7 +57,13 @@ dir, removed afterwards):
 | 20 000 | 1.4 s | 1.9 s | +11.8 MB | 16 MB | 10.4 ms | 0.4 / 3.6 ms (0.2 / 12.1 ms) |
 | 100 000 | 5.6 s | 6.7 s | +22 MB | 28 MB | 13.1 ms | 0.2 / 4.1 ms (0.2 / 10.1 ms) |
 
-(Node 22, 4 vCPU dev container; CPU > wall because lstat runs on the thread pool.) Every production run reports its own
+(Node 22, 4 vCPU dev container; CPU > wall because lstat runs on the thread pool.)
+
+Real image (`scripts/test-storage-diag-container.sh <image>`, openclaw@2026.10.9, Node 26, real gateway, 46 k files /
+417 MB synthetic volume): scan 2.6 s, wrapper CPU 2.6 s (≈ one core for the scan duration), max event-loop delay
+20.8 ms, `/setup/healthz` through the wrapper p50 3.8 ms / p99 12.6 ms / max 74 ms with 652/652 requests = 200 during
+the scan window, gateway PID unchanged, 64 seeded sensitive/recovery files byte-identical across the scan, 3
+`storage-diag` lines in total. With `DIAG_STORAGE=0` there is no `storage-diag` line at all. Every production run reports its own
 `scan.ms`, `scan.cpuMs`, `scan.lagMaxMs` and `scan.rssMB`, so the real cost on the volume is visible in the logs.
 
 ## Alerts

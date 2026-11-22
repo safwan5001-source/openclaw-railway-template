@@ -221,6 +221,10 @@ function recoveryFixture() {
   put(root, "workspace/exports/inv.pdf.quarantined-1730000000", 2_000, 30);
   put(root, `workspace/plan.md.pre-startup-migration-${TS}.bak`, 2_000, 30);
   put(root, `.openclaw/agents.migrated-${TS}/main/x.json`, 2_000, 30);
+  // private Doctor capture root beside the state dir: full pre-repair copy of state
+  put(root, ".openclaw.update-captures/run-0123456789abcdef/.openclaw-private-update-capture", 40, 30);
+  put(root, ".openclaw.update-captures/run-0123456789abcdef/state/credentials/whatsapp/creds.json", 3_000, 30);
+  put(root, ".openclaw.update-captures/run-0123456789abcdef/state/logs/gateway.log", 3_000, 30);
   // backups and secrets
   put(root, "backups/2026-11.tar.gz", 9_000, 60);
   put(root, "tmp/basht-backup-2026-11-01.bkp", 9_000, 60);
@@ -231,10 +235,11 @@ function recoveryFixture() {
 
 test("names: doctor snapshot variants are recognised and keep protection of the original", () => {
   for (const n of [`abc.jsonl.pre-doctor-branch-repair-${TS}.bak`, `AGENTS.md.doctor-backup-${TS}`, ".config-audit.jsonl.doctor-importing",
-    "x.raw.doctor-scrub-progress", "auth-profiles.json.quarantined-1", "sessions.json.migrated", `agents.migrated-${TS}`, `f.pre-startup-migration-${TS}.bak`])
+    "x.raw.doctor-scrub-progress", "auth-profiles.json.quarantined-1", "sessions.json.migrated", `agents.migrated-${TS}`, `f.pre-startup-migration-${TS}.bak`,
+    ".openclaw.update-captures"])
     assert.ok(isDoctorSnapshotName(n), n);
   for (const n of [`abc.jsonl.pre-doctor-branch-repair-${TS}.bak`, `AGENTS.md.doctor-backup-${TS}`, ".config-audit.jsonl.doctor-importing",
-    "auth-profiles.json.quarantined-1", `agents.migrated-${TS}`, "basht-backup-2026.bkp", "backups", "x.bkp"])
+    "auth-profiles.json.quarantined-1", `agents.migrated-${TS}`, "basht-backup-2026.bkp", "backups", "x.bkp", ".openclaw.update-captures"])
     assert.ok(isProtectedName(n), n);
   for (const n of ["notes.md", "migrated.txt", "doctor", "plugin-captures", "x.bak"]) assert.ok(!isDoctorSnapshotName(n), n);
 });
@@ -243,22 +248,22 @@ test("scan: doctor snapshots and plugin-captures are measured separately and are
   const root = recoveryFixture();
   const r = await scanTree(root, { now: Date.now() });
   assert.equal(r.recovery.pluginCaptures.n, 2, "both files under tmp/plugin-captures");
-  assert.equal(r.recovery.doctor.n, 8, "every doctor/migration artifact, inside or outside protected trees");
+  assert.equal(r.recovery.doctor.n, 11, "every doctor/migration artifact incl. the update-captures root, inside or outside protected trees");
   assert.ok(r.recovery.pluginCaptures.bytes >= 54_000 && r.recovery.doctor.bytes >= 34_000);
   const c = r.candidates;
   assert.equal(c.tmp.n, 1, "only .openclaw/tmp/stale.tmp (not plugin-captures, not the .bkp backup)");
   assert.equal(c.cache.n, 0, "plugin-captures is not cache");
   assert.equal(c.backup.n, 0, "pre-doctor/.pre-startup-migration .bak files are not backup candidates");
   assert.equal(c.exportsOld.n, 0, "a quarantined export is a doctor artifact, not an old export");
-  assert.equal(c.log.n, 0);
+  assert.equal(c.log.n, 0, "a .log inside the Doctor capture root is not a log candidate");
   const [summary, detail] = buildLines(r, { total: 5e9, used: 4e9, free: 1e9, pct: 80 }, "ok");
   const s = JSON.parse(summary);
   assert.deepEqual(Object.keys(s.recovery), ["doctor", "pluginCaptures"]);
-  assert.equal(s.recovery.doctor.n, 8);
+  assert.equal(s.recovery.doctor.n, 11);
   for (const k of ["cpuMs", "lagMaxMs", "rssMB"]) assert.equal(typeof s.scan[k], "number", k);
   const all = summary + detail;
   for (const bad of ["pre-doctor", "doctor-backup", "doctor-importing", "migrated", "quarantined", "abc", "AGENTS", "inst1",
-    "owner.sqlite", "config-audit", "basht-backup", "gateway.token", ".env", CANARY, "notes", "plan.md"])
+    "owner.sqlite", "config-audit", "basht-backup", "gateway.token", ".env", CANARY, "notes", "plan.md", "update-captures", "run-0123"])
     assert.ok(!all.includes(bad), `leaked ${bad}`);
   assert.ok(detail.includes("/.openclaw/tmp"), "plugin-captures size is visible through its safe parent folder");
   fs.rmSync(root, { recursive: true, force: true });
@@ -273,7 +278,7 @@ test("scan: never opens file contents (only readdir/lstat are called)", async ()
   };
   const r = await scanTree(root, { now: Date.now(), fs: spy });
   assert.deepEqual([...calls].sort(), ["lstat", "readdir"]);
-  assert.ok(r.files >= 14);
+  assert.ok(r.files >= 17);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
