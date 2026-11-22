@@ -1,0 +1,27 @@
+name: BASHT Marketing Skills validation
+
+on:
+  pull_request:
+    paths:
+      - 'skills/basht-*/**'
+      - 'scripts/marketing-skills.test.mjs'
+      - '.github/workflows/basht-marketing-skills-ci.yml'
+      - 'package.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  marketing-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Verify marketing skill structure, security and playbooks
+        run: node --test scripts/marketing-skills.test.mjs
