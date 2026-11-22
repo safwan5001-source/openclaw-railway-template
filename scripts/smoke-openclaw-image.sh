@@ -58,6 +58,23 @@ docker volume rm -f ${N}-data >/dev/null
 docker run -d --name $N -p $P:8080 --tmpfs /data:rw,size=24m,mode=0755 -e SETUP_PASSWORD=$PW -e OPENCLAW_STATE_DIR=/data/.openclaw -e OPENCLAW_WORKSPACE_DIR=/data/workspace "$IMG" >/dev/null
 chk "full volume (24 MB): Homebrew copy fails but the service boots" 'wait_health 60'
 chk "full volume: no half-copied .linuxbrew left; image Homebrew in use" 'docker exec $N bash -c "[ ! -e /data/.linuxbrew ] && [ ! -e /data/.linuxbrew.partial ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ] && [ ! -L /home/linuxbrew/.linuxbrew ]"'
-chk "full volume: reason logged" 'docker logs $N 2>&1 | grep -q "could not copy Homebrew"'
+# Avoid grep -q on a live docker-logs pipe with pipefail: early grep exit can SIGPIPE docker logs.
+# Preserve the check: require successful log capture and the exact expected warning.
+check_full_volume_reason_logged() {
+  local log_file
+  log_file=$(mktemp) || return 1
+  if ! docker logs "$N" >"$log_file" 2>&1; then
+    rm -f "$log_file"
+    return 1
+  fi
+  if grep -qF "could not copy Homebrew" "$log_file"; then
+    rm -f "$log_file"
+    return 0
+  fi
+  echo "      expected Homebrew failure warning absent from captured container logs"
+  rm -f "$log_file"
+  return 1
+}
+chk "full volume: reason logged" 'check_full_volume_reason_logged'
 docker rm -f $N >/dev/null; docker volume rm -f ${N}-data >/dev/null
 echo "RESULT pass=$pass fail=$fail"; [ $fail = 0 ]
