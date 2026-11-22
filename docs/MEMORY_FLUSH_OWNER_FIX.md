@@ -101,6 +101,32 @@ owner-only `toolsBySender` grant; `*` denies `write`):
 The E2E uses test-only instrumentation that gives the CLI maintenance run the same fields a WhatsApp owner reply turn
 carries; it is applied identically to baseline and patched installs and never ships in the image.
 
+## 4b. Re-verification on top of `main@901dd72` (after the PR #27 security fix)
+
+The branch was updated by **merging** `main` (no rebase, no force-push). The merge had no conflicts. Against `main`, this
+PR touches no file in `src/`, `scripts/`, `entrypoint.sh` or the PR #27 workflows; it only adds the patch step to the
+`Dockerfile`, the `patches/` directory, a CI job, `package.json` scripts and this document.
+
+| Check (head of this branch) | Result |
+|---|---|
+| `scripts/ci-local.sh --with-openclaw` (PR #27's local CI): syntax, wrapper + skill suite, packaging + **security invariants**, skills, shellcheck, pinned OpenClaw install, skill eligibility, `patches/*.test.mjs` on the pinned dist | **RESULT PASS** (516 + 14 + 16 tests, 0 failures) |
+| E2E with the real `@openclaw/whatsapp` plugin (§4 matrix A–F) | 6/6 |
+| Docker image build (patch applied, sha `2812f12a…`) | pass |
+| `scripts/smoke-openclaw-image.sh` (V1 token injection, V5 env, V6 full volume, non-root, `/setup` auth) | 19/19 |
+| `scripts/export-drill.sh` (V12 streaming export, 900 MB synthetic) | 10/10 |
+| `scripts/restore-drill.sh` | pass on most runs; intermittent failures are **pre-existing in `main`** (below) |
+
+**Restore drill (pre-existing timing race, not caused by this PR).** Two checks fail intermittently:
+* `.openclaw/openclaw.json.last-good` present after restore but absent in the "before" snapshot. OpenClaw's config-health
+  monitor writes this file asynchronously after the gateway starts (`io.factory-*.mjs`, last-known-good promotion), so it
+  depends on whether the snapshot was taken before or after that write.
+* "backup wrote nothing significant to the volume" (volume-delta timing).
+
+Alternating runs on an idle host: the image built from **`main` (no patch)** failed 3/6 (including the identical
+`last-good` diff), the patched image 1/6. The memory-flush code path does not run in the drill (no agent turns).
+Suggested fix for the drill (separate PR): exclude `*.last-good` from the manifest, or wait for the config-health
+promotion before snapshotting.
+
 ## 5. Pre-deploy check on production (read-only)
 
 The doctor ships in the image (`/app/patches/memory-flush-doctor.mjs`). Before or after deploying, in the Railway
