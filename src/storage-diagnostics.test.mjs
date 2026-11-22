@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildLines,
   DEFAULTS,
+  isDoctorSnapshotName,
   isProtectedName,
   isSafeName,
   nextAlertState,
@@ -202,4 +203,100 @@ test("start: opt-in runOnce logs two compact lines and a single warning above 85
   assert.equal(lines.filter(([k]) => k === "warn").length, 1);
   h.stop();
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+const TS = "2026-11-01T10-00-00-000Z";
+function recoveryFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "diag-rec-"));
+  // plugin source captures (OpenClaw-owned, under the tmp tree that is otherwise a cache candidate)
+  put(root, ".openclaw/tmp/plugin-captures/inst1/captures/pkg/index.js", 50_000, 30);
+  put(root, ".openclaw/tmp/plugin-captures/inst1/owner.sqlite", 4_000, 30);
+  put(root, ".openclaw/tmp/stale.tmp", 3_000, 30); // still a normal tmp candidate
+  // doctor snapshots / migration backups
+  put(root, `.openclaw/agents/main/sessions/abc.jsonl.pre-doctor-branch-repair-${TS}.bak`, 20_000, 30);
+  put(root, `workspace/AGENTS.md.doctor-backup-${TS}`, 2_000, 30);
+  put(root, ".openclaw/logs/.config-audit.jsonl.doctor-importing", 2_000, 30);
+  put(root, ".openclaw/logs/config-audit.jsonl.migrated.raw", 2_000, 30);
+  put(root, `workspace/notes.md.migrated-${TS}`, 2_000, 30);
+  put(root, "workspace/exports/inv.pdf.quarantined-1730000000", 2_000, 30);
+  put(root, `workspace/plan.md.pre-startup-migration-${TS}.bak`, 2_000, 30);
+  put(root, `.openclaw/agents.migrated-${TS}/main/x.json`, 2_000, 30);
+  // backups and secrets
+  put(root, "backups/2026-11.tar.gz", 9_000, 60);
+  put(root, "tmp/basht-backup-2026-11-01.bkp", 9_000, 60);
+  put(root, ".openclaw/gateway.token", 64, 60);
+  put(root, "workspace/.env.local", 200, 60);
+  return root;
+}
+
+test("names: doctor snapshot variants are recognised and keep protection of the original", () => {
+  for (const n of [`abc.jsonl.pre-doctor-branch-repair-${TS}.bak`, `AGENTS.md.doctor-backup-${TS}`, ".config-audit.jsonl.doctor-importing",
+    "x.raw.doctor-scrub-progress", "auth-profiles.json.quarantined-1", "sessions.json.migrated", `agents.migrated-${TS}`, `f.pre-startup-migration-${TS}.bak`])
+    assert.ok(isDoctorSnapshotName(n), n);
+  for (const n of [`abc.jsonl.pre-doctor-branch-repair-${TS}.bak`, `AGENTS.md.doctor-backup-${TS}`, ".config-audit.jsonl.doctor-importing",
+    "auth-profiles.json.quarantined-1", `agents.migrated-${TS}`, "basht-backup-2026.bkp", "backups", "x.bkp"])
+    assert.ok(isProtectedName(n), n);
+  for (const n of ["notes.md", "migrated.txt", "doctor", "plugin-captures", "x.bak"]) assert.ok(!isDoctorSnapshotName(n), n);
+});
+
+test("scan: doctor snapshots and plugin-captures are measured separately and are never candidates", async () => {
+  const root = recoveryFixture();
+  const r = await scanTree(root, { now: Date.now() });
+  assert.equal(r.recovery.pluginCaptures.n, 2, "both files under tmp/plugin-captures");
+  assert.equal(r.recovery.doctor.n, 8, "every doctor/migration artifact, inside or outside protected trees");
+  assert.ok(r.recovery.pluginCaptures.bytes >= 54_000 && r.recovery.doctor.bytes >= 34_000);
+  const c = r.candidates;
+  assert.equal(c.tmp.n, 1, "only .openclaw/tmp/stale.tmp (not plugin-captures, not the .bkp backup)");
+  assert.equal(c.cache.n, 0, "plugin-captures is not cache");
+  assert.equal(c.backup.n, 0, "pre-doctor/.pre-startup-migration .bak files are not backup candidates");
+  assert.equal(c.exportsOld.n, 0, "a quarantined export is a doctor artifact, not an old export");
+  assert.equal(c.log.n, 0);
+  const [summary, detail] = buildLines(r, { total: 5e9, used: 4e9, free: 1e9, pct: 80 }, "ok");
+  const s = JSON.parse(summary);
+  assert.deepEqual(Object.keys(s.recovery), ["doctor", "pluginCaptures"]);
+  assert.equal(s.recovery.doctor.n, 8);
+  for (const k of ["cpuMs", "lagMaxMs", "rssMB"]) assert.equal(typeof s.scan[k], "number", k);
+  const all = summary + detail;
+  for (const bad of ["pre-doctor", "doctor-backup", "doctor-importing", "migrated", "quarantined", "abc", "AGENTS", "inst1",
+    "owner.sqlite", "config-audit", "basht-backup", "gateway.token", ".env", CANARY, "notes", "plan.md"])
+    assert.ok(!all.includes(bad), `leaked ${bad}`);
+  assert.ok(detail.includes("/.openclaw/tmp"), "plugin-captures size is visible through its safe parent folder");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("scan: never opens file contents (only readdir/lstat are called)", async () => {
+  const root = recoveryFixture();
+  const calls = new Set();
+  const spy = {
+    readdir: (...a) => (calls.add("readdir"), fs.promises.readdir(...a)),
+    lstat: (...a) => (calls.add("lstat"), fs.promises.lstat(...a)),
+  };
+  const r = await scanTree(root, { now: Date.now(), fs: spy });
+  assert.deepEqual([...calls].sort(), ["lstat", "readdir"]);
+  assert.ok(r.files >= 14);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("start: DIAG_STORAGE=0 (and any value other than 1) is a no-op", () => {
+  for (const v of ["0", "", "true", "yes", " 1"]) {
+    let touched = false;
+    const h = startStorageDiagnostics({ log: { info() { touched = true; }, warn() { touched = true; } }, env: { DIAG_STORAGE: v }, setTimeoutFn: () => { touched = true; } });
+    assert.equal(h, null, JSON.stringify(v));
+    assert.equal(touched, false);
+  }
+});
+
+test("start: a scan failure logs only the error code, never a path", async () => {
+  const lines = [];
+  const missing = path.join(os.tmpdir(), "diag-missing-+966501234567");
+  const h = startStorageDiagnostics({
+    log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
+    env: { DIAG_STORAGE: "1", DIAG_STORAGE_ROOT: missing },
+    statfs: async () => { throw Object.assign(new Error(`ENOENT: ${missing}`), { code: "ENOENT" }); },
+    setTimeoutFn: () => ({ unref() {} }),
+  });
+  assert.equal(await h.runOnce(), null);
+  const fail = lines.filter((m) => m.startsWith("scan failed"));
+  assert.deepEqual(fail, ["scan failed: ENOENT"]);
+  h.stop();
 });
