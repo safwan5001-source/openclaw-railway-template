@@ -32,7 +32,7 @@ docker restart drillA >/dev/null; chk "A: real gateway up with synthetic data" '
 manifest drillA > $D/before.sha
 # Diagnose volume growth using synthetic file metadata only; never read file contents or output credentials.
 # Exclude server.log to match the du threshold below.
-volume_files() { docker exec drillA bash -c 'find /data -type f ! -name server.log -printf "%P\\t%s\\n" | LC_ALL=C sort'; }
+volume_files() { docker exec drillA bash -c 'find /data -type f ! -name server.log -printf "%P\t%s\n" | LC_ALL=C sort'; }
 volume_files > "$D/volume-before.tsv"
 USED_BEFORE=$(docker exec drillA bash -c 'du -sb --exclude=server.log /data | cut -f1')
 T0=$(date +%s%N)
@@ -52,7 +52,7 @@ from pathlib import Path
 def read_sizes(filename):
     result = {}
     for row in Path(filename).read_text(errors="replace").splitlines():
-        name, sep, size = row.rpartition("\\t")
+        name, sep, size = row.rpartition("\t")
         if sep and size.isdigit():
             result[name] = int(size)
     return result
