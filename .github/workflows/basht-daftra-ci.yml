@@ -54,6 +54,8 @@ jobs:
       # Independent readers used by the export tests to prove the XLSX/DOCX files really open (no repo code, test-time only).
       - name: Install reader libraries for export validation
         run: python3 -m pip install --disable-pip-version-check openpyxl python-docx
+      - name: Install wrapper dependencies (frozen lockfile)
+        run: npx -y pnpm@11.24.0 install --frozen-lockfile --prod
       - name: Node version
         run: node --version
       - name: Node tests (wrapper + Daftra skill, offline fakes only)
@@ -146,6 +148,6 @@ jobs:
         env:
           OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
           OPENCLAW_STATE_DIR: ${{ runner.temp }}/flush/state
-        run: node --test patches/*.test.mjs
+        run: node --test --test-concurrency=1 patches/*.test.mjs
       - name: End-to-end (upstream reproduces the bug; patched owner saves and recalls; non-owners stay read-only)
         run: bash patches/e2e/memory-flush-e2e.sh "$RUNNER_TEMP/flush"
