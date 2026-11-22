@@ -226,7 +226,8 @@ test("F3: every agent that holds the owner's DM is simulated; a non-main agent t
 });
 
 test("F4: owner entries OpenClaw would not accept (legacy user: form, ${ENV}) fail closed", integration, () => {
-  for (const entry of [`whatsapp:user:${OWNER}`, "${OWNER_NUMBER}", `whatsapp:${OWNER.slice(0, 4)} ${OWNER.slice(4)}`]) {
+  // A spaced number is NOT in this list: OpenClaw keeps digits only and accepts it (see R1 / whatsapp-owner.test.mjs).
+  for (const entry of [`whatsapp:user:${OWNER}`, "${OWNER_NUMBER}", "whatsapp:120363000000000001@g.us", `whatsapp:${OWNER.slice(1)}@example.com`]) {
     const st = makeState({ config: { ...BASE_CONFIG, commands: { ownerAllowFrom: [entry] } } });
     try {
       const { out } = runCheck(st);
@@ -266,6 +267,90 @@ test("F7: secrets in tools/agents sections stay in the parent (only policy field
   const src = fs.readFileSync(CHECK, "utf8");
   assert.match(src, /const POLICY_KEYS = \["profile", "allow", "alsoAllow", "deny"\];/, "child receives only allowlisted policy keys");
   assert.match(src, /OPENCLAW_LOG_LEVEL: "silent"/, "child logging silenced (F1)");
+});
+
+test("R1: every owner form OpenClaw 2026.10.9 accepts is READY — incl. the 'whatsapp:<digits>' form without '+'", integration, () => {
+  const digits = OWNER.slice(1);
+  for (const entry of [`whatsapp:${digits}`, digits, `whatsapp:+${digits.slice(0, 1)} ${digits.slice(1, 4)}-${digits.slice(4)}`, `${digits}@s.whatsapp.net`, `whatsapp:whatsapp:${OWNER}`]) {
+    const st = makeState({ config: { ...BASE_CONFIG, commands: { ownerAllowFrom: [entry] } } });
+    try {
+      const { out } = runCheck(st);
+      assert.match(out.VERDICT, /^READY/, entry);
+      assert.equal(out.q1_explicit_whatsapp_owner_entries, 1, entry);
+      assert.equal(out.q1_unrecognised_owner_entries, 0, entry);
+    } finally { cleanup(st); }
+  }
+});
+
+// ---------------------------------------------------------------- memory-flush-doctor.mjs: same owner, no writes
+const DOCTOR = path.join(HERE, "memory-flush-doctor.mjs");
+
+/** Runs the doctor --json under the same isolation and the same before/after snapshot as runCheck. */
+function runDoctor(st) {
+  const childEnv = { PATH: process.env.PATH, HOME: st.home, TMPDIR: st.tmp, OPENCLAW_STATE_DIR: st.state, OPENCLAW_WORKSPACE_DIR: st.ws, OPENCLAW_PACKAGE_ROOT: PKG,
+    GH_TOKEN: SECRETS[2] };
+  const logDir = sharedLogDirOwnedByRunUser();
+  const dirs = [st.state, st.ws, st.home, st.tmp, ...(logDir ? [logDir] : [])];
+  const before = snapshot(dirs);
+  const cmd = isRoot ? ["runuser", ["-u", RUN_AS, "--", "env", ...Object.entries(childEnv).map(([k, v]) => `${k}=${v}`), process.execPath, DOCTOR, "--json"]] : [process.execPath, [DOCTOR, "--json"]];
+  const r = spawnSync(cmd[0], cmd[1], { env: isRoot ? process.env : childEnv, encoding: "utf8", timeout: 240_000 });
+  assert.equal(snapshot(dirs), before, "the doctor must not create, modify or delete any file (state, workspace, HOME, TMPDIR, /tmp/openclaw logs)");
+  assert.deepEqual(fs.readdirSync(st.tmp), [], "nothing left in TMPDIR (no compile cache, no sandbox)");
+  assert.equal(r.stderr, "", "stderr must be empty");
+  assert.equal(r.status, 0);
+  assert.ok(!/\d{7,}/.test(r.stdout), "numbers are masked");
+  for (const s of SECRETS) assert.ok(!r.stdout.includes(s), `secret leaked: ${s}`);
+  return JSON.parse(r.stdout);
+}
+
+test("R2: production regression — owner 'whatsapp:<digits>' (no '+'): doctor and owner-check both verify the owner, READY, no writes", integration, () => {
+  const st = makeState({ config: { ...BASE_CONFIG, commands: { ownerAllowFrom: [`whatsapp:${OWNER.slice(1)}`] } } });
+  try {
+    const rep = runDoctor(st);
+    assert.equal(rep.ownerIdentity.verifiedOwners.length, 1, "doctor verifies the owner (was [] before the fix)");
+    assert.deepEqual(rep.ownerIdentity.verifiedOwnerForms, ["PN"]);
+    assert.equal(rep.ownerCheck.q1_explicit_whatsapp_owner_entries, 1);
+    assert.match(rep.ownerCheck.VERDICT, /^READY/);
+    assert.match(rep.verdict, /^READY/);
+    assert.equal(rep.simulation.main.flush_patched.write, true, "owner flush keeps write (was write=false before the fix)");
+    assert.equal(rep.simulation.main.flush_upstream.write, false);
+    assert.equal(rep.simulation.main.flush_impostor.write, false);
+  } finally { cleanup(st); }
+});
+
+test("R3: doctor and owner-check agree on BLOCKED cases (no owner / channel allowFrom only / owner never chatted)", integration, () => {
+  const cases = [
+    [{ ...BASE_CONFIG, commands: {} }, [OWNER], /^BLOCKED: no explicit WhatsApp owner/, /OWNER UNVERIFIED/],
+    [{ ...BASE_CONFIG, commands: { ownerAllowFrom: ["*"] } }, [OWNER], /^BLOCKED: no explicit WhatsApp owner/, /OWNER UNVERIFIED/],
+    [BASE_CONFIG, [OTHER], /^BLOCKED: configured owner has no WhatsApp DM session/, /no simulation|BLOCKED/],
+  ];
+  for (const [config, sessionNumbers, ocRe, doctorRe] of cases) {
+    const st = makeState({ config, sessionNumbers });
+    try {
+      const rep = runDoctor(st);
+      assert.match(rep.ownerCheck.VERDICT, ocRe);
+      assert.match(rep.verdict, ocRe, "doctor never reports READY when owner-check is BLOCKED");
+      assert.match(rep.verdict, doctorRe);
+      assert.equal(rep.ownerIdentity.verifiedOwners.length, rep.ownerCheck.q1_explicit_whatsapp_owner_entries, "same owner count");
+    } finally { cleanup(st); }
+  }
+});
+
+test("doctor refuses to run as root", { skip: !isRoot ? "not running as root" : false }, () => {
+  const r = spawnSync(process.execPath, [DOCTOR], { encoding: "utf8", env: { PATH: process.env.PATH } });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /refusing to run as root/);
+});
+
+test("static: the doctor never invokes the OpenClaw CLI, never opens SQLite, never imports OpenClaw, never writes", () => {
+  const src = fs.readFileSync(DOCTOR, "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
+  assert.ok(!/dist\/entry\.js|openclaw\.mjs|ENTRY\b|["']config["'],\s*["']get|["']sessions["']/.test(src), "no OpenClaw CLI invocation");
+  assert.ok(!/node:sqlite|DatabaseSync|better-sqlite/.test(src), "no SQLite connection");
+  assert.ok(!/agent-tools-|AGENT_TOOLS_CHUNK|await import\(/.test(src), "OpenClaw is never imported in-process (replay runs in owner-check's sandboxed child)");
+  assert.ok(!/writeFileSync|appendFileSync|createWriteStream|renameSync|unlinkSync|copyFileSync|chmodSync|chownSync|mkdtempSync|rmSync|mkdirSync/.test(src), "no file writes");
+  assert.match(src, /O_RDONLY/, "config is opened read-only");
+  assert.match(src, /from "\.\/whatsapp-owner\.mjs"/, "doctor uses the shared owner normaliser");
+  assert.match(fs.readFileSync(CHECK, "utf8"), /from "\.\/whatsapp-owner\.mjs"/, "owner-check uses the shared owner normaliser");
 });
 
 test("refuses to run as root", { skip: !isRoot ? "not running as root" : false }, () => {

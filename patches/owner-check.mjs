@@ -28,13 +28,13 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { classifyOwnerEntry } from "./whatsapp-owner.mjs";
 
 const EXPECTED_OPENCLAW = "2026.10.9";
 const AGENT_TOOLS_CHUNK = "dist/agent-tools-Bpi7xWYy.mjs";
 // A DM session key as stored: not preceded by an identifier character, and not followed by more key segments
 // (":thread:…") or digits, so keys embedded in other keys or in free text do not count.
 const SESSION_KEY_RE = /(?<![A-Za-z0-9_:.-])agent:([a-z0-9][a-z0-9_-]{0,63}):whatsapp:direct:(\+?\d{7,15})(?![\d:A-Za-z_-])/g;
-const OWNER_ENTRY_RE = /^(?:whatsapp:)?\+?\d{7,15}$/i;
 const emit = process.stdout.write.bind(process.stdout);
 let finished = false;
 const finish = (out, code = 0) => {
@@ -140,11 +140,13 @@ try {
   cfg = { ...(all?.tools ? { tools: pickPolicy(all.tools) } : {}), ...(agents ? { agents } : {}) };
   out.config_unsubstituted_env = JSON.stringify(cfg).includes("${");
   const raw = Array.isArray(all?.commands?.ownerAllowFrom) ? all.commands.ownerAllowFrom.map((v) => String(v).trim()) : [];
-  const whatsappish = raw.filter((v) => v !== "*" && (!/^[a-z][a-z0-9-]*:/i.test(v) || /^whatsapp:/i.test(v)));
+  // Owner identity exactly as OpenClaw derives it (shared with memory-flush-doctor.mjs, see whatsapp-owner.mjs).
+  const classified = raw.map((v) => (v.includes("${") ? { kind: "unrecognised" } : classifyOwnerEntry(v)));
   out.q1_ownerAllowFrom_present = raw.length > 0;
-  out.q1_wildcard_entry_present = raw.includes("*");
-  out.q1_unrecognised_owner_entries = whatsappish.filter((v) => !OWNER_ENTRY_RE.test(v)).length + (raw.some((v) => v.includes("${")) ? 1 : 0);
-  cfg.owners = [...new Set(whatsappish.filter((v) => OWNER_ENTRY_RE.test(v)).map((v) => e164(v.replace(/^whatsapp:/i, ""))).filter(Boolean))];
+  out.q1_wildcard_entry_present = classified.some((c) => c.kind === "wildcard");
+  out.q1_unrecognised_owner_entries = classified.filter((c) => c.kind === "unrecognised").length;
+  out.q1_owner_entry_forms = [...new Set(classified.filter((c) => c.kind === "owner").map((c) => c.form))];
+  cfg.owners = [...new Set(classified.filter((c) => c.kind === "owner").map((c) => c.e164))];
   out.q1_explicit_whatsapp_owner_entries = cfg.owners.length;
   const chan = Array.isArray(all?.channels?.whatsapp?.allowFrom) ? all.channels.whatsapp.allowFrom : [];
   out.info_channel_allowFrom_entries_not_owner = [...new Set(chan.map(e164).filter(Boolean))].filter((n) => !cfg.owners.includes(n)).length;
