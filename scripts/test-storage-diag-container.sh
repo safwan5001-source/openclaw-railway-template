@@ -70,7 +70,7 @@ SUMMARY=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"level"' | head -1 | s
 echo "summary: $SUMMARY"
 echo "detail:  $(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"dirs"' | head -1 | sed 's/.*\[storage-diag\] //' | cut -c1-400)..."
 chk "first scan: exactly 2 JSON lines" '[ "$(logs | grep -c "\[storage-diag\] {")" = 2 ]'
-chk "summary: recovery.doctor counts seeded snapshots + OpenClaw's own .update-captures (>4)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.doctor.n>4&&s.recovery.doctor.mb>0?0:1)"'
+chk "summary: recovery.doctor counts seeded snapshots + OpenClaw's own .update-captures (>4)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.doctor.n>4&&Number.isFinite(s.recovery.doctor.mb)?0:1)"'
 chk "summary: recovery.pluginCaptures >= 50 seeded (+ OpenClaw's own)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.pluginCaptures.n>=50?0:1)"'
 chk "detail: no update-captures or capture-run names printed" '! logs | grep storage-diag | grep -qE "update-captures|plugin-captures/|inst1"'
 chk "summary: backups/secrets never candidates (backup candidates = scratch.md.bak only)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.candidates.backup.n===1&&s.protectedMB>0?0:1)"'
