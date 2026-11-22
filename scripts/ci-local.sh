@@ -72,7 +72,7 @@ if [ "$WITH_OPENCLAW" = 1 ]; then
   step "install pinned OpenClaw $OC_VER (scripts disabled, temp dir)" install_openclaw
   step "OpenClaw discovers the skill; eligible only with DAFTRA_* env" bash scripts/verify-skill-eligibility.sh "$OC_TMP"
   if compgen -G "patches/*.test.mjs" >/dev/null; then
-    step "patches: unit + integration against pinned OpenClaw" env OPENCLAW_PACKAGE_ROOT="$OC_TMP/node_modules/openclaw" OPENCLAW_STATE_DIR="$OC_TMP/state" node --test patches/*.test.mjs
+    step "patches: unit + integration against pinned OpenClaw" env OPENCLAW_PACKAGE_ROOT="$OC_TMP/node_modules/openclaw" OPENCLAW_STATE_DIR="$OC_TMP/state" node --test --test-concurrency=1 patches/*.test.mjs
   else
     skip "patches tests" "no patches/ directory on this commit"
   fi
