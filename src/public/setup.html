@@ -308,23 +308,29 @@
         }
       },
 
-      async exportData() {
-        // The archive is streamed by the server; let the browser's own download manager write it to disk (a fetch()
-        // + blob would hold the whole file in memory, which fails on phones). First show what will be exported.
+      async exportData(scope = 'essential') {
+        // Server streams the archive; the browser's own download manager writes it to disk. The download goes
+        // through a single-use link because iOS download managers may not send this page's login with it.
         this.exporting = true;
-        this.log = 'Checking export size...\n';
+        this.log = 'Checking export size (' + scope + ')...\n';
         try {
-          const plan = await this.httpJson('/setup/api/export/plan');
+          const plan = await this.httpJson('/setup/api/export/plan?scope=' + scope);
           if (plan.running) {
             this.log += '✗ An export is already running. Wait for it to finish.\n';
             return;
           }
-          this.log += 'Export: ' + plan.files + ' files, about ' + plan.mb + ' MB before compression (rebuildable caches excluded).\n';
+          this.log += 'Export (' + scope + '): ' + plan.files + ' files, about ' + plan.mb + ' MB before compression.\n';
+          for (const d of (plan.largest || []).slice(0, 5)) this.log += '   ' + d.mb + ' MB  ' + d.dir + '\n';
           if (plan.mb > plan.importLimitMb) {
             this.log += '⚠ Larger than the ' + plan.importLimitMb + ' MB restore limit of Import.\n';
           }
-          this.log += 'Download started by the browser — keep this page open until it finishes.\n';
-          window.location.href = '/setup/api/export';
+          const link = await this.httpJson('/setup/api/export/link', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ scope }),
+          });
+          this.log += 'Download started by the browser — keep it in front until it finishes.\n';
+          window.location.href = link.url;
           this.showExportInfo = true;
         } catch (e) {
           this.log += '✗ Export error: ' + String(e) + '\n';
@@ -564,8 +570,11 @@
               <span class="action-title">Export Data</span>
             </div>
             <p class="action-desc">Download a password-protected ZIP of your config and workspace data.</p>
-            <button @click="exportData()" :disabled="loading || exporting" class="action-btn">
-              <span x-show="!exporting">Export Data</span>
+            <button @click="exportData('essential')" :disabled="loading || exporting" class="action-btn" style="margin-bottom:0.5rem">
+              Export Essential (config, WhatsApp, memory, conversations)
+            </button>
+            <button @click="exportData('full')" :disabled="loading || exporting" class="action-btn">
+              <span x-show="!exporting">Export Everything (incl. PDF copies)</span>
               <span x-show="exporting" style="display:inline-flex;align-items:center;justify-content:center;gap:0.5rem">
                 <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
                 Exporting...
