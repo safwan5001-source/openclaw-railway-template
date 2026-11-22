@@ -305,3 +305,17 @@ test("start: a scan failure logs only the error code, never a path", async () =>
   assert.deepEqual(fail, ["scan failed: ENOENT"]);
   h.stop();
 });
+
+test("start: first scan defaults to 90s and explicit delay is bounded", () => {
+  const log = { info() {}, warn() {} };
+  for (const [requested, expected] of [[undefined, 90_000], ["240000", 240_000], ["1", 90_000], ["garbage", 90_000], ["9999999", 900_000]]) {
+    const delays = [];
+    const env = { DIAG_STORAGE: "1", ...(requested === undefined ? {} : { DIAG_STORAGE_FIRST_DELAY_MS: requested }) };
+    const h = startStorageDiagnostics({
+      log, env,
+      setTimeoutFn: (ms) => { delays.push(ms); return { unref() {} }; },
+    });
+    assert.deepEqual(delays, [expected], `initial delay for ${String(requested)}`);
+    h.stop();
+  }
+});
