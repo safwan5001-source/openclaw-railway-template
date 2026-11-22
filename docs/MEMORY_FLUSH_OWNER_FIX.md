@@ -136,12 +136,14 @@ console:
 gosu openclaw node /app/patches/memory-flush-doctor.mjs          # or --json
 ```
 
-Run it as the `openclaw` user (the doctor refuses root): reading the session store as root could leave root-owned
-SQLite side files on `/data` that the gateway can no longer write.
+Run it as the `openclaw` user (the doctor refuses root).
 
-It reads config via `openclaw config get`, sessions via `openclaw sessions list --json`, replays OpenClaw's own tool
-policy in a throwaway workspace and prints which policy step removes `write` for: owner turn, upstream flush, patched
-flush, impostor flush — plus PN/LID forms and the latest memory files. Numbers are masked. Possible verdicts:
+The doctor is **strictly read-only** (see §5.2): it reads `openclaw.json` through an `O_RDONLY|O_NOFOLLOW` handle,
+derives the owner with the same normaliser as `owner-check.mjs` (`patches/whatsapp-owner.mjs`), takes the tool-policy
+replay from `owner-check.mjs` (sandboxed child) and prints which policy step removes `write` for: owner turn, upstream
+flush, patched flush, impostor flush — plus the owner entry forms and the latest memory files. Numbers are masked. The
+final verdict starts with owner-check's `READY` / `BLOCKED` and adds the doctor's cause; if the two tools ever derived
+a different owner count it says `INCONSISTENT` instead of picking one. Possible causes:
 
 * **"identity propagation is the cause"** → this PR fixes production.
 * **"operator tool policy removes write for the owner too"** → an agent-level `deny`/`allow` excludes `write` for
@@ -151,9 +153,9 @@ flush, impostor flush — plus PN/LID forms and the latest memory files. Numbers
 
 ### 5.1 Owner readiness check (`patches/owner-check.mjs`, strictly read-only)
 
-`memory-flush-doctor.mjs` uses OpenClaw's CLI (`config get`, `sessions list`). Testing showed that even those read
-commands **write to `state/openclaw.sqlite`** (WAL/maintenance) and create caches under `~/.cache` and `/tmp`. For a
-check that must not touch a live production volume, `owner-check.mjs` avoids the CLI entirely:
+The first doctor used OpenClaw's CLI (`config get`, `sessions list`). Testing showed that even those read commands
+**write to `state/openclaw.sqlite`** (WAL/maintenance) and create caches under `~/.cache` and `/tmp`. For a check that
+must not touch a live production volume, `owner-check.mjs` avoids the CLI entirely (and since §5.2 the doctor does too):
 
 * reads `openclaw.json` (JSON or JSON5) and the agent session stores' bytes with `O_RDONLY` file handles — no SQLite
   connection, so no WAL/SHM/lock interaction with the running gateway;
@@ -163,14 +165,15 @@ check that must not touch a live production volume, `owner-check.mjs` avoids the
   live in one temp directory (deleted before exit), with a minimal environment (no inherited secrets) and
   `OPENCLAW_LOG_LEVEL=silent` (OpenClaw's file logger ignores `TMPDIR` and would otherwise append to the live gateway's
   `/tmp/openclaw/*.log`); the child's stdout/stderr go to `/dev/null` and its result returns on a private pipe;
-* simulates every agent that holds the owner's WhatsApp DM (not only `main`) and counts only owner entries OpenClaw
-  accepts (`whatsapp:+E164` / `+E164`); legacy or `${ENV}` entries, `$include` and `${ENV}` in policy fields are `BLOCKED`;
+* simulates every agent that holds the owner's WhatsApp DM (not only `main`) and counts exactly the owner entries
+  OpenClaw accepts (§5.2: with or without `+`, `whatsapp:` prefix, spaces/dashes, user JIDs); legacy `whatsapp:user:`,
+  group/other-`@` and `${ENV}` entries, `$include` and `${ENV}` in policy fields are `BLOCKED`;
 * prints exactly one line `BASHT_OWNER_CHECK {json}`: booleans, counts, policy-step names and a verdict
   (`READY` / `BLOCKED: <reason>` / `REFUSED`); 7+ digit runs are masked; errors are reduced to their type;
 * refuses root and any OpenClaw version other than 2026.10.9.
 
 ```bash
-gosu openclaw node /app/patches/owner-check.mjs     # after deploy (or copy the file to /tmp first)
+gosu openclaw node /app/patches/owner-check.mjs     # after deploy (to run a copy, copy whatsapp-owner.mjs alongside)
 ```
 
 Verified by `patches/owner-check.test.mjs` (synthetic state, run unprivileged, full before/after file snapshot incl. a
@@ -178,6 +181,37 @@ private `TMPDIR`, a live WAL database referenced from config and `/tmp/openclaw`
 regression test per security-review finding F1–F7) and E2E case G (real OpenClaw SQLite store with `-wal`/`-shm`/lock
 files). An independent security review found F1–F7 in the first version (two High: a log append to the live gateway log,
 and opening a live database through a forwarded `agentDir`); all are fixed and covered by tests.
+
+### 5.2 Doctor vs owner-check contradiction (READY vs `verifiedOwners=[]`, `write=false`) — root cause and fix
+
+**Symptom.** On production `owner-check.mjs` printed `READY` while `memory-flush-doctor.mjs` printed
+`verifiedOwners=[]`, `OWNER UNVERIFIED` and `write=false`.
+
+**Root cause: the doctor's owner parser, not OpenClaw or owner-check.** The doctor accepted an owner only if, after
+stripping `whatsapp:`, it matched `/^\+\d{7,15}$/`, so the `+` was **mandatory**. owner-check accepted
+`/^(?:whatsapp:)?\+?\d{7,15}$/` (`+` optional). OpenClaw 2026.10.9 itself (`isConfiguredCommandOwner` →
+`resolveOwnerAllowFromList` → `@openclaw/whatsapp` `normalizeWhatsAppAllowFromEntries` → `normalizeE164`) keeps
+**digits only**, so `whatsapp:9665…` is a valid owner. With an owner entry without `+`, the doctor found no owner, skipped
+the `flush_patched` case and reported only the anonymous flush (`write=false`). Reproduced with synthetic state against
+the merged PR #25 code: owner-check `READY`, doctor `verifiedOwners: []`.
+
+Owner forms, evaluated with the **real** `isConfiguredCommandOwner` + real WhatsApp plugin
+(`patches/whatsapp-owner.test.mjs`, owner `+15550001234`):
+
+| `commands.ownerAllowFrom` entry | OpenClaw | doctor (PR #25) | owner-check (PR #25) | both (fixed) |
+|---|---|---|---|---|
+| `whatsapp:+15550001234`, `+15550001234` | owner | owner | owner | owner |
+| `whatsapp:15550001234`, `15550001234` | owner | **none** | owner | owner |
+| `whatsapp:+1 555-000-1234`, `15550001234@s.whatsapp.net`, `whatsapp:whatsapp:+1555…` | owner | none | BLOCKED (unrecognised) | owner |
+| `*`, `telegram:…`, `whatsapp:user:…`, `…@g.us` | not owner | not owner | ignored / BLOCKED | ignored / BLOCKED |
+
+**Second defect: the doctor was not read-only.** `openclaw sessions list` creates/writes `state/openclaw.sqlite`
+(`-wal`/`-shm`), every CLI start writes ~3–4.6k compile-cache files to `TMPDIR` (`/tmp` in production), and the
+in-process replay could append to `/tmp/openclaw/*.log`.
+
+**Fix.** `patches/whatsapp-owner.mjs` mirrors OpenClaw's rule and is the single owner normaliser for both tools. The
+doctor no longer runs the CLI or imports OpenClaw; it reuses owner-check's sandboxed replay and cross-checks the owner
+count. No owner setting, tool permission or production file is changed by this fix.
 
 ## 6. Risks
 
