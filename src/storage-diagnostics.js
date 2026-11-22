@@ -415,7 +415,13 @@ export function startStorageDiagnostics({
     }, delayMs);
     timer?.unref?.();
   }
-  schedule(DEFAULTS.firstDelayMs);
+  // Keep the production 90-second default. A bounded opt-in delay allows slower
+  // integration environments to capture a baseline before their first scan.
+  const requestedDelay = Number(env.DIAG_STORAGE_FIRST_DELAY_MS);
+  const initialDelayMs = Number.isFinite(requestedDelay) && requestedDelay >= DEFAULTS.firstDelayMs
+    ? Math.min(requestedDelay, 900_000)
+    : DEFAULTS.firstDelayMs;
+  schedule(initialDelayMs);
   log.info("storage-diag", `enabled root=${root} every ${hours}h (read-only: readdir/lstat/statfs)`);
   return {
     runOnce,
