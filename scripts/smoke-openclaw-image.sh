@@ -32,7 +32,16 @@ for i in $(seq 1 60); do curl -s http://127.0.0.1:$P/setup/healthz | grep -q '"g
 chk "configured: real gateway reachable" 'curl -s http://127.0.0.1:$P/setup/healthz | grep -q "\"gatewayReachable\":true"'
 chk "anonymous /tools/invoke from the internet = 401" '[ "$(curl -s -o /dev/null -w %{http_code} -X POST -H "X-Real-IP: 203.0.113.9" -H "Host: smoke.example" --data-binary "{\"tool\":\"session_status\"}" http://127.0.0.1:$P/tools/invoke)" = 401 ]'
 chk "anonymous /openclaw = 401 (no token handed out)" '[ "$(curl -s -o /dev/null -w %{http_code} -H "X-Real-IP: 203.0.113.9" http://127.0.0.1:$P/openclaw)" = 401 ]'
-chk "operator /openclaw = 302 with token" 'curl -s -o /dev/null -D - -H "Authorization: Basic $B" http://127.0.0.1:$P/openclaw | grep -qi "^location: /openclaw?token="'
+# Observe only status and boolean header properties. Never print the redirect URL or gateway token.
+REDIRECT_HEADERS="$(mktemp)"
+REDIRECT_STATUS="$(curl -s -o /dev/null -D "$REDIRECT_HEADERS" -w '%{http_code}' -H "Authorization: Basic $B" "http://127.0.0.1:$P/openclaw")"
+REDIRECT_VALID=false
+if grep -qi '^location: /openclaw?token=' "$REDIRECT_HEADERS"; then REDIRECT_VALID=true; fi
+if [ "$REDIRECT_STATUS" != 302 ] || [ "$REDIRECT_VALID" != true ]; then
+  echo "      redirect diagnostic: http_status=$REDIRECT_STATUS location_header_present=$(grep -qi '^location:' "$REDIRECT_HEADERS" && echo yes || echo no) expected_token_redirect=$REDIRECT_VALID"
+fi
+chk "operator /openclaw = 302 with token" '[ "$REDIRECT_STATUS" = 302 ] && [ "$REDIRECT_VALID" = true ]'
+rm -f "$REDIRECT_HEADERS"
 chk "operator /tools/invoke = 200" '[ "$(curl -s -o /dev/null -w %{http_code} -X POST -H "Authorization: Basic $B" -H "X-Real-IP: 203.0.113.9" -H "Host: smoke.example" -H "content-type: application/json" -d "{\"tool\":\"session_status\"}" http://127.0.0.1:$P/tools/invoke)" = 200 ]'
 GW=$(docker exec $N pgrep -f openclaw-gateway | head -1)
 chk "gateway process env has no SETUP_PASSWORD (read as the same uid)" '[ -n "$GW" ] && docker exec -u openclaw $N test -r /proc/$GW/environ && [ "$(docker exec -u openclaw $N bash -c "tr \"\\0\" \"\\n\" < /proc/$GW/environ | grep -c ^SETUP_PASSWORD=")" = 0 ]'
