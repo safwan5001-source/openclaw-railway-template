@@ -46,7 +46,8 @@ RUN npm install -g \
     openclaw@2026.10.9 \
   && node --version | grep -Eq '^v26\.' \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
-RUN npm install -g clawhub@latest
+# Pinned (was @latest): a rebuild must produce the same tool the previous build had. Bump deliberately.
+RUN npm install -g clawhub@0.27.0
 
 WORKDIR /app
 
