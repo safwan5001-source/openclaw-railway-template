@@ -43,13 +43,19 @@ test("the guard recognises a parallel invocation (self-check)", () => {
   assert.ok(/--test-concurrency=1/.test(patchesInvocations("node --test --test-concurrency=1 patches/*.test.mjs")[0]));
 });
 
-test("the container storage test gives the first scan a deterministic margin over a slow start", () => {
-  // 4cbf464: the gateway became reachable ~112 s after wrapper start on a CI runner, after the default 90 s first scan,
-  // so the 'baseline hash before the first scan' check failed. The test must delay the first scan beyond the wait_gw bound.
-  const s = read("scripts/test-storage-diag-container.sh");
-  const m = s.match(/DIAG_STORAGE_FIRST_DELAY_SEC=(\d+)/);
-  assert.ok(m, "phase 2 must set DIAG_STORAGE_FIRST_DELAY_SEC");
-  const waitGwSeconds = Number(s.match(/seq 1 (\d+)\); do curl -s [^\n]*sleep (\d+)/)?.slice(1).reduce((a, b) => a * Number(b), 1));
-  assert.ok(Number(m[1]) > 90, "must be longer than the 90 s production default");
-  assert.ok(waitGwSeconds > 0 && Number(m[1]) >= waitGwSeconds + 30, `first-scan delay ${m[1]} s must exceed the wait_gw bound ${waitGwSeconds} s by >= 30 s`);
+test("server.js starts the storage heartbeat only AFTER the boot-time doctor/gateway initialisation (#38)", () => {
+  // Race seen on 4cbf464: the heartbeat's 90 s first-scan timer started at listen(), the boot-time `openclaw doctor --fix`
+  // + gateway start took ~112 s on a CI runner, so the first scan ran while OpenClaw was still migrating state and the
+  // container test's baseline hash was taken after the scan. #38 moved the start behind the initialisation; keep it there.
+  const s = read("src/server.js");
+  const calls = [...s.matchAll(/startStorageDiagnostics\(/g)].map((m) => m.index);
+  assert.equal(calls.length, 2, "exactly two guarded call sites (after init, and when not configured)");
+  const listen = s.indexOf("const server = app.listen(");
+  const ensure = s.indexOf("await ensureGatewayRunning();", listen);
+  const fin = s.indexOf(".finally(", ensure);
+  assert.ok(listen > 0 && ensure > listen && fin > ensure, "boot sequence found");
+  const callSites = calls.filter((i) => i > listen);
+  assert.equal(callSites.length, 2);
+  assert.ok(callSites[0] > fin, "first call site is inside the .finally() that follows ensureGatewayRunning()");
+  assert.ok(/}\s*else\s*{\s*startStorageDiagnostics/.test(s.slice(callSites[0])), "second call site is the not-configured branch");
 });

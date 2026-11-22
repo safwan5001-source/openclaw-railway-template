@@ -404,17 +404,6 @@ export async function getFsInfo(root, statfs = fsp.statfs) {
   }
 }
 
-// DIAG_STORAGE_FIRST_DELAY_SEC: delay of the first scan after boot (default 90 s). Integer seconds, clamped to
-// 5..3600; anything else falls back to the default. Exists so a slow start (boot-time `openclaw doctor --fix` plus
-// gateway start took ~112 s on a CI runner) can be given a deterministic margin in container tests.
-export function parseFirstDelayMs(raw) {
-  const s = typeof raw === "string" ? raw.trim() : "";
-  if (!/^\d{1,5}$/.test(s)) return DEFAULTS.firstDelayMs;
-  const sec = Number(s);
-  if (sec < 5) return DEFAULTS.firstDelayMs;
-  return Math.min(sec, 3600) * 1000;
-}
-
 export function startStorageDiagnostics({
   log,
   env = process.env,
@@ -426,7 +415,6 @@ export function startStorageDiagnostics({
   if (env.DIAG_STORAGE !== "1") return null;
   const root = (env.DIAG_STORAGE_ROOT || "/data").trim();
   const hours = Math.min(168, Math.max(1, Number(env.DIAG_STORAGE_INTERVAL_HOURS) || DEFAULTS.intervalHours));
-  const firstDelayMs = parseFirstDelayMs(env.DIAG_STORAGE_FIRST_DELAY_SEC);
   let alert = { level: "ok", lastEmit: 0 };
   let running = false;
   let stopped = false;
@@ -470,12 +458,11 @@ export function startStorageDiagnostics({
     }, delayMs);
     timer?.unref?.();
   }
-  schedule(firstDelayMs);
+  schedule(DEFAULTS.firstDelayMs);
   // The configured root is printed only as a sanitised label: it may point inside a protected tree.
   log.info(
     "storage-diag",
-    `enabled root=${rootLabel(root)} every ${hours}h (read-only: readdir/lstat/statfs)` +
-      (firstDelayMs === DEFAULTS.firstDelayMs ? "" : ` first scan after ${firstDelayMs / 1000}s`),
+    `enabled root=${rootLabel(root)} every ${hours}h (read-only: readdir/lstat/statfs)`,
   );
   return {
     runOnce,

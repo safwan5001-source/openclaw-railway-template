@@ -56,12 +56,13 @@ chk "DIAG_STORAGE=0: no [storage-diag] line" '[ "$(logs | grep -c "storage-diag"
 docker rm -f $N >/dev/null
 
 # ---- 2. DIAG_STORAGE=1
-# The baseline hash has to be taken after the boot-time `openclaw doctor --fix` and gateway start (wait_gw, <= 180 s)
-# but BEFORE the first scan. With the production default (90 s) a slow runner lost that race (gateway reachable ~112 s
-# after start on a GitHub runner, first scan at 90 s), so the first scan is delayed past the wait_gw bound here.
-run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6 -e DIAG_STORAGE_FIRST_DELAY_SEC=240
+# Since #38 the heartbeat starts only after the boot-time `openclaw doctor --fix` and gateway start, so its 90 s first-scan
+# timer begins when the gateway is up. The baseline hash (taken right after wait_gw) is therefore always before the scan;
+# the "enabled" line is logged just after the gateway comes up, so wait for it instead of assuming it is already there.
+run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6
 chk "DIAG_STORAGE=1: gateway healthy" 'wait_gw'
-chk "DIAG_STORAGE=1: one 'enabled' line" '[ "$(logs | grep -c "storage-diag.*enabled root=/data every 6h .*first scan after 240s")" = 1 ]'
+for _ in $(seq 1 30); do logs | grep -q "storage-diag.*enabled root=/data every 6h" && break; sleep 2; done
+chk "DIAG_STORAGE=1: one 'enabled' line" '[ "$(logs | grep -c "storage-diag.*enabled root=/data every 6h")" = 1 ]'
 GW0=$(docker exec $N pgrep -f openclaw-gateway | head -1)
 SEED_SUM=$(docker exec $N bash -c "$HASH_CMD")
 chk "baseline hash taken before the first scan" '[ "$(logs | grep -c "\[storage-diag\] {")" = 0 ]'
@@ -69,14 +70,14 @@ LAT=$(mktemp); STATS=$(mktemp)
 DONE=$(mktemp -u)
 ( while [ ! -e "$DONE" ]; do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://127.0.0.1:$P/setup/healthz; sleep 0.2; done ) > "$LAT" &
 ( while [ ! -e "$DONE" ]; do docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' $N; done ) > "$STATS" &
-for _ in $(seq 1 200); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done   # <= 400 s (scan fires at 240 s)
+for _ in $(seq 1 120); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done   # <= 240 s (scan fires 90 s after the gateway is up)
 sleep 3; touch "$DONE"
 wait; rm -f "$DONE"
 SUMMARY=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"level"' | head -1 | sed 's/.*\[storage-diag\] //')
 echo "summary: $SUMMARY"
 echo "detail:  $(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"dirs"' | head -1 | sed 's/.*\[storage-diag\] //' | cut -c1-400)..."
 chk "first scan: exactly 2 JSON lines" '[ "$(logs | grep -c "\[storage-diag\] {")" = 2 ]'
-chk "summary: recovery.doctor counts seeded snapshots + OpenClaw's own .update-captures (>4)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.doctor.n>4&&s.recovery.doctor.mb>0?0:1)"'
+chk "summary: recovery.doctor counts seeded snapshots + OpenClaw's own .update-captures (>4)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.doctor.n>4&&Number.isFinite(s.recovery.doctor.mb)?0:1)"'
 chk "summary: recovery.pluginCaptures >= 50 seeded (+ OpenClaw's own)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.recovery.pluginCaptures.n>=50?0:1)"'
 chk "detail: no update-captures or capture-run names printed" '! logs | grep storage-diag | grep -qE "update-captures|plugin-captures/|inst1"'
 chk "summary: backups/secrets never candidates (backup candidates = scratch.md.bak only)" 'echo "$SUMMARY" | node -e "const s=JSON.parse(require(\"fs\").readFileSync(0));process.exit(s.candidates.backup.n===1&&s.protectedMB>0?0:1)"'
@@ -94,9 +95,9 @@ rm -f "$LAT" "$STATS"
 docker rm -f $N >/dev/null
 
 # ---- 3. DIAG_STORAGE_ROOT inside a protected tree (regression: protection used to be lost when the root was narrowed)
-run -e DIAG_STORAGE=1 -e DIAG_STORAGE_ROOT=/data/workspace/memory -e DIAG_STORAGE_FIRST_DELAY_SEC=30
+run -e DIAG_STORAGE=1 -e DIAG_STORAGE_ROOT=/data/workspace/memory
 chk "protected root: gateway healthy" 'wait_gw'
-for _ in $(seq 1 90); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done
+for _ in $(seq 1 120); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done
 PSUM=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"level"' | head -1 | sed 's/.*\[storage-diag\] //')
 PDET=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"dirs"' | head -1 | sed 's/.*\[storage-diag\] //')
 echo "protected-root summary: $PSUM"

@@ -12,7 +12,6 @@ import {
   isProtectedName,
   isSafeName,
   nextAlertState,
-  parseFirstDelayMs,
   rootContext,
   rootLabel,
   scanTree,
@@ -455,36 +454,15 @@ test("scan: only readdir/lstat/realpath are used (realpath is called once, on th
   fs.rmSync(vol, { recursive: true, force: true });
 });
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Regression: first-scan delay (container test race; the gateway needed ~112 s on a CI runner, the scan fired at 90 s).
-// ---------------------------------------------------------------------------------------------------------------------
-test("parseFirstDelayMs: default 90 s; integer seconds clamped to 5..3600; anything else falls back", () => {
-  assert.equal(parseFirstDelayMs(undefined), 90_000);
-  assert.equal(parseFirstDelayMs(""), 90_000);
-  assert.equal(parseFirstDelayMs("240"), 240_000);
-  assert.equal(parseFirstDelayMs(" 30 "), 30_000);
-  assert.equal(parseFirstDelayMs("5"), 5_000);
-  assert.equal(parseFirstDelayMs("99999"), 3_600_000);
-  for (const bad of ["abc", "-5", "0", "4", "1.5", "1e3", "600000", "0x10", null, 240]) assert.equal(parseFirstDelayMs(bad), 90_000, JSON.stringify(bad));
-});
-
-test("start: the first scan fires at the default 90 s, or at DIAG_STORAGE_FIRST_DELAY_SEC, and the enabled line says so", () => {
-  const run = (extra) => {
-    const delays = [];
-    const lines = [];
-    const h = startStorageDiagnostics({
-      log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
-      env: { DIAG_STORAGE: "1", ...extra },
-      setTimeoutFn: (fn, ms) => (delays.push(ms), { unref() {} }),
-    });
-    h.stop();
-    return { delays, line: lines.find((m) => m.startsWith("enabled")) };
-  };
-  const d = run({});
-  assert.deepEqual(d.delays, [90_000]);
-  assert.match(d.line, /^enabled root=\/data every 6h \(read-only: readdir\/lstat\/statfs\)$/, "unchanged production line");
-  const c = run({ DIAG_STORAGE_FIRST_DELAY_SEC: "240" });
-  assert.deepEqual(c.delays, [240_000]);
-  assert.match(c.line, /^enabled root=\/data every 6h .* first scan after 240s$/);
-  assert.deepEqual(run({ DIAG_STORAGE_FIRST_DELAY_SEC: "nope" }).delays, [90_000]);
+test("start: first scan at the 90 s default and the enabled line keeps its production format", () => {
+  const delays = [];
+  const lines = [];
+  const h = startStorageDiagnostics({
+    log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
+    env: { DIAG_STORAGE: "1", DIAG_STORAGE_FIRST_DELAY_SEC: "5" }, // the former test-only knob must have no effect
+    setTimeoutFn: (fn, ms) => (delays.push(ms), { unref() {} }),
+  });
+  h.stop();
+  assert.deepEqual(delays, [90_000]);
+  assert.deepEqual(lines, ["enabled root=/data every 6h (read-only: readdir/lstat/statfs)"]);
 });

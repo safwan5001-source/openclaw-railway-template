@@ -5,7 +5,7 @@ exposing contents. Implemented in `src/storage-diagnostics.js`; **off unless `DI
 
 ## What it logs
 
-Two JSON lines tagged `[storage-diag]` at boot+90 s (`DIAG_STORAGE_FIRST_DELAY_SEC`, integer 5..3600, default 90) and then every `DIAG_STORAGE_INTERVAL_HOURS` (default 6):
+Two JSON lines tagged `[storage-diag]` 90 s after the boot-time `openclaw doctor --fix` / gateway start has finished (the timer is started after that initialisation, not at `listen()`) and then every `DIAG_STORAGE_INTERVAL_HOURS` (default 6):
 
 1. **summary** — `fs` (statfs total/used/free/usedPct), `scan` stats (incl. `cpuMs`, `lagMaxMs`, `rssMB` of the scan
    itself), `protectedMB`, measured cleanup `candidates` (`tmp`, `backup`, `log`, `cache`, `exportsOld`), `recovery`
