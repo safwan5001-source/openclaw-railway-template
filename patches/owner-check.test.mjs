@@ -35,15 +35,15 @@ const BASE_CONFIG = {
 /** Synthetic state: openclaw.json + a fake session store that only needs to contain the session-key bytes. */
 function makeState({ config = BASE_CONFIG, configText, sessionNumbers = [OWNER], wal = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "oc-test-state-"));
-  const state = path.join(root, "state"), ws = path.join(root, "ws"), home = path.join(root, "home");
+  const state = path.join(root, "state"), ws = path.join(root, "ws"), home = path.join(root, "home"), tmp = path.join(root, "tmp");
   fs.mkdirSync(path.join(state, "agents", "main", "agent"), { recursive: true });
-  fs.mkdirSync(ws); fs.mkdirSync(home);
+  fs.mkdirSync(ws); fs.mkdirSync(home); fs.mkdirSync(tmp);
   fs.writeFileSync(path.join(state, "openclaw.json"), configText ?? JSON.stringify(config, null, 2));
   const blob = Buffer.concat([crypto.randomBytes(4096), ...sessionNumbers.map((n) => Buffer.from(`\u0000agent:main:whatsapp:direct:${n}\u0000`)), crypto.randomBytes(4096)]);
   fs.writeFileSync(path.join(state, "agents", "main", "agent", wal ? "openclaw-agent.sqlite-wal" : "openclaw-agent.sqlite"), blob);
   fs.writeFileSync(path.join(ws, "MEMORY.md"), "# synthetic\n");
   if (isRoot) spawnSync("chown", ["-R", `${RUN_AS}:`, root]);
-  return { root, state, ws, home };
+  return { root, state, ws, home, tmp };
 }
 
 function snapshot(dirs) {
@@ -56,18 +56,20 @@ function snapshot(dirs) {
     }
   };
   for (const d of dirs) walk(d);
-  rows.push(...fs.readdirSync(os.tmpdir()).filter((n) => /^(basht-owner-check-|openclaw)/.test(n)).map((n) => `TMP ${n}`));
   return rows.sort().join("\n");
 }
 
 function runCheck(st, { env = {}, pkg = PKG } = {}) {
-  const childEnv = { PATH: process.env.PATH, HOME: st.home, OPENCLAW_STATE_DIR: st.state, OPENCLAW_WORKSPACE_DIR: st.ws, OPENCLAW_PACKAGE_ROOT: pkg,
+  // A private TMPDIR (instead of the shared /tmp, where concurrent processes create entries) makes the sandbox-cleanup
+  // assertion deterministic: it must be empty again after the run.
+  const childEnv = { PATH: process.env.PATH, HOME: st.home, TMPDIR: st.tmp, OPENCLAW_STATE_DIR: st.state, OPENCLAW_WORKSPACE_DIR: st.ws, OPENCLAW_PACKAGE_ROOT: pkg,
     GH_TOKEN: SECRETS[2], AWJ_API_KEY: SECRETS[2], ...env };
-  const before = snapshot([st.state, st.ws, st.home]);
+  const before = snapshot([st.state, st.ws, st.home, st.tmp]);
   const cmd = isRoot ? ["runuser", ["-u", RUN_AS, "--", "env", ...Object.entries(childEnv).map(([k, v]) => `${k}=${v}`), process.execPath, CHECK]] : [process.execPath, [CHECK]];
   const r = spawnSync(cmd[0], cmd[1], { env: isRoot ? process.env : childEnv, encoding: "utf8", timeout: 180_000 });
-  const after = snapshot([st.state, st.ws, st.home]);
-  assert.equal(after, before, "the checker must not create, modify or delete any file (state, workspace, HOME, /tmp)");
+  const after = snapshot([st.state, st.ws, st.home, st.tmp]);
+  assert.equal(after, before, "the checker must not create, modify or delete any file (state, workspace, HOME, TMPDIR)");
+  assert.deepEqual(fs.readdirSync(st.tmp), [], "the checker's sandbox under TMPDIR is removed");
   assert.equal(r.stderr, "", "stderr must be empty");
   const lines = r.stdout.split("\n").filter(Boolean);
   assert.equal(lines.length, 1, `exactly one output line, got: ${lines.length}`);
