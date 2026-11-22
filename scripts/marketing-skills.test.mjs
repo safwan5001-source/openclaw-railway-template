@@ -28,8 +28,8 @@ for (const name of names) {
     assert.ok(fs.statSync(playbook).isFile(), 'playbook required');
     const reference = fs.readFileSync(playbook, 'utf8');
     assert.ok(reference.length > 450, 'domain-specific detail required');
-    assert.ok(content.includes('references/PLAYBOOK.md'), 'SKILL must link its playbook');
     const content = fs.readFileSync(file, 'utf8');
+    assert.ok(content.includes('references/PLAYBOOK.md'), 'SKILL must link its playbook');
     assert.ok(content.startsWith('---\n'));
     const front = content.match(/^---\n([\s\S]*?)\n---\n/);
     assert.ok(front, 'frontmatter required');
@@ -52,8 +52,8 @@ test('production installer is intentionally NOT enabled for these skills', () =>
 test('domain-specific verification guidance exists', () => {
   const read = (name) => fs.readFileSync(path.join(root, name, 'references', 'PLAYBOOK.md'), 'utf8');
   assert.match(read('basht-performance-analytics'), /CTR=clicks\/impressions/);
-  assert.match(read('basht-performance-analytics'), /zero denominator|zero denominator|zero denominator|N\/A/);
-  assert.match(read('basht-ads-campaigns'), /No connectors|No connectors|no creation|No connectors/);
+  assert.match(read('basht-performance-analytics'), /zero denominator|N\/A/);
+  assert.match(read('basht-ads-campaigns'), /No connectors|no creation/);
   assert.match(read('basht-marketing-automation'), /Idempotency/);
   assert.match(read('basht-market-intelligence'), /SAR 12\/kg/);
   assert.match(read('basht-conversion-optimization'), /percentage-point/);
