@@ -42,6 +42,7 @@ fi
 step "syntax: src/server.js" node -c src/server.js
 step "unit + integration: wrapper (src) and basht-daftra skill" node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
 step "packaging + security invariants" node --test scripts/check-dockerfiles.mjs scripts/test-entrypoint.mjs scripts/check-security-invariants.mjs
+step "marketing installer: synthetic safety and idempotence" node --test scripts/test-marketing-installer.mjs
 
 check_skills() {
   local f n
