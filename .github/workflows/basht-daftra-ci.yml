@@ -148,6 +148,6 @@ jobs:
         env:
           OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
           OPENCLAW_STATE_DIR: ${{ runner.temp }}/flush/state
-        run: node --test patches/*.test.mjs
+        run: node --test --test-concurrency=1 patches/*.test.mjs
       - name: End-to-end (upstream reproduces the bug; patched owner saves and recalls; non-owners stay read-only)
         run: bash patches/e2e/memory-flush-e2e.sh "$RUNNER_TEMP/flush"
