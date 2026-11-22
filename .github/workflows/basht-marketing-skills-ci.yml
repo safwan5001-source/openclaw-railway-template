@@ -1,0 +1,45 @@
+name: BASHT Marketing Skills validation
+
+on:
+  push:
+    branches:
+      - feature/basht-marketing-skills-v1
+  pull_request:
+    paths:
+      - 'skills/basht-*/**'
+      - 'scripts/marketing-skills.test.mjs'
+      - 'scripts/marketing-openclaw-compat.sh'
+      - '.github/workflows/basht-marketing-skills-ci.yml'
+      - 'package.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  marketing-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Verify marketing skill structure, security and playbooks
+        run: node --test scripts/marketing-skills.test.mjs
+  openclaw-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Install exact production OpenClaw version (isolated runner)
+        run: npm install --global --allow-scripts=openclaw openclaw@2026.10.9
+      - name: Verify ten skills discovered without Gateway or production credentials
+        run: bash scripts/marketing-openclaw-compat.sh
