@@ -69,3 +69,5 @@ jobs:
         run: bash scripts/restore-drill.sh basht-openclaw-ci
       - name: Large export -> restore drill (streaming, ~900 MB synthetic)
         run: bash scripts/export-drill.sh basht-openclaw-ci 900
+      - name: Storage diagnostics on the real image (DIAG_STORAGE=0 and =1, synthetic data)
+        run: bash scripts/test-storage-diag-container.sh basht-openclaw-ci 40000
