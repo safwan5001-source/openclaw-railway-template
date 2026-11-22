@@ -20,7 +20,7 @@ import {
   readOriginalFromPatched,
   sha256,
 } from "./openclaw-memory-flush-owner.mjs";
-import { classifyWhatsAppId, maskId, normalizeOwnerCandidates, verdict } from "./memory-flush-doctor.mjs";
+import { classifyWhatsAppId, combinedVerdict, maskId, normalizeOwnerCandidates, verdict } from "./memory-flush-doctor.mjs";
 
 // Minimal stand-in that contains every anchor exactly once, in upstream order.
 const FIXTURE = [
@@ -173,6 +173,16 @@ test("doctor helpers: PN/LID classification and masking", () => {
   assert.equal(maskId("agent:main:whatsapp:direct:+966500001234"), "agent:main:whatsapp:direct:+••••••••1234");
 });
 
+test("doctor REGRESSION: owner entries without '+' (production form) are verified, as OpenClaw does", () => {
+  // Before the fix normalizeOwnerCandidates required /^\+\d{7,15}$/ after stripping "whatsapp:", so the production
+  // entry "whatsapp:<digits>" gave verifiedOwners=[] while owner-check (and OpenClaw) accepted it => READY vs UNVERIFIED.
+  for (const entry of ["whatsapp:15550001234", "15550001234", "whatsapp:+1 555-000-1234", "15550001234@s.whatsapp.net", "whatsapp:+15550001234"]) {
+    assert.deepEqual(normalizeOwnerCandidates({ ownerAllowFrom: [entry] }, {}).configuredOwners, ["+15550001234"], entry);
+  }
+  const mixed = normalizeOwnerCandidates({ ownerAllowFrom: ["whatsapp:15550001234"] }, { allowFrom: ["15550001234", "+14440000000"] });
+  assert.deepEqual(mixed.channelOnly, ["+14440000000"], "channel entries are compared in the same normalised form");
+});
+
 test("doctor: simulation applies the patch's owner gate (channel allowFrom is not ownership)", () => {
   const onlyChannel = normalizeOwnerCandidates({}, { allowFrom: ["+15550001234"] });
   assert.deepEqual(onlyChannel.configuredOwners, [], "channels.whatsapp.allowFrom alone never proves ownership");
@@ -181,6 +191,10 @@ test("doctor: simulation applies the patch's owner gate (channel allowFrom is no
   assert.deepEqual(both.configuredOwners, ["+15550001234", "+15550009999"], "wildcard and other-channel entries ignored");
   assert.deepEqual(both.channelOnly, ["+14440000000"]);
   const sim = { owner_turn: { write: true }, flush_upstream: { write: false }, flush_patched: { write: true }, flush_impostor: { write: false } };
+  assert.match(combinedVerdict({ ownerCheck: { VERDICT: "READY: x", q1_explicit_whatsapp_owner_entries: 1 }, owners: { configuredOwners: [] }, sim }), /^INCONSISTENT/,
+    "a differing owner count between the two tools is reported, never silently resolved");
+  assert.match(combinedVerdict({ ownerCheck: { VERDICT: "BLOCKED: y", q1_explicit_whatsapp_owner_entries: 1 }, owners: { configuredOwners: ["+15550001234"] }, sim }), /^BLOCKED: y/,
+    "owner-check's BLOCKED is never upgraded by the doctor");
   assert.match(verdict(sim, false), /OWNER UNVERIFIED/, "no configured owner => never a 'patch restores' verdict");
   assert.match(verdict(sim, true), /identity propagation is the cause/);
   assert.match(verdict({ ...sim, flush_impostor: { write: true } }, true), /UNSAFE/);
