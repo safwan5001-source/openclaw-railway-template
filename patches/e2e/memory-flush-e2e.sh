@@ -35,7 +35,8 @@ DATE=$(date -u +%F)
 # One state template per install: config + the REAL @openclaw/whatsapp plugin, so OpenClaw resolves the
 # "whatsapp:+E164" owner entries exactly as the production gateway does (no WhatsApp account is linked).
 make_template() { # pkgdir -> $WORK/tmpl-<name>/state
-  local pkg=$1 tmpl="$WORK/tmpl-$(basename "$1")"
+  local pkg=$1 tmpl
+  tmpl="$WORK/tmpl-$(basename "$1")"
   [ -f "$tmpl/.ready" ] && return 0
   rm -rf "$tmpl"; mkdir -p "$tmpl/state"
   cat > "$tmpl/state/openclaw.json" <<JSON
