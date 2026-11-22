@@ -104,4 +104,30 @@ check C-patched-spoofed-flag no
 check D-patched-non-owner no
 check E-patched-cli-no-sender no
 check F-patched-owner-revoked no
+
+# G: patches/owner-check.mjs against case B's REAL OpenClaw session store (SQLite + WAL written by real turns).
+# Must say READY, print one line without digits, and leave every file byte-identical. Runs unprivileged (it refuses root).
+owner_check_g() {
+  local src="$WORK/runs/B-patched-owner" dst snap_before snap_after line runas=()
+  dst=$(mktemp -d); cp -a "$src/state" "$dst/state"; mkdir -p "$dst/ws" "$dst/home"
+  if [ "$(id -u)" = 0 ]; then
+    if ! runuser -u nobody -- "$(command -v node)" -e 0 2>/dev/null; then echo "G-owner-check-real-sqlite     SKIP (root and cannot drop to nobody)"; rm -rf "$dst"; return 0; fi
+    chown -R nobody: "$dst"; chmod a+rx "$dst"; runas=(runuser -u nobody --)
+  fi
+  snap() { find "$dst" -type f -printf '%p %s %T@\n' | sort; find "$dst" -type f -exec sha256sum {} + | sort; }
+  snap_before=$(snap)
+  line=$("${runas[@]}" env -i PATH="$PATH" HOME="$dst/home" OPENCLAW_STATE_DIR="$dst/state" OPENCLAW_WORKSPACE_DIR="$dst/ws" \
+    OPENCLAW_PACKAGE_ROOT="$WORK/patched/node_modules/openclaw" node "$REPO/patches/owner-check.mjs" 2>&1)
+  snap_after=$(snap)
+  local ok=1
+  [ "$(printf '%s\n' "$line" | wc -l)" = 1 ] || ok=0
+  [[ "$line" == "BASHT_OWNER_CHECK "*'"VERDICT":"READY'* ]] || ok=0
+  ! printf '%s' "$line" | grep -qE '[0-9]{7,}' || ok=0
+  [ "$snap_before" = "$snap_after" ] || ok=0
+  printf '%-28s verdict=%s filesUnchanged=%s => %s\n' "G-owner-check-real-sqlite" "$(printf '%s' "$line" | grep -o '"VERDICT":"[A-Z]*' | cut -d'"' -f4)" \
+    "$([ "$snap_before" = "$snap_after" ] && echo yes || echo NO)" "$([ $ok = 1 ] && echo PASS || echo FAIL)"
+  rm -rf "$dst"
+  [ $ok = 1 ] || FAIL=1
+}
+owner_check_g
 exit $FAIL

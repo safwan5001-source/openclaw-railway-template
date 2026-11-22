@@ -18,7 +18,8 @@
     "verify:skill-eligibility": "bash scripts/verify-skill-eligibility.sh",
     "test:memory-flush": "node --test patches/*.test.mjs",
     "e2e:memory-flush": "bash patches/e2e/memory-flush-e2e.sh",
-    "doctor:memory-flush": "node patches/memory-flush-doctor.mjs"
+    "doctor:memory-flush": "node patches/memory-flush-doctor.mjs",
+    "check:owner": "node patches/owner-check.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",

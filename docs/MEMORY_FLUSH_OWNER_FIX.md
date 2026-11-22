@@ -149,6 +149,28 @@ flush, impostor flush — plus PN/LID forms and the latest memory files. Numbers
   on config (e.g. move the `write` restriction into `toolsBySender."*"` and keep it open for the owner entry). Not done
   here because permission changes require explicit approval.
 
+### 5.1 Owner readiness check (`patches/owner-check.mjs`, strictly read-only)
+
+`memory-flush-doctor.mjs` uses OpenClaw's CLI (`config get`, `sessions list`). Testing showed that even those read
+commands **write to `state/openclaw.sqlite`** (WAL/maintenance) and create caches under `~/.cache` and `/tmp`. For a
+check that must not touch a live production volume, `owner-check.mjs` avoids the CLI entirely:
+
+* reads `openclaw.json` (JSON or JSON5) and the agent session stores' bytes with `O_RDONLY` file handles — no SQLite
+  connection, so no WAL/SHM/lock interaction with the running gateway;
+* replays OpenClaw's tool-policy assembly in a child process whose `HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
+  `OPENCLAW_STATE_DIR` and workspace all live in one temp directory (deleted before exit), with a minimal environment
+  (no inherited secrets); the child's stdout/stderr go to `/dev/null` and its result returns on a private pipe;
+* prints exactly one line `BASHT_OWNER_CHECK {json}`: booleans, counts, policy-step names and a verdict
+  (`READY` / `BLOCKED: <reason>` / `REFUSED`); 7+ digit runs are masked; errors are reduced to their type;
+* refuses root and any OpenClaw version other than 2026.10.9.
+
+```bash
+gosu openclaw node /app/patches/owner-check.mjs     # after deploy (or copy the file to /tmp first)
+```
+
+Verified by `patches/owner-check.test.mjs` (synthetic state, run unprivileged, full before/after file snapshot,
+secret and digit leak checks) and E2E case G (real OpenClaw SQLite session store).
+
 ## 6. Risks
 
 | Risk | Mitigation |
