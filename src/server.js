@@ -1920,9 +1920,8 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `configured: ${isConfigured()}`);
   void probeDeviceBootstrapSdk();
-  // Opt-in (DIAG_STORAGE=1), read-only volume size heartbeat; returns null and does nothing otherwise.
-  startStorageDiagnostics({ log, env: process.env });
-
+  // Start the opt-in read-only storage heartbeat only after boot-time doctor/gateway initialization.
+  // This prevents its first scan racing OpenClaw's legitimate state migrations.
   if (isConfigured()) {
     (async () => {
       try {
@@ -1936,7 +1935,11 @@ const server = app.listen(PORT, () => {
       await ensureGatewayRunning();
     })().catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
+    }).finally(() => {
+      startStorageDiagnostics({ log, env: process.env });
     });
+  } else {
+    startStorageDiagnostics({ log, env: process.env });
   }
 });
 
