@@ -9,7 +9,7 @@
     "dev": "node src/server.js",
     "start": "node src/server.js",
     "lint": "node -c src/server.js",
-    "test": "node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs patches/*.test.mjs scripts/marketing-skills.test.mjs",
+    "test": "node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs patches/*.test.mjs scripts/marketing-skills.test.mjs skills/basht-transport-sales/scripts/*.test.mjs",
     "test:daftra": "node --test skills/basht-daftra/scripts/*.test.mjs",
     "test:packaging": "node --test scripts/check-dockerfiles.mjs scripts/test-entrypoint.mjs",
     "build:broker-image": "docker build -f Dockerfile.broker -t basht-broker-local .",
@@ -19,7 +19,8 @@
     "test:memory-flush": "node --test patches/*.test.mjs",
     "e2e:memory-flush": "bash patches/e2e/memory-flush-e2e.sh",
     "doctor:memory-flush": "node patches/memory-flush-doctor.mjs",
-    "check:owner": "node patches/owner-check.mjs"
+    "check:owner": "node patches/owner-check.mjs",
+    "test:transport": "node --test skills/basht-transport-sales/scripts/*.test.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",
