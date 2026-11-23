@@ -34,3 +34,44 @@ test('invalid quote rejected',()=>{
 test('invalid leads rejected',()=>{
  const r=run('leads',{leads:'not array'});assert.notEqual(r.code,0);
 });
+
+test('unsubstantiated verified request is downgraded, retaining claim for audit',()=>{
+ const r=run('leads',{leads:[{
+  name:'شركة اختبار',status:'verified_open_request',
+  source_url:'https://example.org/request',checked_at:'2026-11-23'
+ }]});
+ assert.equal(r.code,0);
+ assert.equal(r.out.leads[0].status,'unverified_request');
+ assert.equal(r.out.leads[0].claimed_status,'verified_open_request');
+ assert.ok(r.out.leads[0].issues.includes('classification_downgraded_missing_evidence'));
+});
+test('qualified claim with missing confirmed demand is downgraded',()=>{
+ const r=run('leads',{leads:[{
+  name:'شركة اختبار',status:'qualified',source_url:'https://example.org/request',
+  checked_at:'2026-11-23',loading_location:'الدمام',unloading_location:'الجبيل',
+  material:'بحص',vehicle_type:'قلاب'
+ }]});
+ assert.equal(r.code,0);
+ assert.equal(r.out.leads[0].status,'unverified_request');
+});
+test('qualified missing vehicle fit cannot retain qualified classification',()=>{
+ const r=run('leads',{leads:[{
+  name:'شركة اختبار',status:'qualified',source_url:'https://example.org/request',
+  checked_at:'2026-11-23',request_confirmed_at:'2026-11-23',
+  confirmation_evidence:'document reviewed manually',loading_location:'الدمام',
+  unloading_location:'الجبيل',material:'بحص'
+ }]});
+ assert.equal(r.code,0);
+ assert.equal(r.out.leads[0].status,'verified_open_request');
+ assert.ok(r.out.leads[0].issues.includes('missing_vehicle_type'));
+});
+test('complete confirmed evidence is not automatically invalidated',()=>{
+ const r=run('leads',{leads:[{
+  name:'شركة اختبار',status:'verified_open_request',source_url:'https://example.org/request',
+  checked_at:'2026-11-23',request_confirmed_at:'2026-11-23',
+  confirmation_evidence:'manually verified original dated request'
+ }]});
+ assert.equal(r.code,0);
+ assert.equal(r.out.leads[0].status,'verified_open_request');
+ assert.ok(r.out.leads[0].issues.includes('manual_confirmation_required_not_automatically_verified'));
+});
