@@ -58,6 +58,9 @@ RUN npm install -g pnpm@11.24.0 \
 COPY src ./src
 # Self-contained BASHT Daftra skill; entrypoint.sh syncs it into the persistent workspace at boot (skill-sync.sh).
 COPY skills ./skills
+# Canonical transport plan stays in docs/; include exactly that file in the image skill reference tree.
+# The existing verified skill-sync copies this reference with the skill into the persistent workspace.
+COPY docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md ./skills/basht-transport-sales/references/MASTER-PLAN.md
 # BASHT memory-flush owner-identity patch for the pinned OpenClaw (docs/MEMORY_FLUSH_OWNER_FIX.md). Exact-match and
 # hash-checked: the build fails if the installed OpenClaw differs from the version the patch was validated against.
 # patches/memory-flush-doctor.mjs and patches/owner-check.mjs are read-only diagnostics for the Railway console.
