@@ -104,6 +104,12 @@ function label(parts) {
       out.push("<doctor-snapshot>");
       break;
     }
+    // plugin-captures/<instance>/...: instance/run names are OpenClaw-internal and never printed (a root narrowed to
+    // <state>/tmp would otherwise print them at depth 2)
+    if (PLUGIN_CAPTURES_DIR.test(p)) {
+      out.push("<plugin-captures>");
+      break;
+    }
     out.push(isSafeName(p) ? p : "<other>");
   }
   return "/" + out.join("/");
@@ -116,10 +122,43 @@ function emptyClass() {
   return { n: 0, bytes: 0 };
 }
 
+// The scan root can be any directory (DIAG_STORAGE_ROOT), including one INSIDE a protected tree such as
+// <workspace>/memory or <state>/agents/main/sessions. Protection is a property of the path, not only of what the walk
+// discovers below the root, so it is derived from every component of the resolved root path and of its real path
+// (the root may be a symlink). Only protective contexts are inherited: cache/exports classification is deliberately NOT
+// inherited, so a narrowed root can only ever reduce what is reported as a candidate, never enlarge it.
+export async function rootContext(root, ops = {}) {
+  const paths = [path.resolve(root)];
+  if (typeof ops.realpath === "function") {
+    try {
+      const real = await ops.realpath(root);
+      if (real) paths.push(real);
+    } catch {
+      /* unresolvable root: the scan itself reports the errno code */
+    }
+  }
+  const ctx = { prot: false, doc: false, pcap: false };
+  for (const p of paths) {
+    for (const part of p.split(path.sep)) {
+      if (!part) continue;
+      if (isProtectedName(part)) ctx.prot = true;
+      if (isDoctorSnapshotName(part)) ctx.doc = true;
+      if (PLUGIN_CAPTURES_DIR.test(part)) ctx.pcap = true;
+    }
+  }
+  return ctx;
+}
+
+// Root as it may appear in logs: protected / identifying components are replaced, never printed.
+export function rootLabel(root) {
+  const parts = path.resolve(root).split(path.sep).filter(Boolean);
+  return parts.length ? label(parts) : "/";
+}
+
 export async function scanTree(root, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const now = o.now ?? Date.now();
-  const ops = o.fs ?? { readdir: fsp.readdir, lstat: fsp.lstat };
+  const ops = o.fs ?? { readdir: fsp.readdir, lstat: fsp.lstat, realpath: fsp.realpath };
   const started = Date.now();
   const cpu0 = process.cpuUsage();
   const lag = monitorEventLoopDelay({ resolution: 20 });
@@ -163,7 +202,10 @@ async function walk(root, o, now, ops, started, cpu0, lag) {
     map.set(key, e);
   };
 
-  const stack = [{ abs: root, rel: [], prot: false, cache: false, exp: false, pcap: false, doc: false }];
+  const ctx = await rootContext(root, ops);
+  // A root inside a protected / recovery tree: nothing below it may be named, and everything is counted as such.
+  const anon = ctx.prot ? "/<protected>" : ctx.doc ? "/<doctor-snapshot>" : ctx.pcap ? "/<plugin-captures>" : null;
+  const stack = [{ abs: root, rel: [], prot: ctx.prot, cache: false, exp: false, pcap: ctx.pcap, doc: ctx.doc }];
   let seen = 0;
   while (stack.length) {
     const dir = stack.pop();
@@ -224,9 +266,10 @@ async function walk(root, o, now, ops, started, cpu0, lag) {
       res.bytes += bytes;
       if (isProt) res.protectedBytes += bytes;
 
-      const l1 = dir.rel.length === 0 ? "/(root-files)" : label([dir.rel[0]]);
+      const l1 = anon ?? (dir.rel.length === 0 ? "/(root-files)" : label([dir.rel[0]]));
       let l2 = null;
-      if (dir.rel.length >= 2) l2 = label(dir.rel.slice(0, 2));
+      if (anon) l2 = null;
+      else if (dir.rel.length >= 2) l2 = label(dir.rel.slice(0, 2));
       else if (dir.rel.length === 1) l2 = protName ? `${label([dir.rel[0]])}/<protected>` : `${label([dir.rel[0]])}/(files)`;
       bump(res.level1, l1, bytes, mod);
       if (l2) bump(res.level2, l2, bytes, mod);
@@ -422,7 +465,8 @@ export function startStorageDiagnostics({
     ? Math.min(requestedDelay, 900_000)
     : DEFAULTS.firstDelayMs;
   schedule(initialDelayMs);
-  log.info("storage-diag", `enabled root=${root} every ${hours}h (read-only: readdir/lstat/statfs)`);
+  // The configured root is printed only as a sanitised label: it may point inside a protected tree.
+  log.info("storage-diag", `enabled root=${rootLabel(root)} every ${hours}h (read-only: readdir/lstat/statfs)`);
   return {
     runOnce,
     stop() {

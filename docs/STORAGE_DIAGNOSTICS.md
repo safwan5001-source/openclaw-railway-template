@@ -5,7 +5,7 @@ exposing contents. Implemented in `src/storage-diagnostics.js`; **off unless `DI
 
 ## What it logs
 
-Two JSON lines tagged `[storage-diag]` at boot+90 s and then every `DIAG_STORAGE_INTERVAL_HOURS` (default 6):
+Two JSON lines tagged `[storage-diag]` 90 s after the boot-time `openclaw doctor --fix` / gateway start has finished (the timer is started after that initialisation, not at `listen()`) and then every `DIAG_STORAGE_INTERVAL_HOURS` (default 6):
 
 1. **summary** — `fs` (statfs total/used/free/usedPct), `scan` stats (incl. `cpuMs`, `lagMaxMs`, `rssMB` of the scan
    itself), `protectedMB`, measured cleanup `candidates` (`tmp`, `backup`, `log`, `cache`, `exportsOld`), `recovery`
@@ -39,6 +39,16 @@ with a doctor suffix is labelled `<doctor-snapshot>` (or `<protected>` when the 
   backups (`backup/`, `backups/`, `basht-backup*`, `*.bkp`) are summed into a single `<protected>` total and are never
   named or counted as candidates. Backup/temp/doctor variants of a protected name (`customers.sqlite.bak`,
   `IDENTITY.md.bak`, `AGENTS.md.doctor-backup-<ts>`, `agents.migrated-<ts>/`) stay protected.
+- **Scan root inside a protected tree.** `DIAG_STORAGE_ROOT` may be any directory, including one *inside* a protected
+  tree (`<workspace>/memory`, `<state>/agents/main/sessions`, `…/credentials/whatsapp/default`, a doctor snapshot,
+  `plugin-captures/…`). Protection is derived from every component of the resolved root path **and** of its real path
+  (a symlinked root is followed with `realpath`, the only call besides `readdir`/`lstat`/`statfs`). In that case every
+  byte is counted as `<protected>` (or `recovery.*`), the detail output has the single anonymous row `/<protected>`
+  (`/<doctor-snapshot>`, `/<plugin-captures>`), nothing is a candidate, and the `enabled root=` log line prints a
+  sanitised label (`/data/workspace/<protected>`), never the configured path. Only *protective* context is inherited:
+  cache/exports classification is not, so narrowing the root can only reduce what is reported as a candidate.
+  Fail-safe side effect: if a component of the real mount path happens to look protected (e.g. a host path containing
+  `state`), the scan is anonymous rather than detailed.
 - A scan failure logs only the errno code (`scan failed: ENOENT`), never a message or a path.
 - Names that look like phone numbers, ids or hashes are printed as `<other>`.
 - Files modified in the last 24 h, `.lock/.pid/.sock/.wal/.shm` and anything younger than 7 days are never candidates.
