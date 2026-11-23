@@ -14,9 +14,9 @@ Run `node --test scripts/marketing-skills.test.mjs` from repo root.
 - This repository is the live OpenClaw **image source**, unlike the separate safwan-smart-assistant application.
 - Dockerfile already copies `skills/` into `/app/skills`.
 - Production workspace resides at `/data/workspace`, backed by the existing Railway `openclaw-volume`.
-- Current `skill-sync.sh` **rejects these ten names**; it only permits basht-daftra and basht-accounting.
-- **Do not merge this branch to main to test**. Main can trigger production deployment. These files alone do not get installed on /data.
-- Do not alter `skill-sync.sh`, `entrypoint.sh`, `Dockerfile`, or OpenClaw/Gateway/Claude config in this PR.
+- The existing `skill-sync.sh` still manages only basht-daftra and basht-accounting. A separate manifest-restricted `install-marketing-skills.sh` installer adds only the ten marketing skills, without updating or deleting existing workspace copies.
+- The marketing-only PR #36 delivered the source files. This separate installer PR is required for automatic workspace installation; merging it will trigger Railway production deployment. Live discovery is not verified until after an approved merge/deployment.
+- The installer PR modifies only the Dockerfile copy step and entrypoint invocation (and adds installer/tests). It does not modify `skill-sync.sh`, Gateway, Claude, or OpenClaw configuration.
 
 ## Installation follow-up (separate, owner-approved PR)
 1. Inspect `entrypoint.sh` call sites of `skill-sync.sh` and live skill inventory; check for collisions and symlinks.

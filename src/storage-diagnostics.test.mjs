@@ -454,15 +454,29 @@ test("scan: only readdir/lstat/realpath are used (realpath is called once, on th
   fs.rmSync(vol, { recursive: true, force: true });
 });
 
-test("start: first scan at the 90 s default and the enabled line keeps its production format", () => {
+test("start: the enabled line keeps its production format and the first scan defaults to 90 s", () => {
   const delays = [];
   const lines = [];
   const h = startStorageDiagnostics({
     log: { info: (c, m) => lines.push(m), warn: (c, m) => lines.push(m) },
-    env: { DIAG_STORAGE: "1", DIAG_STORAGE_FIRST_DELAY_SEC: "5" }, // the former test-only knob must have no effect
+    env: { DIAG_STORAGE: "1" },
     setTimeoutFn: (fn, ms) => (delays.push(ms), { unref() {} }),
   });
   h.stop();
   assert.deepEqual(delays, [90_000]);
   assert.deepEqual(lines, ["enabled root=/data every 6h (read-only: readdir/lstat/statfs)"]);
+});
+
+test("start: first scan defaults to 90s and explicit delay is bounded", () => {
+  const log = { info() {}, warn() {} };
+  for (const [requested, expected] of [[undefined, 90_000], ["240000", 240_000], ["1", 90_000], ["garbage", 90_000], ["9999999", 900_000]]) {
+    const delays = [];
+    const env = { DIAG_STORAGE: "1", ...(requested === undefined ? {} : { DIAG_STORAGE_FIRST_DELAY_MS: requested }) };
+    const h = startStorageDiagnostics({
+      log, env,
+      setTimeoutFn: (_callback, ms) => { delays.push(ms); return { unref() {} }; },
+    });
+    assert.deepEqual(delays, [expected], `initial delay for ${String(requested)}`);
+    h.stop();
+  }
 });

@@ -56,10 +56,11 @@ chk "DIAG_STORAGE=0: no [storage-diag] line" '[ "$(logs | grep -c "storage-diag"
 docker rm -f $N >/dev/null
 
 # ---- 2. DIAG_STORAGE=1
-# Since #38 the heartbeat starts only after the boot-time `openclaw doctor --fix` and gateway start, so its 90 s first-scan
-# timer begins when the gateway is up. The baseline hash (taken right after wait_gw) is therefore always before the scan;
-# the "enabled" line is logged just after the gateway comes up, so wait for it instead of assuming it is already there.
-run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6
+# Since #38 the heartbeat starts only after the boot-time `openclaw doctor --fix` and gateway start, so its first-scan timer
+# begins when the gateway is up; CI may still need substantial time for doctor + 40k seeded files, so the first scan is
+# deferred explicitly (production keeps the 90 s default). The "enabled" line is logged just after the gateway comes up:
+# wait for it instead of assuming it is already there.
+run -e DIAG_STORAGE=1 -e DIAG_STORAGE_INTERVAL_HOURS=6 -e DIAG_STORAGE_FIRST_DELAY_MS=240000
 chk "DIAG_STORAGE=1: gateway healthy" 'wait_gw'
 for _ in $(seq 1 30); do logs | grep -q "storage-diag.*enabled root=/data every 6h" && break; sleep 2; done
 chk "DIAG_STORAGE=1: one 'enabled' line" '[ "$(logs | grep -c "storage-diag.*enabled root=/data every 6h")" = 1 ]'
@@ -70,7 +71,7 @@ LAT=$(mktemp); STATS=$(mktemp)
 DONE=$(mktemp -u)
 ( while [ ! -e "$DONE" ]; do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://127.0.0.1:$P/setup/healthz; sleep 0.2; done ) > "$LAT" &
 ( while [ ! -e "$DONE" ]; do docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' $N; done ) > "$STATS" &
-for _ in $(seq 1 120); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done   # <= 240 s (scan fires 90 s after the gateway is up)
+for _ in $(seq 1 150); do [ "$(logs | grep -c '\[storage-diag\] {')" -ge 2 ] && break; sleep 2; done   # <= 300 s (scan fires 240 s after the gateway is up)
 sleep 3; touch "$DONE"
 wait; rm -f "$DONE"
 SUMMARY=$(logs | grep '\[storage-diag\] {"v":1,"ts":[^,]*,"level"' | head -1 | sed 's/.*\[storage-diag\] //')

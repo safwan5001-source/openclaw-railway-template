@@ -69,6 +69,22 @@ test('entrypoint.sh: existing behaviour intact, skill sync is fail-soft and runs
   assert.match(t, /skill-sync\.sh \/app\/skills "\$\{OPENCLAW_WORKSPACE_DIR:-\/data\/workspace\}" openclaw:openclaw \\\n\s+\|\| echo/, 'a sync failure must not stop the Gateway');
 });
 
+test('marketing installer is shipped and called fail-soft with an explicit fixed allowlist', () => {
+  const docker = dockerfileLines('Dockerfile').join('\n');
+  const entry = read('entrypoint.sh');
+  const installer = read('scripts/install-marketing-skills.sh');
+  assert.match(docker, /^COPY --chmod=755 scripts\/install-marketing-skills\.sh \.\/install-marketing-skills\.sh$/m);
+  assert.match(entry, /\/app\/install-marketing-skills\.sh \/app\/skills/);
+  assert.ok(entry.indexOf('/app/install-marketing-skills.sh') < entry.indexOf('exec gosu openclaw'));
+  assert.match(entry, /marketing skill installation incomplete/, 'fail-soft startup');
+  for (const name of ['basht-market-intelligence','basht-marketing-strategy','basht-creative-direction',
+    'basht-social-media','basht-ads-campaigns','basht-performance-analytics','basht-video-creative',
+    'basht-local-seo','basht-conversion-optimization','basht-marketing-automation']) {
+    assert.ok(installer.includes(name), 'missing allowlisted skill: ' + name);
+  }
+  assert.match(installer, /mv -Tn/, 'never clobber an existing skill');
+});
+
 // ---------------------------------------------------------------- broker image
 test('Dockerfile.broker: minimal, pinned, non-root drop, healthcheck, only the skill scripts', () => {
   const lines = dockerfileLines('Dockerfile.broker'); const t = lines.join('\n');
