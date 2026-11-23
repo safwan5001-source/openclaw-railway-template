@@ -6,6 +6,8 @@ on:
       - 'skill-sync.sh'
       - 'entrypoint.sh'
       - 'package.json'
+      - 'Dockerfile'
+      - 'docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md'
       - '.github/workflows/transport-sales-ci.yml'
   workflow_dispatch:
 permissions:
@@ -41,3 +43,17 @@ jobs:
           test -f "$tmp/ws/skills/basht-daftra/SKILL.md"
           test -f "$tmp/ws/skills/basht-accounting/SKILL.md"
           test -f "$tmp/ws/skills/basht-transport-sales/SKILL.md"
+      - name: Canonical plan packaged and synchronized to workspace
+        run: |
+          set -euo pipefail
+          grep -Fq 'COPY docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md ./skills/basht-transport-sales/references/MASTER-PLAN.md' Dockerfile
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/image/skills/basht-transport-sales/references" "$tmp/ws"
+          cp -a skills/basht-transport-sales/. "$tmp/image/skills/basht-transport-sales/"
+          cp docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md "$tmp/image/skills/basht-transport-sales/references/MASTER-PLAN.md"
+          bash skill-sync.sh "$tmp/image/skills" "$tmp/ws" - basht-transport-sales
+          cmp docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md "$tmp/ws/skills/basht-transport-sales/references/MASTER-PLAN.md"
+          grep -q 'references/MASTER-PLAN.md' "$tmp/ws/skills/basht-transport-sales/SKILL.md"
+          bash skill-sync.sh "$tmp/image/skills" "$tmp/ws" - basht-transport-sales
+          cmp docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md "$tmp/ws/skills/basht-transport-sales/references/MASTER-PLAN.md"
