@@ -1,0 +1,43 @@
+name: Transport sales skill checks
+on:
+  pull_request:
+    paths:
+      - 'skills/basht-transport-sales/**'
+      - 'skill-sync.sh'
+      - 'entrypoint.sh'
+      - 'package.json'
+      - '.github/workflows/transport-sales-ci.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  transport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Static shell syntax
+        run: bash -n skill-sync.sh entrypoint.sh
+      - name: Transport unit tests
+        run: npm run test:transport
+      - name: Skill installation and isolation smoke test
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/ws"
+          bash skill-sync.sh "$PWD/skills" "$tmp/ws" - basht-transport-sales
+          test -f "$tmp/ws/skills/basht-transport-sales/SKILL.md"
+          test -f "$tmp/ws/skills/basht-transport-sales/scripts/transport-sales.mjs"
+          node "$tmp/ws/skills/basht-transport-sales/scripts/transport-sales.mjs" quote <<'JSON'
+          {"trips":5,"daily_cost_sar":900,"target_margin_pct":20}
+          JSON
+          bash skill-sync.sh "$PWD/skills" "$tmp/ws" - basht-transport-sales
+          bash skill-sync.sh "$PWD/skills" "$tmp/ws" - basht-daftra
+          bash skill-sync.sh "$PWD/skills" "$tmp/ws" - basht-accounting
+          test -f "$tmp/ws/skills/basht-daftra/SKILL.md"
+          test -f "$tmp/ws/skills/basht-accounting/SKILL.md"
+          test -f "$tmp/ws/skills/basht-transport-sales/SKILL.md"

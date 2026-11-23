@@ -30,6 +30,10 @@ fi
 /app/skill-sync.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw basht-accounting \
   || echo "[entrypoint] accounting skill sync skipped (see message above); OpenClaw starts normally" >&2
 
+# Transport skill installation remains separate from marketing and accounting.
+/app/skill-sync.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw basht-transport-sales \
+  || echo "[entrypoint] transport skill sync skipped; OpenClaw starts normally" >&2
+
 # Marketing installer is allowlisted and add-only: existing workspace copies are NEVER overwritten.
 # A collision is logged for manual review; Gateway still starts normally.
 /app/install-marketing-skills.sh /app/skills "${OPENCLAW_WORKSPACE_DIR:-/data/workspace}" openclaw:openclaw \
