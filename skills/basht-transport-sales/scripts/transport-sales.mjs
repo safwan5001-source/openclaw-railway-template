@@ -44,11 +44,23 @@ function leads(input) {
         if (!v[f]) issues.push('missing_' + f);
       }
     }
+    // Never output an unsubstantiated verified/qualified status as if it were valid.
+    // The original status is retained separately for audit, not as the effective classification.
+    const claimedVerified = v.status === 'verified_open_request' || v.status === 'qualified';
+    const missingConfirmation = claimedVerified &&
+      (!dateOnly(v.request_confirmed_at) ||
+       typeof v.confirmation_evidence !== 'string' || !v.confirmation_evidence.trim());
+    const missingQualification = v.status === 'qualified' &&
+      ['loading_location','unloading_location','material','vehicle_type'].some(
+        f => typeof v[f] !== 'string' || !v[f].trim());
+    const status = missingConfirmation ? 'unverified_request' :
+      missingQualification ? 'verified_open_request' : (v.status ?? null);
+    if (status !== v.status) issues.push('classification_downgraded_missing_evidence');
     const key = normal(name);
     let duplicate_of = null;
     if (key && seen.has(key)) duplicate_of = seen.get(key);
     else if (key) seen.set(key, index);
-    const candidate = {index, name, status: v.status ?? null, source_host: host || null, issues, duplicate_of};
+    const candidate = {index, name, status, claimed_status: v.status ?? null, source_host: host || null, issues, duplicate_of};
     return candidate;
   });
 }
