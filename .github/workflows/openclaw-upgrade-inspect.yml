@@ -27,6 +27,8 @@ jobs:
           node -e 'if(require("./package/package.json").version!=="2026.11.10")process.exit(1)'
           find package/dist -maxdepth 1 -type f \( -name '*memory-flush*' -o -name '*agent-runner-memory*' -o -name '*command-auth*' -o -name '*io.runtime*' \) -print0 | xargs -0 -r sha256sum | tee hashes.txt
           grep -lE 'createSessionMaintenanceFollowup|memory flush dispatched|memory flush skipped: no declared persistence tool survived policy' package/dist/*.mjs > candidates.txt
+          find package/dist -maxdepth 1 -type f \( -name '*command-auth*' -o -name '*io.runtime*' -o -name '*agent-runner-utils*' -o -name '*agent-runner-memory*' -o -name '*memory-flush-plan*' \) >> candidates.txt
+          sort -u candidates.txt -o candidates.txt
           cat candidates.txt
           mkdir evidence
           cp hashes.txt candidates.txt evidence/
