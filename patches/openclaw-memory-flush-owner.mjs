@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// BASHT build-time patch for OpenClaw 2026.10.9: keep the verified owner's identity on the pre-compaction
+// BASHT build-time patch for OpenClaw 2026.11.10: keep the verified owner's identity on the pre-compaction
 // memory flush (file arm only).
 //
 // Upstream behaviour: runMemoryFlushIfNeeded() builds the flush turn with createSessionMaintenanceFollowup(),
@@ -16,7 +16,7 @@
 //     a bound command-owner authority must be current (revoked => denied, no fallback), otherwise the sender must
 //     match commands.ownerAllowFrom in the live config (wildcards never count);
 //   * only the sender identifiers that individually prove ownership are propagated.
-// The proof is repeated before every model attempt. WhatsApp (OpenClaw 2026.10.9) marks its sender identifier
+// The proof is repeated before every model attempt. WhatsApp (OpenClaw 2026.11.10) marks its sender identifier
 // "asserted", not "verified", so it never yields a command-owner authority; its owner basis is the configured-owner
 // match — the same basis OpenClaw already uses to grant that sender the owner's tools on the live turn.
 // Everything else (non-owner sessions, tainted turns, tools-arm providers, owner-only tool deny list, append-only
@@ -29,40 +29,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const OPENCLAW_VERSION = "2026.10.9";
-export const TARGET_FILE = "dist/agent-runner-memory-BkOUjtvi.mjs";
-export const ORIGINAL_SHA256 = "afee11592d7662020debf02db5dbb15194a698c0793408775ccc306c95357641";
+export const OPENCLAW_VERSION = "2026.11.10";
+export const TARGET_FILE = "dist/agent-runner-memory-Bmk5_PZf.mjs";
+export const ORIGINAL_SHA256 = "8cf5d7d6637baa3df48ae2e17814a1f58416c5fb9c875e0c875c2403601f623e";
 export const PATCH_MARKER = "basht-patch:memory-flush-owner-identity";
 const CONTENT_INVENTORY = "dist/postinstall-content-inventory.json";
 
-const IMPORT_ANCHOR = `import { t as createSessionMaintenanceFollowup } from "./run-C50ZeOtw.mjs";\n`;
-const IMPORT_ADDITION = `import { d as getCommandOwnerAuthority, t as isConfiguredCommandOwner } from "./command-auth-BHrKDij6.mjs";\nimport { r as getRuntimeConfig } from "./io.runtime-B134MOMz.mjs";\n`;
-
-const RUN_ANCHOR = `		auth: params.followupRun.run
-	}).run;
-`;
-const RUN_ADDITION = `	// ${PATCH_MARKER}: keep the verified owner identity for the file-arm flush (see patches/openclaw-memory-flush-owner.mjs)
-	const bashtOwnerFlushIdentity = resolveBashtOwnerMemoryFlushIdentity({
-		sourceRun: params.followupRun.run,
-		memoryFlushWritePath,
-		sourceTurnTainted: sessionLogSnapshot?.turnTainted === true
-	});
-	if (bashtOwnerFlushIdentity) {
-		maintenanceRun.senderIsOwner = true;
-		memoryFlushLog.debug("memory flush keeps verified owner identity", {
-			event: "memory_flush_owner_identity",
-			sourceSessionKey: params.sessionKey,
-			ownerBasis: bashtOwnerFlushIdentity.ownerBasis
-		});
-	}
-`;
-
-const CTX_ANCHOR = `					sessionCtx: {},
-`;
-const CTX_REPLACEMENT = `					sessionCtx: bashtOwnerFlushIdentity ? bashtOwnerFlushIdentity.currentSessionCtx() : {},
-`;
-
-const EXPORT_ANCHOR = `export { runSessionCompactionIfNeeded as n, runMemoryFlushIfNeeded as t };`;
+const IMPORT_ANCHOR = `const preflightCompactionLog=createSubsystemLogger(`;
+const IMPORT_ADDITION = `import { h as getCommandOwnerAuthority, t as isConfiguredCommandOwner } from "./command-auth-Ch_q0NQN.mjs";\nimport { getRuntimeConfig } from "./io.runtime-euLviN5p.mjs";\n`;
+const RUN_ANCHOR = `maintenanceRun:P,sourcePolicySessionKey:F}=E;`;
+const RUN_ADDITION = `const bashtOwnerFlushIdentity=resolveBashtOwnerMemoryFlushIdentity({sourceRun:e.followupRun.run,memoryFlushWritePath:D,sourceTurnTainted:v?.turnTainted!==false});if(bashtOwnerFlushIdentity)P.senderIsOwner=true;`;
+const CTX_ANCHOR = `run:{...P,thinkLevel:o},sessionCtx:{},`;
+const CTX_REPLACEMENT = `run:{...P,thinkLevel:o},sessionCtx:bashtOwnerFlushIdentity?bashtOwnerFlushIdentity.currentSessionCtx():{},`;
+const EXPORT_ANCHOR = `export{runSessionCompactionIfNeeded as n,runMemoryFlushIfNeeded as t};`;
 const HELPER = `//#region ${PATCH_MARKER}
 /**
 * Owner identity for a file-arm memory flush, or undefined to keep upstream's anonymous maintenance identity.
@@ -126,10 +105,10 @@ export function sha256(text) {
 export function patchSource(original) {
   if (original.includes(PATCH_MARKER)) throw new Error("memory-flush patch: already applied");
   let out = original;
-  out = replaceOnce(out, IMPORT_ANCHOR, IMPORT_ANCHOR + IMPORT_ADDITION, "import");
+  out = replaceOnce(out, IMPORT_ANCHOR, IMPORT_ADDITION + IMPORT_ANCHOR, "import");
   out = replaceOnce(out, RUN_ANCHOR, RUN_ANCHOR + RUN_ADDITION, "maintenance run");
   out = replaceOnce(out, CTX_ANCHOR, CTX_REPLACEMENT, "flush sessionCtx");
-  out = replaceOnce(out, EXPORT_ANCHOR, HELPER + EXPORT_ANCHOR, "export");
+  out = replaceOnce(out, EXPORT_ANCHOR, "\n" + HELPER + EXPORT_ANCHOR, "export");
   return out;
 }
 
@@ -181,10 +160,10 @@ export function applyToPackage(packageRoot, { log = console } = {}) {
 /** Reverse the four additive edits (used only to verify an already-patched file byte-for-byte). */
 export function readOriginalFromPatched(patched) {
   let out = patched;
-  out = replaceOnce(out, IMPORT_ANCHOR + IMPORT_ADDITION, IMPORT_ANCHOR, "unpatch import");
+  out = replaceOnce(out, IMPORT_ADDITION + IMPORT_ANCHOR, IMPORT_ANCHOR, "unpatch import");
   out = replaceOnce(out, RUN_ANCHOR + RUN_ADDITION, RUN_ANCHOR, "unpatch maintenance run");
   out = replaceOnce(out, CTX_REPLACEMENT, CTX_ANCHOR, "unpatch flush sessionCtx");
-  out = replaceOnce(out, HELPER + EXPORT_ANCHOR, EXPORT_ANCHOR, "unpatch export");
+  out = replaceOnce(out, "\n" + HELPER + EXPORT_ANCHOR, EXPORT_ANCHOR, "unpatch export");
   return out;
 }
 
