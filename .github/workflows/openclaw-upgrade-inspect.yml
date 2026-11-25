@@ -10,8 +10,9 @@ jobs:
   inspect:
     if: github.ref == 'refs/heads/upgrade/openclaw-2026.11.10' || github.head_ref == 'upgrade/openclaw-2026.11.10'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
@@ -38,3 +39,15 @@ jobs:
           name: openclaw-upgrade-evidence
           path: ${{ runner.temp }}/openclaw-inspect/evidence
           retention-days: 3
+      - name: Verify exact patch and syntax against published package
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/openclaw-inspect/package"
+          node patches/openclaw-memory-flush-owner.mjs "$root"
+          node --check "$root/dist/agent-runner-memory-Bmk5_PZf.mjs"
+          node patches/openclaw-memory-flush-owner.mjs "$root"
+      - name: Build production image without publishing
+        run: docker build --tag basht-upgrade-test:2026.11.10 .
+      - name: Verify installed version
+        run: docker run --rm --entrypoint openclaw basht-upgrade-test:2026.11.10 --version
