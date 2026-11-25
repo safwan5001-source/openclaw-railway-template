@@ -43,9 +43,9 @@ RUN apt-get update \
 
 RUN npm install -g \
     --allow-scripts=openclaw \
-    openclaw@2026.10.9 \
+    openclaw@2026.11.10 \
   && node --version | grep -Eq '^v26\.' \
-  && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.11\.10( |$)'
 # Pinned (was @latest): a rebuild must produce the same tool the previous build had. Bump deliberately.
 RUN npm install -g clawhub@0.27.0
 
@@ -66,8 +66,8 @@ COPY docs/business/nebras-transport/NEBRAS-TRANSPORT-MASTER-PLAN.md ./skills/bas
 # patches/memory-flush-doctor.mjs and patches/owner-check.mjs are read-only diagnostics for the Railway console.
 COPY patches/openclaw-memory-flush-owner.mjs patches/memory-flush-doctor.mjs patches/owner-check.mjs patches/whatsapp-owner.mjs ./patches/
 RUN node patches/openclaw-memory-flush-owner.mjs /usr/local/lib/node_modules/openclaw \
-  && grep -q 'basht-patch:memory-flush-owner-identity' /usr/local/lib/node_modules/openclaw/dist/agent-runner-memory-BkOUjtvi.mjs \
-  && openclaw --version | grep -Eq '^OpenClaw 2026\.10\.9( |$)'
+  && grep -q 'basht-patch:memory-flush-owner-identity' /usr/local/lib/node_modules/openclaw/dist/agent-runner-memory-Bmk5_PZf.mjs \
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.11\.10( |$)'
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 skill-sync.sh ./skill-sync.sh
 COPY --chmod=755 scripts/install-marketing-skills.sh ./install-marketing-skills.sh
