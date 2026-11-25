@@ -1,0 +1,38 @@
+name: OpenClaw upgrade package inspection
+on:
+  push:
+    branches: ['upgrade/openclaw-2026.11.10']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/upgrade/openclaw-2026.11.10' || github.head_ref == 'upgrade/openclaw-2026.11.10'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Inspect pinned package without executing package scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/openclaw-inspect"
+          cd "$RUNNER_TEMP/openclaw-inspect"
+          npm view openclaw@2026.11.10 version dist.integrity engines --json
+          npm pack openclaw@2026.11.10 --ignore-scripts
+          tar -xzf openclaw-2026.11.10.tgz
+          node -e 'if(require("./package/package.json").version!=="2026.11.10")process.exit(1)'
+          find package/dist -maxdepth 1 -type f \( -name '*memory-flush*' -o -name '*agent-runner-memory*' -o -name '*command-auth*' -o -name '*io.runtime*' \) -print0 | xargs -0 -r sha256sum | tee hashes.txt
+          grep -lE 'createSessionMaintenanceFollowup|memory flush dispatched|memory flush skipped: no declared persistence tool survived policy' package/dist/*.mjs > candidates.txt
+          cat candidates.txt
+          mkdir evidence
+          cp hashes.txt candidates.txt evidence/
+          while IFS= read -r f; do cp "$f" evidence/; done < candidates.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-upgrade-evidence
+          path: ${{ runner.temp }}/openclaw-inspect/evidence
+          retention-days: 3
