@@ -38,7 +38,7 @@ test('OpenClaw Dockerfile: Arabic fonts, skill copy, unchanged OpenClaw/Node pin
   assert.match(t, /fc-match 'Noto Naskh Arabic' \| grep -qi 'NotoNaskhArabic'/, 'build fails if the Arabic font is not resolvable');
   assert.match(t, /^COPY skills \.\/skills$/m, 'self-contained skill is copied');
   assert.match(t, /^COPY --chmod=755 skill-sync\.sh \.\/skill-sync\.sh$/m);
-  assert.match(t, /openclaw@2026\.10\.9/, 'OpenClaw pin unchanged');
+  assert.match(t, /openclaw@2026\.11\.10/, 'OpenClaw pin unchanged');
   assert.match(t, /grep -Eq '\^v26\\\./, 'Node 26 runtime assertion unchanged');
   assert.match(t, /^ENTRYPOINT \["tini", "--", "\.\/entrypoint\.sh"\]$/m, 'launch chain unchanged');
   assert.match(t, /^HEALTHCHECK .*\/setup\/healthz/m, 'OpenClaw healthcheck unchanged');
