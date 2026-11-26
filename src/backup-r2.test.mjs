@@ -31,7 +31,7 @@ test("R2 delivery checks SHA256 and rejects corrupted readback", async () => {
   try {
     const file = path.join(dir,"encrypted.bkp"), remote = path.join(dir,"remote"), aws = path.join(dir,"aws");
     await fs.writeFile(file,"synthetic encrypted bytes");
-    await fs.writeFile(aws, '#!/bin/sh\nset -eu\nif [ "$5" = "-" ]; then cat "$MOCK_REMOTE"; if [ "$MOCK_CORRUPT" = yes ]; then printf x; fi; else cp "$5" "$MOCK_REMOTE"; fi\n',{mode:0o700});
+    await fs.writeFile(aws, '#!/bin/sh\nset -eu\nif [ "$6" = "-" ]; then cat "$MOCK_REMOTE"; if [ "$MOCK_CORRUPT" = yes ]; then printf x; fi; else cp "$5" "$MOCK_REMOTE"; fi\n',{mode:0o700});
     const cfg = {endpoint:"https://example.invalid",bucket:"basht-backups",env:{PATH:dir+":"+process.env.PATH,MOCK_REMOTE:remote,MOCK_CORRUPT:"no"}};
     const ok = await uploadEncryptedBackup(file,cfg);
     assert.equal(ok.verified,true);
