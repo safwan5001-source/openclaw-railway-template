@@ -29,6 +29,7 @@ import { callBroker, BrokerRefused } from './daftra-broker-client.mjs';
 import { callBrokerService, createBrokerFetcher, downloadInvoicePdfViaBroker } from './daftra-broker-service-client.mjs';
 import { renderCliResult, formatFailure, LANGS, VIEWS } from './daftra-format.mjs';
 import { renderWhatsAppCliResult, formatWhatsAppFailure } from './daftra-format-whatsapp.mjs';
+import { recordReadEvidence } from './daftra-reply-guard.mjs';
 
 // ---- argument parsing: positionals + --flag value (repeatable --query k=v / --param k=v) -------
 export function parseArgs(argv) {
@@ -144,7 +145,12 @@ export async function run(argv, options = {}) {
   const result = await runCommand(argv, options);
   if (!render) return result;
   const { positional } = parseArgs(argv);
-  return (render.channel === 'whatsapp' ? renderWhatsAppCliResult : renderCliResult)(positional[0], positional[1], result, render);
+  const rendered = await (render.channel === 'whatsapp' ? renderWhatsAppCliResult : renderCliResult)(positional[0], positional[1], result, render);
+  // A successful, complete read is recorded so the reply guard can verify a later financial reply against it.
+  if (READ_COMMANDS.has(positional[0]) && result?.ok === true && typeof rendered?.markdown === 'string') {
+    recordReadEvidence({ command: positional[0], markdown: rendered.markdown, complete: result.complete !== false, env: options.env ?? process.env });
+  }
+  return rendered;
 }
 
 async function runCommand(argv, { env = process.env, fetcher = fetch, sleep, brokerFetcher = fetch } = {}) {
