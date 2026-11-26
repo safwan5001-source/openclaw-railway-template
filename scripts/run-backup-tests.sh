@@ -14,5 +14,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAJOR="${1:-$(node -p 'process.versions.node.split(".")[0]')}"
 command -v docker >/dev/null || { echo "docker is required to run the backup tests" >&2; exit 2; }
+# The import-ZIP test needs zip/unzip, which the production image ships but the plain Node image does not.
+# Dependencies (express, http-proxy) come from the repository's node_modules: install them first (pnpm --prod).
+[ -d "$ROOT/node_modules/express" ] || { echo "run 'npx -y pnpm@11.24.0 install --frozen-lockfile --prod' first" >&2; exit 2; }
 exec docker run --rm --cap-add=SYS_PTRACE -v "$ROOT:/app:ro" -w /app "node:${MAJOR}-bookworm" \
-  node --test src/backup.test.mjs src/backup-r2.test.mjs
+  bash -ec 'apt-get update -qq && apt-get install -y -qq --no-install-recommends zip unzip >/dev/null && node --test src/backup.test.mjs src/backup-r2.test.mjs'
