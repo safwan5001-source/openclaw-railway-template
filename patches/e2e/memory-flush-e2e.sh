@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end proof for the BASHT memory-flush owner-identity patch on the REAL OpenClaw 2026.10.9 runtime.
+# End-to-end proof for the BASHT memory-flush owner-identity patch on the REAL OpenClaw 2026.11.10 runtime.
 #
 #   bash patches/e2e/memory-flush-e2e.sh [workdir]
 #
@@ -17,7 +17,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 WORK=${1:-$(mktemp -d)}
 OWNER=+15550001234
 IMPOSTOR=+19990001111
-VERSION=2026.10.9
+VERSION=2026.11.10
 mkdir -p "$WORK"
 echo "[e2e] workdir $WORK"
 
@@ -27,7 +27,7 @@ fi
 rm -rf "$WORK/patched" && cp -a "$WORK/base" "$WORK/patched"
 node "$REPO/patches/openclaw-memory-flush-owner.mjs" "$WORK/patched/node_modules/openclaw"
 for d in base patched; do
-  f="$WORK/$d/node_modules/openclaw/dist/agent-command-B2Fr8yPI.mjs"
+  f="$WORK/$d/node_modules/openclaw/dist/agent-command-DCE2yuWI.mjs"
   grep -q bashtE2eOrigCreateCommandMaintenanceFollowup "$f" || node "$HERE/instrument-cli-owner-run.mjs" "$f"
 done
 

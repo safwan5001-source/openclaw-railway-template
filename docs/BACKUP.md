@@ -160,7 +160,10 @@ Delete `restore.tar.gz` / `restore.zip` afterwards (they are plaintext).
 
 - `src/backup.test.mjs`: round trip; wrong key / flipped byte / truncation refused with no output; route auth, CSRF,
   exclusions, no plaintext in the file, no files on the volume, gateway back up; the restore ZIP satisfies the import's
-  exact entry rules.
+  exact entry rules. The route refuses to snapshot while a same-user process still holds a writable descriptor or shared
+  mapping under the data roots, and fails closed on a process it cannot inspect, so these tests run through
+  `bash scripts/run-backup-tests.sh` (a Node container with `CAP_SYS_PTRACE`, repository mounted read-only) in CI instead of
+  directly on a shared runner. The guard is not changed or skipped for tests.
 - `scripts/restore-drill.sh <image>` (real image + real gateway, synthetic data): backup from a running instance →
   container **and volume destroyed** → fresh container on an **empty** volume → import → 17/17 protected files
   byte-identical, SQLite `integrity_check` ok, gateway healthy, files owned by `openclaw`. Run it quarterly.

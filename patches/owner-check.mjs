@@ -20,7 +20,7 @@
 //   * NO DATA OUT. The child's stdout/stderr go to /dev/null; its result returns on a private pipe. The parent prints one
 //     line `BASHT_OWNER_CHECK {json}` (booleans, counts, sanitised agent ids / policy-step names, verdict). Any 7+ digit
 //     run is masked; errors are reduced to their type; uncaught errors still end in that single line.
-//   * Fails closed: refuses root and any OpenClaw version other than 2026.10.9; BLOCKED on unreadable config, $include,
+//   * Fails closed: refuses root and any OpenClaw version other than 2026.11.10; BLOCKED on unreadable config, $include,
 //     unsubstituted ${ENV} in policy fields, ownerAllowFrom entries OpenClaw would not accept, or any simulation error.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -30,8 +30,11 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { classifyOwnerEntry } from "./whatsapp-owner.mjs";
 
-const EXPECTED_OPENCLAW = "2026.10.9";
-const AGENT_TOOLS_CHUNK = "dist/agent-tools-Bpi7xWYy.mjs";
+const EXPECTED_OPENCLAW = "2026.11.10";
+// createOpenClawCodingToolsInternalAsync (export "n") of the pinned package. Unlike the public createOpenClawCodingToolsAsync
+// (export "t", options only) it takes the tool-policy observer as its third argument: onFilter({ step, policy, before, after }).
+// The public wrapper only adds unverifiedExecutionPolicy:true, which this read-only replay passes as well.
+const AGENT_TOOLS_CHUNK = "dist/agent-tools.async-Cu9hozum.mjs";
 // A DM session key as stored: not preceded by an identifier character, and not followed by more key segments
 // (":thread:…") or digits, so keys embedded in other keys or in free text do not count.
 const SESSION_KEY_RE = /(?<![A-Za-z0-9_:.-])agent:([a-z0-9][a-z0-9_-]{0,63}):whatsapp:direct:(\+?\d{7,15})(?![\d:A-Za-z_-])/g;
@@ -70,8 +73,8 @@ if (IS_CHILD) {
     const mod = await import(pathToFileURL(path.join(PKG, AGENT_TOOLS_CHUNK)).href);
     const sim = async (agentId, n, flags) => {
       const removedBy = { read: [], write: [] };
-      const tools = await mod.i({ config: cfg, agentId, sessionKey: `agent:${agentId}:whatsapp:direct:${n}`, workspaceDir: ws,
-        messageProvider: "whatsapp", messageChannel: "whatsapp", chatType: "direct", ...flags }, undefined, (e) => {
+      const tools = await mod.n({ config: cfg, agentId, sessionKey: `agent:${agentId}:whatsapp:direct:${n}`, workspaceDir: ws,
+        messageProvider: "whatsapp", messageChannel: "whatsapp", chatType: "direct", unverifiedExecutionPolicy: true, ...flags }, undefined, (e) => {
         for (const t of ["read", "write"]) if (e.before.some((x) => x.name === t) && !e.after.some((x) => x.name === t)) removedBy[t].push(label(e.step?.label));
       });
       const names = new Set(tools.map((t) => t.name));

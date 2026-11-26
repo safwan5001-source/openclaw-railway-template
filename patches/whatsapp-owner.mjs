@@ -1,9 +1,9 @@
-// Shared, side-effect-free mirror of how OpenClaw 2026.10.9 turns a commands.ownerAllowFrom entry into a WhatsApp owner.
+// Shared, side-effect-free mirror of how OpenClaw 2026.11.10 turns a commands.ownerAllowFrom entry into a WhatsApp owner.
 // Used by owner-check.mjs and memory-flush-doctor.mjs so the two diagnostics can never disagree about who the owner is.
 //
-// Upstream path (verified against the real dist + @openclaw/whatsapp@2026.10.9, see whatsapp-owner.test.mjs):
-//   isConfiguredCommandOwner()                    command-auth-BHrKDij6.mjs:471
-//     resolveOwnerAllowFromList()                 :312  drops other-channel prefixes, strips ONE "whatsapp:" prefix,
+// Upstream path (verified against the real dist + @openclaw/whatsapp@2026.11.10, see whatsapp-owner.test.mjs):
+//   isConfiguredCommandOwner()                    command-auth-Ch_q0NQN.mjs
+//     resolveOwnerAllowFromList()                       drops other-channel prefixes, strips ONE "whatsapp:" prefix,
 //                                                       drops "<channel>:user:<id>" for WhatsApp
 //     plugin.config.formatAllowFrom()             @openclaw/whatsapp normalizeWhatsAppAllowFromEntries
 //       normalizeWhatsAppTarget()                 strips repeated "whatsapp:", accepts user JIDs (@s.whatsapp.net,

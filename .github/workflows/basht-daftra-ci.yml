@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['24', '26']          # OpenClaw 2026.10.9 supports >=24.22.1 <25 || >=26.12.1; production image is Node 26
+        node: ['24', '26']          # OpenClaw 2026.11.10 supports >=24.16.0 <25 || >=26.1.0; production image is Node 26
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -56,8 +56,12 @@ jobs:
         run: node --version
       - name: Install wrapper dependencies with locked production versions
         run: npx -y pnpm@11.24.0 install --frozen-lockfile --prod
-      - name: Node tests (wrapper + Daftra skill, offline fakes only)
-        run: node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
+      - name: Node tests (wrapper + Daftra skill, offline fakes only; backup tests run in the next step)
+        run: node --test $(ls src/*.test.mjs | grep -vE '^src/backup(-r2)?\.test\.mjs$') skills/basht-daftra/scripts/*.test.mjs
+      # The backup writer guard fails closed on any same-user process it cannot inspect, which a shared runner does not
+      # allow; the guard is unchanged, the tests run where /proc inspection is possible (CAP_SYS_PTRACE, repo read-only).
+      - name: Backup tests (encrypted archive, writer guard, R2 readback) in a container with process inspection
+        run: bash scripts/run-backup-tests.sh ${{ matrix.node }}
       - name: Skill frontmatter is valid and self-contained
         run: |
           node -e "
@@ -118,7 +122,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/oc" && cd "$RUNNER_TEMP/oc"
           npm init -y >/dev/null
-          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.11.10
           node node_modules/openclaw/openclaw.mjs --version
       - name: Skill is discovered as a workspace skill; eligible only when DAFTRA_* env is present
         run: bash scripts/verify-skill-eligibility.sh "$RUNNER_TEMP/oc"
