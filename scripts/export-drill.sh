@@ -11,7 +11,7 @@ pass=0; fail=0; chk() { if eval "$2"; then echo "PASS  $1"; pass=$((pass+1)); el
 health() { for _ in $(seq 1 "${2:-90}"); do curl -s http://127.0.0.1:$P/setup/healthz | grep -q "\"gatewayReachable\":$1" && return 0; sleep 2; done; return 1; }
 up() { docker run -d --name "$1" -p $P:8080 -v "$2":/data -e SETUP_PASSWORD=$PW -e OPENCLAW_STATE_DIR=/data/.openclaw -e OPENCLAW_WORKSPACE_DIR=/data/workspace "$IMG" >/dev/null; }
 mem() { docker stats --no-stream --format '{{.MemUsage}}' "$1" | awk '{v=$1; u=v; gsub(/[0-9.]/,"",u); gsub(/[^0-9.]/,"",v); m=(u=="GiB")?v*1024:(u=="KiB")?v/1024:v; printf "%d", m}'; }
-manifest() { docker exec "$1" bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path workspace/skills \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
+manifest() { docker exec "$1" bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path workspace/skills \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.sqlite.seal" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
 docker rm -f exA exB >/dev/null 2>&1; docker volume rm -f ex-a ex-b >/dev/null 2>&1
 
 up exA ex-a; sleep 10
