@@ -50,6 +50,12 @@ RUN npm install -g \
 # Pinned (was @latest): a rebuild must produce the same tool the previous build had. Bump deliberately.
 RUN npm install -g clawhub@0.27.0
 
+# Official Claude Code CLI, installed in the image rather than the persistent disk.
+RUN npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@2.1.332 \
+  && claude --version | grep -Eq '^2\.1\.332( |$)' \
+  && npm cache clean --force
+ENV CLAUDE_CONFIG_DIR=/data/claude
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
@@ -79,6 +85,14 @@ RUN useradd -m -s /bin/bash openclaw \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
 USER openclaw
+# Smoke test as the same unprivileged user that runs the Gateway; no login or network request.
+RUN set -eu; \
+    cfg="$(mktemp -d)"; \
+    trap 'rm -rf "$cfg"' EXIT; \
+    CLAUDE_CONFIG_DIR="$cfg" claude --version | grep -Eq '^2\.1\.332( |$)'; \
+    CLAUDE_CONFIG_DIR="$cfg" claude auth --help >/dev/null; \
+    test "$(id -un)" = openclaw
+
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"

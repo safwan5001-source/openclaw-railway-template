@@ -4,6 +4,14 @@ set -e
 chown -R openclaw:openclaw /data
 chmod 700 /data
 
+# Persistent Claude configuration; never follow a pre-existing symlink.
+if [ ! -L /data/claude ] && install -d -m 700 -o openclaw -g openclaw /data/claude; then
+  export CLAUDE_CONFIG_DIR=/data/claude
+else
+  echo '[entrypoint] Claude configuration directory unavailable; Claude login must not be attempted' >&2
+  unset CLAUDE_CONFIG_DIR
+fi
+
 # Homebrew lives on the volume so agent-installed packages survive redeploys. The copy is staged and renamed into
 # place, so a failed copy (e.g. a full volume) never leaves a half tree that later boots would trust, and it never
 # stops the service: this boot then keeps using the image's Homebrew and the next boot retries.
