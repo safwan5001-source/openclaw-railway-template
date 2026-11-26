@@ -23,6 +23,8 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerBackupRoute } from "./backup.js";
+import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
+import { restrictToOwner } from "./private-permissions.js";
 import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
@@ -337,7 +339,10 @@ function waitForChildExit(proc, timeoutMs) {
   });
 }
 
-async function stopGatewayProcess() {
+// graceMs: how long the Gateway gets after SIGTERM before SIGKILL. A Gateway that is killed leaves its state owner lease
+// behind; OpenClaw 2026.11.10 only recovers that automatically inside the same container/PID namespace, so a container
+// shutdown (gracefulShutdown) allows far longer than the 2 s used when we merely pause and restart it ourselves.
+async function stopGatewayProcess({ graceMs = 2000 } = {}) {
   const proc = gatewayProc;
   if (!proc) return;
 
@@ -345,7 +350,7 @@ async function stopGatewayProcess() {
   try {
     if (!hasChildExited(proc)) {
       proc.kill("SIGTERM");
-      if (!(await waitForChildExit(proc, 2000))) {
+      if (!(await waitForChildExit(proc, graceMs))) {
         log.warn("gateway", "did not stop after SIGTERM; sending SIGKILL");
         proc.kill("SIGKILL");
         if (!(await waitForChildExit(proc, 2000))) {
@@ -527,6 +532,26 @@ async function startGateway() {
   });
 }
 
+// OPT-IN (BASHT_RECOVER_STALE_GATEWAY_LOCK=1). A Gateway that was killed (container SIGKILL, OOM, a deploy with no draining
+// time) leaves its state owner lease; a replacement container has another hostname/PID namespace, so OpenClaw 2026.11.10
+// refuses to reclaim it on its own and the Gateway (and every CLI call below) waits and then fails. With this flag the
+// wrapper clears such a lease once per boot, before it starts or configures anything, using OpenClaw's own
+// `gateway recover-lock` (it refuses a locally live holder and any record that changed). Only enable it where a single
+// container owns the volume (Railway volumes attach to one deployment at a time); it overrides OpenClaw's protection
+// against two Gateways sharing state. Default off. See docs/BACKUP.md.
+let staleLockRecoveryDone = false;
+async function recoverStaleGatewayLockOnBoot() {
+  if (staleLockRecoveryDone || process.env.BASHT_RECOVER_STALE_GATEWAY_LOCK !== "1") return;
+  staleLockRecoveryDone = true;
+  try {
+    const lock = await recoverRestoredGatewayLock((args) => runCmd(OPENCLAW_NODE, clawArgs(args)));
+    if (lock.recovered) log.warn("gateway", `cleared ${lock.holders} stale gateway owner record(s) left by a previous container`);
+    else if (lock.holders) log.warn("gateway", `stale gateway owner record(s) kept: ${lock.reason}`);
+  } catch (err) {
+    log.warn("gateway", `stale gateway owner recovery skipped: ${err.message}`);
+  }
+}
+
 async function ensureGatewayRunning() {
   if (gatewayPausedFor) throw new Error(`Gateway is paused for ${gatewayPausedFor}`);
   if (!isConfigured()) return { ok: false, reason: "not configured" };
@@ -537,6 +562,7 @@ async function ensureGatewayRunning() {
   }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
+      await recoverStaleGatewayLockOnBoot();
       await syncTrustedProxies();
       await syncAllowedOrigins();
       try {
@@ -1691,6 +1717,11 @@ app.post(
         validReplacements.push(r);
       }
 
+      // The state tree must be private to this user (OpenClaw 2026.11.10 refuses to start on a group/other-readable
+      // client credential directory, and an import ZIP has no directory modes). Only ever removes access. Done before
+      // the gateway is stopped so a failure costs no downtime.
+      if (validReplacements.some((r) => r.target === stateAbs)) restrictToOwner(path.join(tmpExtract, stateRel));
+
       // Now that the archive is fully extracted and validated, take down the
       // gateway. From here through the rename swap, downtime is unavoidable.
       // Hold the maintenance lock for the whole swap (also when the gateway was not running).
@@ -1713,6 +1744,19 @@ app.post(
       backups.length = 0;
 
       log.info("import", `restored ${uploaded} bytes from archive`);
+      // A live export carries the Gateway owner lease of the instance it was copied from; OpenClaw 2026.11.10 never reclaims
+      // such an unverifiable owner by itself. Our Gateway is stopped (maintenance lock), so a lease still present is the
+      // source's, not ours: clear it with OpenClaw's own recover-lock (see src/gateway-lock-recovery.js).
+      // Set BASHT_IMPORT_KEEP_FOREIGN_LOCK=1 to skip this and recover manually instead. Never blocks the import.
+      if (process.env.BASHT_IMPORT_KEEP_FOREIGN_LOCK !== "1") {
+        try {
+          const lock = await recoverRestoredGatewayLock((args) => runCmd(OPENCLAW_NODE, clawArgs(args)));
+          if (lock.recovered) log.info("import", `cleared ${lock.holders} gateway owner record(s) carried by the archive`);
+          else if (lock.holders) log.warn("import", `gateway owner record(s) from the archive kept: ${lock.reason}`);
+        } catch (err) {
+          log.warn("import", `gateway owner recovery skipped: ${err.message}`);
+        }
+      }
       gatewayWasStopped = false;
       await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });
@@ -1979,7 +2023,7 @@ async function gracefulShutdown(signal) {
   server.close();
 
   try {
-    await stopGatewayProcess();
+    await stopGatewayProcess({ graceMs: 25_000 });
   } catch (err) {
     log.warn("wrapper", `error stopping gateway: ${err.message}`);
   }

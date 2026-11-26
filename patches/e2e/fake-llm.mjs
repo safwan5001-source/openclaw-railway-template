@@ -14,7 +14,10 @@ function classify(body) {
   const last = msgs.at(-1);
   if (/Pre-compaction memory flush/.test(text(lastUser)) || /Pre-compaction memory flush turn/.test(all) && !body.tools?.some((t) => t.function?.name === "exec")) return { phase: "flush", last, lastUser, all };
   if (!body.tools?.length && /summar/i.test(all)) return { phase: "compaction", last, lastUser, all };
-  if (/RECALL/.test(text(lastUser))) return { phase: "recall", last, lastUser, all };
+  // OpenClaw 2026.11.10 appends its "runtime context" block as a separate trailing user message, so the prompt itself
+  // is one of the last two user messages, not necessarily the very last.
+  const recentUsers = msgs.filter((m) => m.role === "user").slice(-2);
+  if (recentUsers.some((m) => /RECALL/.test(text(m)))) return { phase: "recall", last, lastUser, all };
   return { phase: "chat", last, lastUser, all };
 }
 function respond(res, body, reply, usagePrompt) {

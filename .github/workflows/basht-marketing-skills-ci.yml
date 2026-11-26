@@ -40,6 +40,6 @@ jobs:
         with:
           node-version: '26'
       - name: Install exact production OpenClaw version (isolated runner)
-        run: npm install --global --allow-scripts=openclaw openclaw@2026.10.9
+        run: npm install --global --allow-scripts=openclaw openclaw@2026.11.10
       - name: Verify ten skills discovered without Gateway or production credentials
         run: bash scripts/marketing-openclaw-compat.sh

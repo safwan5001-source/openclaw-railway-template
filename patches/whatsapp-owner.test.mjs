@@ -1,7 +1,7 @@
 // Parity tests for patches/whatsapp-owner.mjs (the owner normaliser shared by owner-check.mjs and the doctor).
 //   node --test patches/whatsapp-owner.test.mjs
-// The parity test runs against the REAL OpenClaw rule — isConfiguredCommandOwner() from openclaw@2026.10.9 with the
-// real @openclaw/whatsapp@2026.10.9 channel plugin registered in-process — when OPENCLAW_PACKAGE_ROOT points at an
+// The parity test runs against the REAL OpenClaw rule — isConfiguredCommandOwner() from openclaw@2026.11.10 with the
+// real @openclaw/whatsapp@2026.11.10 channel plugin registered in-process — when OPENCLAW_PACKAGE_ROOT points at an
 // install that has @openclaw/whatsapp next to it. Synthetic numbers only; nothing is written.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -12,7 +12,7 @@ import { classifyOwnerEntry, normalizeWhatsAppSender, whatsAppOwnersFrom } from 
 
 const OWNER = "+15550001234";      // synthetic
 const D = OWNER.slice(1);
-// [entry, is the synthetic OWNER per OpenClaw 2026.10.9]
+// [entry, is the synthetic OWNER per OpenClaw 2026.11.10]
 const CORPUS = [
   [`whatsapp:${OWNER}`, true], [`whatsapp:${D}`, true], [OWNER, true], [D, true], ["WhatsApp:+15550001234", true],
   ["whatsapp:+1 555-000-1234", true], ["+1 (555) 000-1234", true], [`${D}@s.whatsapp.net`, true], [`${D}:7@s.whatsapp.net`, true],
@@ -36,8 +36,8 @@ test("normaliser: corpus of owner entry forms", () => {
 });
 
 const PKG = process.env.OPENCLAW_PACKAGE_ROOT;
-const WA = PKG && path.join(PKG, "..", "@openclaw", "whatsapp", "dist", ".setup", "channel-D-6ZIq4y.mjs");
-const real = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.10.9" : !fs.existsSync(WA) ? "install @openclaw/whatsapp@2026.10.9 next to openclaw" : false };
+const WA = PKG && path.join(PKG, "..", "@openclaw", "whatsapp", "dist", ".setup", "channel-zYMabwp9.mjs");
+const real = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.11.10" : !fs.existsSync(WA) ? "install @openclaw/whatsapp@2026.11.10 next to openclaw" : false };
 
 test("parity: the shared normaliser decides exactly like OpenClaw's isConfiguredCommandOwner with the real WhatsApp plugin", real, async () => {
   const wa = await import(pathToFileURL(WA).href);
@@ -46,7 +46,7 @@ test("parity: the shared normaliser decides exactly like OpenClaw's isConfigured
   const previous = globalThis[key];
   globalThis[key] = { activeRegistry: { channels: [{ plugin: wa.t }] }, activeVersion: Date.now() };
   try {
-    const auth = await import(pathToFileURL(path.join(PKG, "dist/command-auth-BHrKDij6.mjs")).href);
+    const auth = await import(pathToFileURL(path.join(PKG, "dist/command-auth-Ch_q0NQN.mjs")).href);
     for (const [entry] of CORPUS) {
       const upstream = auth.t({ commands: { ownerAllowFrom: [entry] } }, { channel: "whatsapp", senderId: OWNER, accountId: "default" });
       const ours = whatsAppOwnersFrom([entry]).includes(OWNER);

@@ -40,7 +40,18 @@ if [ ! -d node_modules/express ] || [ ! -d node_modules/http-proxy ]; then
 fi
 
 step "syntax: src/server.js" node -c src/server.js
-step "unit + integration: wrapper (src) and basht-daftra skill" node --test src/*.test.mjs skills/basht-daftra/scripts/*.test.mjs
+# The encrypted-backup tests need to inspect every process of the user (the residual-writer guard fails closed on one it
+# cannot read), which a shared runner or sandbox does not allow: they run in a container with CAP_SYS_PTRACE below.
+WRAPPER_TESTS=()
+for f in src/*.test.mjs; do
+  case "$f" in src/backup.test.mjs|src/backup-r2.test.mjs) ;; *) WRAPPER_TESTS+=("$f") ;; esac
+done
+step "unit + integration: wrapper (src, backup tests below) and basht-daftra skill" node --test "${WRAPPER_TESTS[@]}" skills/basht-daftra/scripts/*.test.mjs
+if docker info >/dev/null 2>&1; then
+  step "backup: encrypted archive, writer guard and R2 readback (container with process inspection)" bash scripts/run-backup-tests.sh
+else
+  skip "backup tests (src/backup*.test.mjs)" "need a Docker daemon for process inspection: run in GitHub Actions or 'bash scripts/run-backup-tests.sh'"
+fi
 step "packaging + security invariants" node --test scripts/check-dockerfiles.mjs scripts/test-entrypoint.mjs scripts/check-security-invariants.mjs
 step "marketing installer: synthetic safety and idempotence" node --test scripts/test-marketing-installer.mjs
 

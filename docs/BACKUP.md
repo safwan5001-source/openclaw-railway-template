@@ -160,7 +160,20 @@ Delete `restore.tar.gz` / `restore.zip` afterwards (they are plaintext).
 
 - `src/backup.test.mjs`: round trip; wrong key / flipped byte / truncation refused with no output; route auth, CSRF,
   exclusions, no plaintext in the file, no files on the volume, gateway back up; the restore ZIP satisfies the import's
-  exact entry rules.
+  exact entry rules. The route refuses to snapshot while a same-user process still holds a writable descriptor or shared
+  mapping under the data roots, and fails closed on a process it cannot inspect, so these tests run through
+  `bash scripts/run-backup-tests.sh` (a Node container with `CAP_SYS_PTRACE`, repository mounted read-only) in CI instead of
+  directly on a shared runner. The guard is not changed or skipped for tests.
+- `src/private-permissions.test.mjs`: `/setup/api/import` makes the restored state tree private to the service user
+  (directories `0700`, group/other bits removed from files, nothing widened, symlinks never followed). OpenClaw 2026.11.10
+  refuses to start on a group/other-readable `.openclaw/client` directory, and an import ZIP carries no directory modes.
+- `src/gateway-lock-recovery.test.mjs`: a restored archive from a *live* export (`/setup/api/export`) carries the Gateway
+  owner lease of the instance it was copied from. OpenClaw 2026.11.10 never reclaims an owner it cannot verify (another
+  container/PID namespace), so the restored Gateway would wait and fail. After the swap, while the local Gateway is stopped
+  under the maintenance lock, `/setup/api/import` runs OpenClaw's own `openclaw gateway recover-lock --json` and then
+  `--confirm <fingerprint>` with the fingerprint of that same inspection (it refuses a locally live holder and any record
+  that changed in between). Backups made by `/setup/api/backup` stop the Gateway first and carry no lease. Failures are
+  logged and never block the import; set `BASHT_IMPORT_KEEP_FOREIGN_LOCK=1` to skip this step and run `recover-lock` by hand.
 - `scripts/restore-drill.sh <image>` (real image + real gateway, synthetic data): backup from a running instance →
   container **and volume destroyed** → fresh container on an **empty** volume → import → 17/17 protected files
   byte-identical, SQLite `integrity_check` ok, gateway healthy, files owned by `openclaw`. Run it quarterly.

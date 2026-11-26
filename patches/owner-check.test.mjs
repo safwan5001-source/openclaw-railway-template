@@ -1,5 +1,5 @@
 // Tests for patches/owner-check.mjs with SYNTHETIC state only (no production data, no network).
-//   OPENCLAW_PACKAGE_ROOT=<installed openclaw@2026.10.9> node --test patches/owner-check.test.mjs
+//   OPENCLAW_PACKAGE_ROOT=<installed openclaw@2026.11.10> node --test patches/owner-check.test.mjs
 // Every run asserts: exactly one output line, empty stderr, no 7+ digit run, no synthetic secret, and a byte-identical
 // filesystem (state dir, workspace, HOME, /tmp entries) before vs after. The checker refuses root, so when the test
 // itself runs as root it executes the checker as an unprivileged user via runuser (skips if that is impossible).
@@ -23,8 +23,8 @@ const RUN_AS = process.env.OWNER_CHECK_TEST_USER || "nobody";
 // As root, the checker runs as RUN_AS, which must be able to execute node, read the checker and read the OpenClaw install.
 const canDrop = !isRoot || (PKG && spawnSync("runuser", ["-u", RUN_AS, "--", process.execPath, "-e",
   "const fs=require('fs');for(const f of process.argv.slice(1))fs.accessSync(f,fs.constants.R_OK)", CHECK, path.join(PKG, "package.json"),
-  path.join(PKG, "dist", "agent-tools-Bpi7xWYy.mjs")]).status === 0);
-const integration = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.10.9" : !canDrop ? `running as root and '${RUN_AS}' cannot run node or read the OpenClaw install` : false };
+  path.join(PKG, "dist", "agent-tools.async-Cu9hozum.mjs")]).status === 0);
+const integration = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.11.10" : !canDrop ? `running as root and '${RUN_AS}' cannot run node or read the OpenClaw install` : false };
 
 const BASE_CONFIG = {
   gateway: { auth: { token: SECRETS[1] } },
@@ -184,7 +184,7 @@ test("fails closed on unreadable config and on a different OpenClaw version", in
     if (isRoot) spawnSync("chown", ["-R", `${RUN_AS}:`, fake]);
     const { status, out } = runCheck(st, { pkg: fake });
     assert.equal(status, 3);
-    assert.match(out.VERDICT, /^REFUSED: expected OpenClaw 2026\.10\.9/);
+    assert.match(out.VERDICT, /^REFUSED: expected OpenClaw 2026\.11\.10/);
     fs.rmSync(fake, { recursive: true, force: true });
   } finally { cleanup(st); }
 });
@@ -269,7 +269,7 @@ test("F7: secrets in tools/agents sections stay in the parent (only policy field
   assert.match(src, /OPENCLAW_LOG_LEVEL: "silent"/, "child logging silenced (F1)");
 });
 
-test("R1: every owner form OpenClaw 2026.10.9 accepts is READY — incl. the 'whatsapp:<digits>' form without '+'", integration, () => {
+test("R1: every owner form OpenClaw 2026.11.10 accepts is READY — incl. the 'whatsapp:<digits>' form without '+'", integration, () => {
   const digits = OWNER.slice(1);
   for (const entry of [`whatsapp:${digits}`, digits, `whatsapp:+${digits.slice(0, 1)} ${digits.slice(1, 4)}-${digits.slice(4)}`, `${digits}@s.whatsapp.net`, `whatsapp:whatsapp:${OWNER}`]) {
     const st = makeState({ config: { ...BASE_CONFIG, commands: { ownerAllowFrom: [entry] } } });

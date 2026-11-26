@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end proof for the BASHT memory-flush owner-identity patch on the REAL OpenClaw 2026.10.9 runtime.
+# End-to-end proof for the BASHT memory-flush owner-identity patch on the REAL OpenClaw 2026.11.10 runtime.
 #
 #   bash patches/e2e/memory-flush-e2e.sh [workdir]
 #
@@ -17,7 +17,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 WORK=${1:-$(mktemp -d)}
 OWNER=+15550001234
 IMPOSTOR=+19990001111
-VERSION=2026.10.9
+VERSION=2026.11.10
 mkdir -p "$WORK"
 echo "[e2e] workdir $WORK"
 
@@ -27,7 +27,7 @@ fi
 rm -rf "$WORK/patched" && cp -a "$WORK/base" "$WORK/patched"
 node "$REPO/patches/openclaw-memory-flush-owner.mjs" "$WORK/patched/node_modules/openclaw"
 for d in base patched; do
-  f="$WORK/$d/node_modules/openclaw/dist/agent-command-B2Fr8yPI.mjs"
+  f="$WORK/$d/node_modules/openclaw/dist/agent-command-DCE2yuWI.mjs"
   grep -q bashtE2eOrigCreateCommandMaintenanceFollowup "$f" || node "$HERE/instrument-cli-owner-run.mjs" "$f"
 done
 
@@ -80,7 +80,10 @@ check() { # label expect_write expect_recall
   tools=$(grep '"phase":"flush"' "$r/llm.jsonl" | head -1 | sed 's/.*"tools":\(\[[^]]*\]\).*/\1/')
   file=$(cat "$r/ws/memory/$DATE.md" 2>/dev/null || true)
   recall=$(grep -ao 'RECALLED: [A-Z0-9-]*' "$r/agent.out" | head -1 || true)
-  local compacted; compacted=$(grep -ac 'outcome=compacted' "$r/agent.out" || true)
+  # Compaction is proven by the summarisation requests the fake model received (OpenClaw 2026.11.10 no longer logs
+  # "outcome=compacted"); the post-compaction transcript must also carry a compactionSummary entry.
+  local compacted; compacted=$(grep -ac '"phase":"compaction"' "$r/llm.jsonl" || true)
+  grep -aq 'compactionSummary' "$r/agent.out" || compacted=0
   local ok=1
   if [ "$2" = yes ]; then [ "$tools" = '["read","write"]' ] && [[ "$file" == *ZEBRA-4417* ]] && [ "$recall" = "RECALLED: ZEBRA-4417" ] || ok=0
   else [ "$tools" = '["read"]' ] && [[ "$file" != *ZEBRA-4417* ]] || ok=0; fi

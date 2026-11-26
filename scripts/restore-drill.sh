@@ -13,8 +13,12 @@ pass=0; fail=0; chk() { if eval "$2"; then echo "PASS  $1"; pass=$((pass+1)); el
 health() { for i in $(seq 1 ${2:-90}); do curl -s http://127.0.0.1:$P/setup/healthz | grep -q "\"gatewayReachable\":$1" && return 0; sleep 2; done; return 1; }
 up() { docker run -d --name $1 -p $P:8080 -v $2:/data -e SETUP_PASSWORD=$PW -e RAILWAY_PUBLIC_DOMAIN=drill.example \
   -e OPENCLAW_STATE_DIR=/data/.openclaw -e OPENCLAW_WORKSPACE_DIR=/data/workspace -e BASHT_BACKUP_PUBLIC_KEY="$(cat $D/keys/basht-backup-public.pem)" "$IMG" >/dev/null; }
-# hashes of everything the backup promises to carry (WAL/SHM/locks excluded: SQLite and the gateway rewrite them at start; integrity is checked instead)
-manifest() { docker exec $1 bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path .openclaw/media/playback-transcode -o -path workspace/skills/basht-daftra -o -path workspace/skills/basht-accounting \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
+# hashes of everything the backup promises to carry (WAL/SHM/locks excluded: SQLite and the gateway rewrite them at start; integrity is checked instead.
+# OpenClaw 2026.11.10 keeps an integrity seal next to every SQLite database (<db>.sqlite.seal), derived from the database
+# and rewritten whenever it changes, so it is excluded with the database it seals; the database's integrity_check still runs below.
+# openclaw.json.last-good is a snapshot OpenClaw writes asynchronously once the gateway has been healthy for a while (a timing race
+# between the two instances); openclaw.json itself is still compared byte for byte.)
+manifest() { docker exec $1 bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path .openclaw/media/playback-transcode -o -path workspace/skills/basht-daftra -o -path workspace/skills/basht-accounting \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.sqlite.seal" ! -name "*.last-good" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
 docker rm -f drillA drillB >/dev/null 2>&1; docker volume rm -f drill-a drill-b >/dev/null 2>&1
 
 $TOOL keygen $D/keys >/dev/null || exit 1
@@ -93,7 +97,15 @@ R=$(curl -s -w ' HTTP%{http_code}' -X POST -H "Authorization: Basic $B" -H "Orig
   -H "X-Archive-Password: $(printf %s "$BASHT_IMPORT_PASSWORD" | base64)" --data-binary @$D/restore.zip http://127.0.0.1:$P/setup/api/import)
 chk "B: /setup Import accepted the restore archive" 'echo "$R" | grep -q "\"ok\":true.*HTTP200"'
 chk "B: configured and real gateway reachable after restore" 'health true 120'
+# A failed restore is only diagnosable from what the wrapper/gateway said: print the import response and the tail of the
+# container log (synthetic data only; lines mentioning token/password/secret are dropped before printing).
+if ! echo "$R" | grep -q '"ok":true.*HTTP200' || ! curl -s http://127.0.0.1:$P/setup/healthz | grep -q '"gatewayReachable":true'; then
+  echo "      import response: $(printf '%s' "$R" | head -c 600)"
+  echo "      drillB container log tail (filtered):"
+  docker logs drillB 2>&1 | grep -viE 'token|password|secret' | tail -80 | cut -c1-300 | sed 's/^/        /'
+fi
 manifest drillB > $D/after.sha
+diff $D/before.sha $D/after.sha > $D/manifest.diff 2>&1 || { echo "      differing protected files (path and sha256 only):"; head -40 $D/manifest.diff | sed 's/^/        /'; }
 chk "B: every protected file is byte-identical ($(wc -l < $D/before.sha) files: config, WhatsApp session, memory, exports, plugins)" 'diff -q $D/before.sha $D/after.sha >/dev/null'
 for db in $(docker exec drillB bash -c 'cd /data && find .openclaw -name "*.sqlite" ! -path "*/tmp/*"'); do
   chk "B: SQLite integrity ok: $db" '[ "$(docker exec -u openclaw drillB node -e "const {DatabaseSync}=require(\"node:sqlite\");const d=new DatabaseSync(\"/data/$db\",{readOnly:true});console.log(d.prepare(\"PRAGMA integrity_check\").get().integrity_check)" 2>/dev/null)" = ok ]'

@@ -53,7 +53,9 @@ run -e DIAG_STORAGE=0
 chk "DIAG_STORAGE=0: gateway healthy" 'wait_gw'
 sleep 100   # past the 90 s first-scan delay
 chk "DIAG_STORAGE=0: no [storage-diag] line" '[ "$(logs | grep -c "storage-diag")" = 0 ]'
-docker rm -f $N >/dev/null
+# The next run reuses this volume. Stop the container the way a drained deploy does (SIGTERM, time to exit): a killed Gateway
+# leaves its owner lease, which a replacement container (other hostname/PID namespace) cannot reclaim in OpenClaw 2026.11.10.
+docker stop -t 60 $N >/dev/null; docker rm -f $N >/dev/null
 
 # ---- 2. DIAG_STORAGE=1
 # Since #38 the heartbeat starts only after the boot-time `openclaw doctor --fix` and gateway start, so its first-scan timer
@@ -93,7 +95,7 @@ echo "healthz latency from baseline until the scan finished (s): $(cut -d" " -f2
 echo "container CPU/RAM samples (min/max): $(awk '{gsub("%","",$1); v=$1+0; if(NR==1||v<min)min=v; if(v>max)max=v; m=$2} END {printf "cpu %.1f%%..%.1f%% (n=%d), mem(last) %s", min, max, NR, m}' "$STATS")"
 echo "storage-diag lines total: $(logs | grep -c storage-diag)"
 rm -f "$LAT" "$STATS"
-docker rm -f $N >/dev/null
+docker stop -t 60 $N >/dev/null; docker rm -f $N >/dev/null
 
 # ---- 3. DIAG_STORAGE_ROOT inside a protected tree (regression: protection used to be lost when the root was narrowed)
 run -e DIAG_STORAGE=1 -e DIAG_STORAGE_ROOT=/data/workspace/memory

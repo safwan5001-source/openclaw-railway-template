@@ -11,7 +11,7 @@ pass=0; fail=0; chk() { if eval "$2"; then echo "PASS  $1"; pass=$((pass+1)); el
 health() { for _ in $(seq 1 "${2:-90}"); do curl -s http://127.0.0.1:$P/setup/healthz | grep -q "\"gatewayReachable\":$1" && return 0; sleep 2; done; return 1; }
 up() { docker run -d --name "$1" -p $P:8080 -v "$2":/data -e SETUP_PASSWORD=$PW -e OPENCLAW_STATE_DIR=/data/.openclaw -e OPENCLAW_WORKSPACE_DIR=/data/workspace "$IMG" >/dev/null; }
 mem() { docker stats --no-stream --format '{{.MemUsage}}' "$1" | awk '{v=$1; u=v; gsub(/[0-9.]/,"",u); gsub(/[^0-9.]/,"",v); m=(u=="GiB")?v*1024:(u=="KiB")?v/1024:v; printf "%d", m}'; }
-manifest() { docker exec "$1" bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path workspace/skills \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
+manifest() { docker exec "$1" bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path workspace/skills \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.sqlite.seal" ! -name "*.last-good" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
 docker rm -f exA exB >/dev/null 2>&1; docker volume rm -f ex-a ex-b >/dev/null 2>&1
 
 up exA ex-a; sleep 10
@@ -53,6 +53,13 @@ touch "$D/done2"; sleep 2
 echo "      import: $(echo "$R" | grep -o 'HTTP[0-9]*') of $(stat -c %s "$D/export.zip") bytes, container memory peak $(cat "$D/peak2" 2>/dev/null) MiB"
 chk "B: import of the large archive accepted" 'echo "$R" | grep -q "\"ok\":true.*HTTP200"'
 chk "B: gateway reachable after restore" 'health true 120'
+# A failed restore is only diagnosable from what the wrapper/gateway said: print the import response and the tail of the
+# container log (synthetic data only; lines mentioning token/password/secret are dropped before printing).
+if ! echo "$R" | grep -q '"ok":true.*HTTP200' || ! curl -s http://127.0.0.1:$P/setup/healthz | grep -q '"gatewayReachable":true'; then
+  echo "      import response: $(printf '%s' "$R" | head -c 600)"
+  echo "      exB container log tail (filtered):"
+  docker logs exB 2>&1 | grep -viE 'token|password|secret' | tail -80 | cut -c1-300 | sed 's/^/        /'
+fi
 manifest exB > "$D/after.sha"
 chk "B: all $(wc -l < "$D/before.sha") protected files byte-identical" 'diff -q <(awk "{print \$2, \$1}" "$D/before.sha" | grep -v plugin-skills | sort) <(awk "{print \$2, \$1}" "$D/after.sha" | grep -v plugin-skills | sort) >/dev/null'
 echo "RESULT pass=$pass fail=$fail"; [ "$fail" = 0 ]

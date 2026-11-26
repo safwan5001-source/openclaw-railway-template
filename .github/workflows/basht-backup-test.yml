@@ -1,7 +1,7 @@
 name: BASHT backup test
 on:
   push:
-    branches: ['backup/r2-pre-upgrade']
+    branches: ['backup/r2-pre-upgrade', 'upgrade/openclaw-2026.11.10']
 permissions:
   contents: read
 jobs:
@@ -13,11 +13,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
+      - name: Install wrapper dependencies with locked production versions
+        run: npx -y pnpm@11.24.0 install --frozen-lockfile --prod
       - name: Test integrated backup guards and R2 readback
         run: |
           node --check src/backup.js
           node --check src/backup-r2.js
-          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/app:ro" -w /app node:26-bookworm node --test src/backup-r2.test.mjs
+          # Both backup test files, in a container where the residual-writer guard can inspect every process.
+          bash scripts/run-backup-tests.sh 26
       - name: Test backup with mock storage and synthetic data
         shell: bash
         run: |
@@ -53,5 +56,5 @@ jobs:
       - name: Build production image and check installed tools
         run: |
           docker build -t basht-backup-ci .
-          docker run --rm --user openclaw --entrypoint sh basht-backup-ci -ec 'aws --version; openclaw --version | grep -E "^OpenClaw 2026[.]10[.]9( |$)"'
+          docker run --rm --user openclaw --entrypoint sh basht-backup-ci -ec 'aws --version; openclaw --version | grep -E "^OpenClaw 2026[.]11[.]10( |$)"'
           docker run --rm --user openclaw --entrypoint node basht-backup-ci --test /app/src/backup-r2.test.mjs

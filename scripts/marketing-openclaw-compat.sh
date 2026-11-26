@@ -25,7 +25,7 @@ done
 for name in basht-daftra basht-accounting; do
   cp -R "$ROOT/skills/$name" "$TMP/ws/skills/$name"
 done
-if ! openclaw --version | grep -Fq '2026.10.9'; then
+if ! openclaw --version | grep -Fq '2026.11.10'; then
   echo "FAIL: OpenClaw version mismatch" >&2; exit 1
 fi
 for name in "${NAMES[@]}" basht-accounting; do

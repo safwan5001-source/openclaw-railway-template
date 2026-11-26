@@ -13,7 +13,7 @@ run() { docker run -d --name $N -p $P:8080 -v ${N}-data:/data -e SETUP_PASSWORD=
 wait_health() { for i in $(seq 1 ${1:-90}); do c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$P/setup/healthz); [ "$c" = 200 ] && return 0; sleep 2; done; return 1; }
 
 # ---- image contents
-chk "openclaw pinned 2026.10.9" '[ "$(docker run --rm --entrypoint openclaw $IMG --version | grep -c "2026.10.9")" = 1 ]'
+chk "openclaw pinned 2026.11.10" '[ "$(docker run --rm --entrypoint openclaw $IMG --version | grep -c "2026.11.10")" = 1 ]'
 chk "clawhub pinned 0.27.0" 'docker run --rm --entrypoint npm $IMG ls -g clawhub 2>/dev/null | grep -q "clawhub@0.27.0"'
 chk "chromium + Arabic Naskh font present" 'docker run --rm --entrypoint bash $IMG -c "command -v chromium && fc-match \"Noto Naskh Arabic\" | grep -qi NotoNaskhArabic" >/dev/null'
 chk "no SETUP_PASSWORD / gateway token baked into image env" '! docker image inspect $IMG --format "{{json .Config.Env}}" | grep -qiE "SETUP_PASSWORD|GATEWAY_TOKEN|DAFTRA_API|APPROVAL"'

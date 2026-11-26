@@ -1,6 +1,6 @@
 // Tests for the BASHT memory-flush owner-identity patch and the read-only doctor.
 //   node --test patches/*.test.mjs
-// Integration block (real OpenClaw 2026.10.9 dist) runs only when OPENCLAW_PACKAGE_ROOT points at an installed
+// Integration block (real OpenClaw 2026.11.10 dist) runs only when OPENCLAW_PACKAGE_ROOT points at an installed
 // openclaw package, e.g. OPENCLAW_PACKAGE_ROOT=$RUNNER_TEMP/oc/node_modules/openclaw. It writes a throwaway copy of
 // the patched module next to the original (removed afterwards) and never touches /data, Railway or WhatsApp.
 import test from "node:test";
@@ -22,21 +22,25 @@ import {
 } from "./openclaw-memory-flush-owner.mjs";
 import { classifyWhatsAppId, combinedVerdict, maskId, normalizeOwnerCandidates, verdict } from "./memory-flush-doctor.mjs";
 
-// Minimal stand-in that contains every anchor exactly once, in upstream order.
+// Minimal stand-in that contains every anchor exactly once, in upstream order. The real 2026.11.10 bundle is a
+// minified single-line module (no tabs, no spaces around operators), so the anchors are matched verbatim.
+const IMPORT_ANCHOR = "const preflightCompactionLog=createSubsystemLogger(";
+const RUN_ANCHOR = "maintenanceRun:P,sourcePolicySessionKey:F}=E;";
+const CTX_ANCHOR = "run:{...P,thinkLevel:o},sessionCtx:{},";
+const EXPORT_ANCHOR = "export{runSessionCompactionIfNeeded as n,runMemoryFlushIfNeeded as t};";
 const FIXTURE = [
-  `import { t as createSessionMaintenanceFollowup } from "./run-C50ZeOtw.mjs";`,
-  `const memoryFlushLog = { debug() {} };`,
-  `async function runMemoryFlushIfNeeded(params) {`,
-  `	const maintenanceRun = createSessionMaintenanceFollowup({`,
-  `		auth: params.followupRun.run`,
-  `	}).run;`,
-  `	const runBaseParams = await buildEmbeddedRunExecutionParams({`,
-  `					sessionCtx: {},`,
-  `	});`,
-  `}`,
-  `export { runSessionCompactionIfNeeded as n, runMemoryFlushIfNeeded as t };`,
+  `import{t as createSubsystemLogger}from"./subsystem-BXrV0rVs.mjs";`,
+  `//!src/auto-reply/reply/agent-runner-memory.ts`,
+  `${IMPORT_ANCHOR}\`auto-reply/preflight-compaction\`);const memoryFlushLog=createSubsystemLogger(\`auto-reply/memory-flush\`);`,
+  `async function runMemoryFlushIfNeeded(e){let E;const{writePath:D,${RUN_ANCHOR}const I=1;`,
+  `const s=await buildEmbeddedRunExecutionParams({${CTX_ANCHOR}hasRepliedRef:void 0});}`,
+  `${EXPORT_ANCHOR}`,
   ``,
 ].join("\n");
+
+// Chunk names of the pinned 2026.11.10 package (checked against the real dist by the integration tests below).
+const AUTH_CHUNK = "dist/command-auth-Ch_q0NQN.mjs"; // h = getCommandOwnerAuthority, t = isConfiguredCommandOwner, p = bindCommandOwnerAuthority
+const TOOLS_CHUNK = "dist/agent-tools.async-Cu9hozum.mjs"; // t = createOpenClawCodingToolsAsync
 
 /**
  * Evaluate the injected helper in isolation. `env` stubs the three OpenClaw functions it imports:
@@ -69,17 +73,21 @@ const flush = (sourceRun, extra = {}) => ({ sourceRun, memoryFlushWritePath: WRI
 test("patchSource: applies four exact edits and is reversible byte-for-byte", () => {
   const patched = patchSource(FIXTURE);
   assert.ok(patched.includes(PATCH_MARKER));
-  assert.ok(patched.includes(`import { d as getCommandOwnerAuthority, t as isConfiguredCommandOwner } from "./command-auth-BHrKDij6.mjs";`));
-  assert.ok(patched.includes(`import { r as getRuntimeConfig } from "./io.runtime-B134MOMz.mjs";`));
-  assert.ok(patched.includes("maintenanceRun.senderIsOwner = true;"));
-  assert.ok(patched.includes("sessionCtx: bashtOwnerFlushIdentity ? bashtOwnerFlushIdentity.currentSessionCtx() : {},"));
-  assert.ok(!patched.includes("\t\t\t\t\tsessionCtx: {},\n"));
+  assert.ok(patched.includes(`import { h as getCommandOwnerAuthority, t as isConfiguredCommandOwner } from "./command-auth-Ch_q0NQN.mjs";`));
+  assert.ok(patched.includes(`import { getRuntimeConfig } from "./io.runtime-euLviN5p.mjs";`));
+  assert.ok(patched.includes("const bashtOwnerFlushIdentity=resolveBashtOwnerMemoryFlushIdentity({sourceRun:e.followupRun.run,memoryFlushWritePath:D,sourceTurnTainted:v?.turnTainted!==false});if(bashtOwnerFlushIdentity)P.senderIsOwner=true;"));
+  assert.ok(patched.includes("run:{...P,thinkLevel:o},sessionCtx:bashtOwnerFlushIdentity?bashtOwnerFlushIdentity.currentSessionCtx():{},"));
+  assert.ok(!patched.includes(CTX_ANCHOR), "the anonymous flush sessionCtx is replaced");
+  assert.ok(patched.indexOf("import { h as getCommandOwnerAuthority") < patched.indexOf(IMPORT_ANCHOR), "imports are inserted before the first module-level statement they precede");
   assert.equal(readOriginalFromPatched(patched), FIXTURE);
 });
 
 test("patchSource: refuses drift (missing anchor, duplicated anchor, double application)", () => {
-  assert.throws(() => patchSource(FIXTURE.replace("sessionCtx: {},", "sessionCtx: ctx,")), /anchor not found \(flush sessionCtx\)/);
-  assert.throws(() => patchSource(FIXTURE.replace("\t\t\t\t\tsessionCtx: {},\n", "\t\t\t\t\tsessionCtx: {},\n\t\t\t\t\tsessionCtx: {},\n")), /anchor not unique/);
+  assert.throws(() => patchSource(FIXTURE.replace("sessionCtx:{},", "sessionCtx:ctx,")), /anchor not found \(flush sessionCtx\)/);
+  assert.throws(() => patchSource(FIXTURE.replace(RUN_ANCHOR, "maintenanceRun:Q,sourcePolicySessionKey:F}=E;")), /anchor not found \(maintenance run\)/);
+  assert.throws(() => patchSource(FIXTURE.replace(EXPORT_ANCHOR, "")), /anchor not found \(export\)/);
+  assert.throws(() => patchSource(FIXTURE.replace(CTX_ANCHOR, CTX_ANCHOR + CTX_ANCHOR)), /anchor not unique \(flush sessionCtx\)/);
+  assert.throws(() => patchSource(FIXTURE.replace(IMPORT_ANCHOR, IMPORT_ANCHOR + IMPORT_ANCHOR)), /anchor not unique \(import\)/);
   assert.throws(() => patchSource(patchSource(FIXTURE)), /already applied/);
 });
 
@@ -155,7 +163,7 @@ test("applyToPackage: refuses another OpenClaw version and an unexpected file ha
     fs.mkdirSync(path.join(dir, "dist"));
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ version: "2026.11.1" }));
     fs.writeFileSync(path.join(dir, TARGET_FILE), FIXTURE);
-    assert.throws(() => applyToPackage(dir, { log: {} }), /expected openclaw 2026\.10\.9, found 2026\.11\.1/);
+    assert.throws(() => applyToPackage(dir, { log: {} }), /expected openclaw 2026\.11\.10, found 2026\.11\.1/);
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ version: OPENCLAW_VERSION }));
     assert.throws(() => applyToPackage(dir, { log: {} }), /hash .* != expected/);
     assert.equal(fs.readFileSync(path.join(dir, TARGET_FILE), "utf8"), FIXTURE, "nothing written on refusal");
@@ -202,7 +210,7 @@ test("doctor: simulation applies the patch's owner gate (channel allowFrom is no
 
 // ---------------------------------------------------------------- integration with the real OpenClaw dist
 const PKG = process.env.OPENCLAW_PACKAGE_ROOT;
-const integration = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.10.9 to run" : false };
+const integration = { skip: !PKG ? "set OPENCLAW_PACKAGE_ROOT to an installed openclaw@2026.11.10 to run" : false };
 
 test("integration: installed target matches the pinned upstream hash (or the verified patched content)", integration, () => {
   const text = fs.readFileSync(path.join(PKG, TARGET_FILE), "utf8");
@@ -225,7 +233,7 @@ test("integration: patched module links against the real OpenClaw chunks", integ
 });
 
 test("integration: real tool policy — owner identity restores the append-only flush writer, impostors gain nothing", integration, async () => {
-  const { i: createTools } = await import(pathToFileURL(path.join(PKG, "dist/agent-tools-Bpi7xWYy.mjs")).href);
+  const { t: createTools } = await import(pathToFileURL(path.join(PKG, TOOLS_CHUNK)).href);
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "basht-flush-ws-"));
   const OWNER = "+15550001234";
   const config = {
@@ -250,7 +258,7 @@ test("integration: real tool policy — owner identity restores the append-only 
 });
 
 test("integration: helper with REAL OpenClaw owner functions — fail closed without configured owner, wildcard never counts", integration, async () => {
-  const auth = await import(pathToFileURL(path.join(PKG, "dist/command-auth-BHrKDij6.mjs")).href);
+  const auth = await import(pathToFileURL(path.join(PKG, AUTH_CHUNK)).href);
   const original = fs.readFileSync(path.join(PKG, TARGET_FILE), "utf8");
   const patched = original.includes(PATCH_MARKER) ? original : patchSource(original);
   const start = patched.indexOf(`//#region ${PATCH_MARKER}`);
@@ -258,16 +266,19 @@ test("integration: helper with REAL OpenClaw owner functions — fail closed wit
   let cfg;
   // eslint-disable-next-line no-new-func
   const resolve = new Function("getCommandOwnerAuthority", "isConfiguredCommandOwner", "getRuntimeConfig", `${body}\nreturn resolveBashtOwnerMemoryFlushIdentity;`)(
-    auth.d, auth.t, () => cfg);
+    auth.h, auth.t, () => cfg);
   const run = { senderIsOwner: true, senderId: "+15550001234", senderE164: "+15550001234", messageProvider: "whatsapp", agentAccountId: "default" };
   const args = (sourceRun) => ({ sourceRun, memoryFlushWritePath: "memory/2026-11-21.md", sourceTurnTainted: false });
   const resolve0 = (r) => resolve(args(r));
-  // Without the WhatsApp channel plugin registered (this test process), OpenClaw cannot resolve the "whatsapp:"
-  // prefix, so a prefixed entry must FAIL CLOSED; the unprefixed E.164 form resolves without a plugin. The E2E runs
-  // with the real @openclaw/whatsapp plugin installed and proves the prefixed production form.
-  cfg = { commands: { ownerAllowFrom: ["whatsapp:+15550001234"] } };
+  // Without the WhatsApp channel plugin registered (this test process) OpenClaw 2026.11.10 still strips a generic
+  // "whatsapp:" prefix from an E.164 entry, but cannot normalise the "whatsapp:<digits>" (no '+') form: that entry
+  // must FAIL CLOSED here. The helper adds no rule of its own, it only reuses OpenClaw's. The E2E and the parity test
+  // run with the real @openclaw/whatsapp plugin installed and prove the production forms.
   const runPrefixed = { senderIsOwner: true, senderId: "+15550001234", senderE164: "+15550001234", messageProvider: "whatsapp", agentAccountId: "default" };
-  assert.equal(resolve0(runPrefixed), undefined, "unresolvable owner entry => fail closed");
+  cfg = { commands: { ownerAllowFrom: ["whatsapp:15550001234"] } };
+  assert.equal(resolve0(runPrefixed), undefined, "owner entry OpenClaw cannot resolve without the channel plugin => fail closed");
+  cfg = { commands: { ownerAllowFrom: ["whatsapp:+15550001234"] } };
+  assert.equal(resolve0(runPrefixed)?.ownerBasis, "configured-owner", "prefixed E.164 entry is OpenClaw's own owner rule");
   cfg = { commands: { ownerAllowFrom: ["+15550001234"] } };
 
   const ok = resolve(args(run));
@@ -283,14 +294,14 @@ test("integration: helper with REAL OpenClaw owner functions — fail closed wit
   cfg = { commands: { ownerAllowFrom: ["+15550001234"] } };
   let current = true;
   const bound = { ...run };
-  auth.l(bound, { isCurrent: () => current });
+  auth.p(bound, { isCurrent: () => current });
   assert.equal(resolve(args(bound))?.ownerBasis, "command-owner-authority");
   current = false;
   assert.equal(resolve(args(bound)), undefined, "revoked/expired command-owner authority is a denial with no configured-owner fallback");
 });
 
 test("integration: the flush writer cannot leave memory/<date>.md, cannot overwrite, cannot replay", integration, async () => {
-  const { i: createTools } = await import(pathToFileURL(path.join(PKG, "dist/agent-tools-Bpi7xWYy.mjs")).href);
+  const { t: createTools } = await import(pathToFileURL(path.join(PKG, TOOLS_CHUNK)).href);
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "basht-flush-write-"));
   const OWNER = "+15550001234";
   const target = "memory/2026-11-21.md";

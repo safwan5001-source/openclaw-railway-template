@@ -1,7 +1,7 @@
 #!/bin/bash
 # Validate installation/eligibility of the basht-daftra skill against the pinned OpenClaw (isolated, offline, fake env).
 #   scripts/verify-skill-eligibility.sh <dir containing node_modules/openclaw>
-# Needs Node >= 24.22.1 / 26.12.1 (OpenClaw refuses older). Touches only a temp state/home/workspace.
+# Needs Node >= 24.16.0 / 26.1.0 (OpenClaw 2026.11.10 engines; refuses older). Touches only a temp state/home/workspace.
 set -euo pipefail
 OC_DIR="${1:?usage: verify-skill-eligibility.sh <dir with node_modules/openclaw>}"
 NODE_BIN="${NODE_BIN:-node}"
