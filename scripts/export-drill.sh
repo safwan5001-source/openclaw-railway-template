@@ -53,6 +53,13 @@ touch "$D/done2"; sleep 2
 echo "      import: $(echo "$R" | grep -o 'HTTP[0-9]*') of $(stat -c %s "$D/export.zip") bytes, container memory peak $(cat "$D/peak2" 2>/dev/null) MiB"
 chk "B: import of the large archive accepted" 'echo "$R" | grep -q "\"ok\":true.*HTTP200"'
 chk "B: gateway reachable after restore" 'health true 120'
+# A failed restore is only diagnosable from what the wrapper/gateway said: print the import response and the tail of the
+# container log (synthetic data only; lines mentioning token/password/secret are dropped before printing).
+if ! echo "$R" | grep -q '"ok":true.*HTTP200' || ! curl -s http://127.0.0.1:$P/setup/healthz | grep -q '"gatewayReachable":true'; then
+  echo "      import response: $(printf '%s' "$R" | head -c 600)"
+  echo "      exB container log tail (filtered):"
+  docker logs exB 2>&1 | grep -viE 'token|password|secret' | tail -80 | cut -c1-300 | sed 's/^/        /'
+fi
 manifest exB > "$D/after.sha"
 chk "B: all $(wc -l < "$D/before.sha") protected files byte-identical" 'diff -q <(awk "{print \$2, \$1}" "$D/before.sha" | grep -v plugin-skills | sort) <(awk "{print \$2, \$1}" "$D/after.sha" | grep -v plugin-skills | sort) >/dev/null'
 echo "RESULT pass=$pass fail=$fail"; [ "$fail" = 0 ]
