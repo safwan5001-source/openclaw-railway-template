@@ -164,6 +164,9 @@ Delete `restore.tar.gz` / `restore.zip` afterwards (they are plaintext).
   mapping under the data roots, and fails closed on a process it cannot inspect, so these tests run through
   `bash scripts/run-backup-tests.sh` (a Node container with `CAP_SYS_PTRACE`, repository mounted read-only) in CI instead of
   directly on a shared runner. The guard is not changed or skipped for tests.
+- `src/private-permissions.test.mjs`: `/setup/api/import` makes the restored state tree private to the service user
+  (directories `0700`, group/other bits removed from files, nothing widened, symlinks never followed). OpenClaw 2026.11.10
+  refuses to start on a group/other-readable `.openclaw/client` directory, and an import ZIP carries no directory modes.
 - `scripts/restore-drill.sh <image>` (real image + real gateway, synthetic data): backup from a running instance →
   container **and volume destroyed** → fresh container on an **empty** volume → import → 17/17 protected files
   byte-identical, SQLite `integrity_check` ok, gateway healthy, files owned by `openclaw`. Run it quarterly.

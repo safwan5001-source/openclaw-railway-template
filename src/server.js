@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerBackupRoute } from "./backup.js";
+import { restrictToOwner } from "./private-permissions.js";
 import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
@@ -1690,6 +1691,11 @@ app.post(
         }
         validReplacements.push(r);
       }
+
+      // The state tree must be private to this user (OpenClaw 2026.11.10 refuses to start on a group/other-readable
+      // client credential directory, and an import ZIP has no directory modes). Only ever removes access. Done before
+      // the gateway is stopped so a failure costs no downtime.
+      if (validReplacements.some((r) => r.target === stateAbs)) restrictToOwner(path.join(tmpExtract, stateRel));
 
       // Now that the archive is fully extracted and validated, take down the
       // gateway. From here through the rename swap, downtime is unavoidable.
