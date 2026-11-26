@@ -1,6 +1,6 @@
 # BASHT — pre-compaction memory flush keeps the verified owner identity
 
-Status: ready for review. **Not deployed.** No production config, WhatsApp setting, model, permission or data was changed.
+Status: ready for review. **Not deployed.** Sections 1–8 describe the original analysis on OpenClaw 2026.10.9 (chunk names and line numbers there refer to that release); section 9 records the re-validation for 2026.11.10. No production config, WhatsApp setting, model, permission or data was changed.
 
 ## 1. Symptom (production evidence, Railway `sweet-courtesy` / `OpenClaw`, deployment `c8b213da`, main@60ee51b)
 
@@ -170,7 +170,7 @@ must not touch a live production volume, `owner-check.mjs` avoids the CLI entire
   group/other-`@` and `${ENV}` entries, `$include` and `${ENV}` in policy fields are `BLOCKED`;
 * prints exactly one line `BASHT_OWNER_CHECK {json}`: booleans, counts, policy-step names and a verdict
   (`READY` / `BLOCKED: <reason>` / `REFUSED`); 7+ digit runs are masked; errors are reduced to their type;
-* refuses root and any OpenClaw version other than 2026.10.9.
+* refuses root and any OpenClaw version other than 2026.11.10.
 
 ```bash
 gosu openclaw node /app/patches/owner-check.mjs     # after deploy (to run a copy, copy whatsapp-owner.mjs alongside)
@@ -244,3 +244,33 @@ Rollback: Railway → OpenClaw → Deployments → redeploy `c8b213da` (current 
 `git revert` the merge commit. The patch touches only the image's OpenClaw `dist/`; it changes no config, volume
 data or WhatsApp credentials, so rollback has no data migration. Memory notes written by the fixed flush are ordinary
 append-only Markdown and remain valid after a rollback.
+
+## 9. Upgrade to OpenClaw 2026.11.10 (re-validated against the real package)
+
+The 2026.11.10 bundle is minified (single line, one-letter locals), so the patch matches exact snippets instead of
+formatted source. It still applies the same four additive edits and refuses any drift (version, SHA-256 of
+`dist/agent-runner-memory-Bmk5_PZf.mjs`, anchor count). Differences that matter:
+
+| Area | 2026.10.9 | 2026.11.10 |
+|---|---|---|
+| Patched chunk | `agent-runner-memory-BkOUjtvi.mjs` | `agent-runner-memory-Bmk5_PZf.mjs` |
+| Owner functions imported by the helper | `command-auth-BHrKDij6.mjs` | `command-auth-Ch_q0NQN.mjs` (`h` getCommandOwnerAuthority, `t` isConfiguredCommandOwner, `p` bindCommandOwnerAuthority) |
+| Live config reader | `io.runtime-B134MOMz.mjs` | `io.runtime-euLviN5p.mjs` (`getRuntimeConfig`) |
+| Tool assembly used by tests/diagnostics | `agent-tools-Bpi7xWYy.mjs` (`i`) | `agent-tools.async-Cu9hozum.mjs`: `t` createOpenClawCodingToolsAsync (options only), `n` createOpenClawCodingToolsInternalAsync (third argument is the `onFilter({step, before, after})` observer used by `owner-check.mjs`) |
+| Taint input | `turnTainted === true` | patch passes `turnTainted !== false`: an unknown taint state is treated as tainted (stricter, fail-closed). Upstream also reports `turnTainted: true` when the transcript cannot be read. |
+| WhatsApp owner entry without the channel plugin | n/a | `whatsapp:+E164` resolves through OpenClaw's own rule even without the plugin; `whatsapp:<digits>` does not (still denied by the helper). The helper adds no rule of its own. |
+
+Behaviour notes: the optional debug line `memory flush keeps verified owner identity` is no longer emitted (the
+2026.11.10 insertion avoids a logger anchor). Verify a deployment by the absence of `no write tool survived` and a new
+`memory/<date>.md` entry. The diagnostics (`owner-check.mjs`, `memory-flush-doctor.mjs`, `whatsapp-owner.mjs`) now pin
+2026.11.10 and the chunk names above.
+
+Verification on the real package (`openclaw@2026.11.10` + `@openclaw/whatsapp@2026.11.10`):
+
+* `node --test --test-concurrency=1 patches/*.test.mjs`: 39/39, none skipped (including the parity test with the real
+  WhatsApp plugin and the unprivileged `owner-check` replays).
+* `bash patches/e2e/memory-flush-e2e.sh`: A (upstream) loses the fact (`flushTools=["read"]`, recall `NOT-FOUND`); B (patched owner) saves
+  it and recalls `ZEBRA-4417`; C (spoofed owner number), D (non-owner), E (no sender) and F (owner removed from
+  config) stay read-only. In 2026.11.10 compaction is proven from the summarisation requests the fake model receives
+  (`outcome=compacted` is no longer logged), and the runtime-context block is a separate trailing user message, so the
+  fake model matches the recall prompt in the last two user messages.
