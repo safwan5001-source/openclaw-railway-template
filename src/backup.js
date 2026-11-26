@@ -17,6 +17,7 @@ import { pipeline } from "node:stream/promises";
 import zlib from "node:zlib";
 
 import { createEncryptStream, keyId, loadPublicKey } from "./backup-format.js";
+import { assertNoBackupWriters, r2BackupConfig, uploadEncryptedBackup } from "./backup-r2.js";
 
 /** Rebuildable or volatile paths, relative to the state / workspace roots. */
 export const STATE_EXCLUDES = ["cache", "tmp", "logs", "server.log", "media/playback-transcode"];
@@ -93,9 +94,13 @@ export function registerBackupRoute(app, requireAuth, opts) {
   }
   let busy = false;
 
-  app.post("/setup/api/backup", requireAuth, async (_req, res) => {
+  app.post("/setup/api/backup", requireAuth, async (req, res) => {
     if (!publicKey) return res.status(503).json({ ok: false, error: configError });
     if (busy) return res.status(409).json({ ok: false, error: "A backup is already running." });
+    let r2 = null;
+    if (req.query?.destination === "r2") {
+      try { r2 = r2BackupConfig(); } catch { return res.status(503).json({ ok: false, error: "R2 backup is not configured." }); }
+    }
     busy = true;
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     let tmpDir = null;
@@ -112,15 +117,21 @@ export function registerBackupRoute(app, requireAuth, opts) {
       }
       let result;
       try {
+        await assertNoBackupWriters([stateDir, workspaceDir]);
         result = await writeEncryptedArchive({ stateDir, workspaceDir, publicKey, outFile, meta: { host: "basht-openclaw" } });
+        await assertNoBackupWriters([stateDir, workspaceDir]);
       } finally {
-        busy = false; // the snapshot is done; sending the file does not need the lock
+        // Keep the request busy until delivery finishes, but release the gateway maintenance lock now.
         resumeGateway().catch((err) =>
           // "paused" = another maintenance (backup/import) took the lock first; it restarts the gateway itself.
           /paused/.test(err.message) ? log.info("backup", err.message) : log.error("backup", `gateway restart failed: ${err.message}`),
         );
       }
       log.info("backup", `encrypted backup ready: ${result.bytes} bytes, gateway paused ${Date.now() - started} ms`);
+      if (r2) {
+        const uploaded = await uploadEncryptedBackup(outFile, r2);
+        return res.json({ ok: true, ...uploaded, keyId: result.header.kid });
+      }
       res.set({
         "Content-Type": "application/octet-stream",
         "Content-Disposition": `attachment; filename="basht-backup-${ts}.bkp"`,

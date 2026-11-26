@@ -1,0 +1,57 @@
+name: BASHT backup test
+on:
+  push:
+    branches: ['backup/r2-pre-upgrade']
+permissions:
+  contents: read
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Test integrated backup guards and R2 readback
+        run: |
+          node --check src/backup.js
+          node --check src/backup-r2.js
+          docker run --rm --cap-add=SYS_PTRACE -v "$PWD:/app:ro" -w /app node:26-bookworm node --test src/backup-r2.test.mjs
+      - name: Test backup with mock storage and synthetic data
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/basht-r2-backup.sh
+          sudo mkdir -p /data/.linuxbrew /data/workspace
+          sudo chown -R "$(id -u):$(id -g)" /data
+          printf 'synthetic memory\n' > /data/workspace/memory.txt
+          printf 'excluded\n' > /data/.linuxbrew/test
+          mkdir -p "$RUNNER_TEMP/mock-bin" "$RUNNER_TEMP/restored"
+          export MOCK_OBJECT="$RUNNER_TEMP/object.gpg"
+          cat > "$RUNNER_TEMP/mock-bin/aws" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "$*" in
+            *"s3 cp -"*) cat > "$MOCK_OBJECT";;
+            *"s3api head-object"*) wc -c < "$MOCK_OBJECT";;
+            *) exit 1;;
+          esac
+          EOF
+          chmod +x "$RUNNER_TEMP/mock-bin/aws"
+          export PATH="$RUNNER_TEMP/mock-bin:$PATH"
+          export R2_ACCESS_KEY_ID=dummy R2_SECRET_ACCESS_KEY=dummy R2_BUCKET=basht-backups
+          export R2_ENDPOINT=https://00000000000000000000000000000000.r2.cloudflarestorage.com
+          export BASHT_BACKUP_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+          if bash scripts/basht-r2-backup.sh; then echo 'Quiesce guard failed'; exit 1; fi
+          BASHT_BACKUP_QUIESCED=YES bash scripts/basht-r2-backup.sh
+          gpg --batch --no-tty --pinentry-mode loopback --passphrase-fd 3 --decrypt "$MOCK_OBJECT" 3<<<"$BASHT_BACKUP_ENCRYPTION_KEY" | tar -xzf - -C "$RUNNER_TEMP/restored"
+          cmp /data/workspace/memory.txt "$RUNNER_TEMP/restored/workspace/memory.txt"
+          test ! -e "$RUNNER_TEMP/restored/.linuxbrew"
+          if gpg --batch --no-tty --pinentry-mode loopback --passphrase-fd 3 --decrypt "$MOCK_OBJECT" 3<<<'wrong-key' >/dev/null 2>&1; then exit 1; fi
+          echo 'Synthetic backup and restore passed'
+      - name: Build production image and check installed tools
+        run: |
+          docker build -t basht-backup-ci .
+          docker run --rm --user openclaw --entrypoint sh basht-backup-ci -ec 'aws --version; openclaw --version | grep -E "^OpenClaw 2026[.]10[.]9( |$)"'
+          docker run --rm --user openclaw --entrypoint node basht-backup-ci --test /app/src/backup-r2.test.mjs
