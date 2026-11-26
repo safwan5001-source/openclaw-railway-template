@@ -10,6 +10,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Test integrated backup guards and R2 readback
+        run: |
+          node --check src/backup.js
+          node --check src/backup-r2.js
+          node --test src/backup-r2.test.mjs
       - name: Test backup with mock storage and synthetic data
         shell: bash
         run: |
