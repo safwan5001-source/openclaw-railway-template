@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerBackupRoute } from "./backup.js";
+import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
 import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
@@ -1719,6 +1720,19 @@ app.post(
       backups.length = 0;
 
       log.info("import", `restored ${uploaded} bytes from archive`);
+      // A live export carries the Gateway owner lease of the instance it was copied from; OpenClaw 2026.11.10 never reclaims
+      // such an unverifiable owner by itself. Our Gateway is stopped (maintenance lock), so a lease still present is the
+      // source's, not ours: clear it with OpenClaw's own recover-lock (see src/gateway-lock-recovery.js).
+      // Set BASHT_IMPORT_KEEP_FOREIGN_LOCK=1 to skip this and recover manually instead. Never blocks the import.
+      if (process.env.BASHT_IMPORT_KEEP_FOREIGN_LOCK !== "1") {
+        try {
+          const lock = await recoverRestoredGatewayLock((args) => runCmd(OPENCLAW_NODE, clawArgs(args)));
+          if (lock.recovered) log.info("import", `cleared ${lock.holders} gateway owner record(s) carried by the archive`);
+          else if (lock.holders) log.warn("import", `gateway owner record(s) from the archive kept: ${lock.reason}`);
+        } catch (err) {
+          log.warn("import", `gateway owner recovery skipped: ${err.message}`);
+        }
+      }
       gatewayWasStopped = false;
       await resumeGateway();
       return res.json({ ok: true, output: extractResult.output });
