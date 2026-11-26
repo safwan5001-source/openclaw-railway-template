@@ -15,8 +15,10 @@ up() { docker run -d --name $1 -p $P:8080 -v $2:/data -e SETUP_PASSWORD=$PW -e R
   -e OPENCLAW_STATE_DIR=/data/.openclaw -e OPENCLAW_WORKSPACE_DIR=/data/workspace -e BASHT_BACKUP_PUBLIC_KEY="$(cat $D/keys/basht-backup-public.pem)" "$IMG" >/dev/null; }
 # hashes of everything the backup promises to carry (WAL/SHM/locks excluded: SQLite and the gateway rewrite them at start; integrity is checked instead.
 # OpenClaw 2026.11.10 keeps an integrity seal next to every SQLite database (<db>.sqlite.seal), derived from the database
-# and rewritten whenever it changes, so it is excluded with the database it seals; the database's integrity_check still runs below.)
-manifest() { docker exec $1 bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path .openclaw/media/playback-transcode -o -path workspace/skills/basht-daftra -o -path workspace/skills/basht-accounting \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.sqlite.seal" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
+# and rewritten whenever it changes, so it is excluded with the database it seals; the database's integrity_check still runs below.
+# openclaw.json.last-good is a snapshot OpenClaw writes asynchronously once the gateway has been healthy for a while (a timing race
+# between the two instances); openclaw.json itself is still compared byte for byte.)
+manifest() { docker exec $1 bash -c 'cd /data && find .openclaw workspace \( -path .openclaw/cache -o -path .openclaw/tmp -o -path .openclaw/logs -o -path .openclaw/media/playback-transcode -o -path workspace/skills/basht-daftra -o -path workspace/skills/basht-accounting \) -prune -o -type f ! -name server.log ! -name "*-wal" ! -name "*-shm" ! -name "*.sqlite" ! -name "*.sqlite.seal" ! -name "*.last-good" ! -name "*.lock" -print0 | sort -z | xargs -0 sha256sum'; }
 docker rm -f drillA drillB >/dev/null 2>&1; docker volume rm -f drill-a drill-b >/dev/null 2>&1
 
 $TOOL keygen $D/keys >/dev/null || exit 1
