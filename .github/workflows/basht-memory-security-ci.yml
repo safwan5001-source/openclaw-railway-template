@@ -36,12 +36,12 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/flush/base" && cd "$RUNNER_TEMP/flush/base"
           npm init -y >/dev/null
-          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.11.10
       - name: Install OpenClaw + the real WhatsApp plugin for the owner-rule parity test (separate dir; the E2E keeps base)
         run: |
           mkdir -p "$RUNNER_TEMP/flush/parity" && cd "$RUNNER_TEMP/flush/parity"
           npm init -y >/dev/null
-          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.10.9 @openclaw/whatsapp@2026.10.9
+          npm install --no-audit --no-fund --ignore-scripts openclaw@2026.11.10 @openclaw/whatsapp@2026.11.10
       - name: Patch unit + integration tests (real OpenClaw tool policy, real WhatsApp owner rule)
         env:
           OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
