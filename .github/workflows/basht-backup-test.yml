@@ -7,7 +7,7 @@ permissions:
 jobs:
   backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,3 +50,8 @@ jobs:
           test ! -e "$RUNNER_TEMP/restored/.linuxbrew"
           if gpg --batch --no-tty --pinentry-mode loopback --passphrase-fd 3 --decrypt "$MOCK_OBJECT" 3<<<'wrong-key' >/dev/null 2>&1; then exit 1; fi
           echo 'Synthetic backup and restore passed'
+      - name: Build production image and check installed tools
+        run: |
+          docker build -t basht-backup-ci .
+          docker run --rm --user openclaw --entrypoint sh basht-backup-ci -ec 'aws --version; openclaw --version | grep -E "^OpenClaw 2026[.]10[.]9( |$)"'
+          docker run --rm --user openclaw --entrypoint node basht-backup-ci --test /app/src/backup-r2.test.mjs
