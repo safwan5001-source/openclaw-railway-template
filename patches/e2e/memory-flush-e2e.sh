@@ -80,7 +80,10 @@ check() { # label expect_write expect_recall
   tools=$(grep '"phase":"flush"' "$r/llm.jsonl" | head -1 | sed 's/.*"tools":\(\[[^]]*\]\).*/\1/')
   file=$(cat "$r/ws/memory/$DATE.md" 2>/dev/null || true)
   recall=$(grep -ao 'RECALLED: [A-Z0-9-]*' "$r/agent.out" | head -1 || true)
-  local compacted; compacted=$(grep -ac 'outcome=compacted' "$r/agent.out" || true)
+  # Compaction is proven by the summarisation requests the fake model received (OpenClaw 2026.11.10 no longer logs
+  # "outcome=compacted"); the post-compaction transcript must also carry a compactionSummary entry.
+  local compacted; compacted=$(grep -ac '"phase":"compaction"' "$r/llm.jsonl" || true)
+  grep -aq 'compactionSummary' "$r/agent.out" || compacted=0
   local ok=1
   if [ "$2" = yes ]; then [ "$tools" = '["read","write"]' ] && [[ "$file" == *ZEBRA-4417* ]] && [ "$recall" = "RECALLED: ZEBRA-4417" ] || ok=0
   else [ "$tools" = '["read"]' ] && [[ "$file" != *ZEBRA-4417* ]] || ok=0; fi

@@ -43,7 +43,9 @@ step "syntax: src/server.js" node -c src/server.js
 # The encrypted-backup tests need to inspect every process of the user (the residual-writer guard fails closed on one it
 # cannot read), which a shared runner or sandbox does not allow: they run in a container with CAP_SYS_PTRACE below.
 WRAPPER_TESTS=()
-while IFS= read -r f; do WRAPPER_TESTS+=("$f"); done < <(ls src/*.test.mjs | grep -vE '^src/backup(-r2)?\.test\.mjs$')
+for f in src/*.test.mjs; do
+  case "$f" in src/backup.test.mjs|src/backup-r2.test.mjs) ;; *) WRAPPER_TESTS+=("$f") ;; esac
+done
 step "unit + integration: wrapper (src, backup tests below) and basht-daftra skill" node --test "${WRAPPER_TESTS[@]}" skills/basht-daftra/scripts/*.test.mjs
 if docker info >/dev/null 2>&1; then
   step "backup: encrypted archive, writer guard and R2 readback (container with process inspection)" bash scripts/run-backup-tests.sh

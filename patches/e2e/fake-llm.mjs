@@ -14,7 +14,10 @@ function classify(body) {
   const last = msgs.at(-1);
   if (/Pre-compaction memory flush/.test(text(lastUser)) || /Pre-compaction memory flush turn/.test(all) && !body.tools?.some((t) => t.function?.name === "exec")) return { phase: "flush", last, lastUser, all };
   if (!body.tools?.length && /summar/i.test(all)) return { phase: "compaction", last, lastUser, all };
-  if (/RECALL/.test(text(lastUser))) return { phase: "recall", last, lastUser, all };
+  // OpenClaw 2026.11.10 appends its "runtime context" block as a separate trailing user message, so the prompt itself
+  // is one of the last two user messages, not necessarily the very last.
+  const recentUsers = msgs.filter((m) => m.role === "user").slice(-2);
+  if (recentUsers.some((m) => /RECALL/.test(text(m)))) return { phase: "recall", last, lastUser, all };
   return { phase: "chat", last, lastUser, all };
 }
 function respond(res, body, reply, usagePrompt) {
@@ -60,7 +63,7 @@ http.createServer((req, res) => {
     } else {
       reply = { text: "ack" };
     }
-    if (LOG) fs.appendFileSync(LOG, JSON.stringify({ n: n + 1, phase: c.phase, tools, lastRole: c.last?.role, lastUser: text(c.lastUser).slice(-160), datePath, reply: reply.toolCall ? `tool:${reply.toolCall.name}` : reply.text.slice(0, 40) }) + "\n");
+    if (LOG) fs.appendFileSync(LOG, JSON.stringify({ n: n + 1, phase: c.phase, tools, lastRole: c.last?.role, datePath, reply: reply.toolCall ? `tool:${reply.toolCall.name}` : reply.text.slice(0, 40) }) + "\n");
     respond(res, body, reply, c.phase === "chat" ? BIG : 2000);
   });
 }).listen(PORT, "127.0.0.1", () => console.log(`fake-llm on ${PORT}`));
