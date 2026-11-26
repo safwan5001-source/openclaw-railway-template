@@ -195,8 +195,10 @@ test('the legacy Python exporter is gone and nothing references it', () => {
 test('Claude CLI is pinned and uses private persistent configuration without changing launch', () => {
   const docker = dockerfileLines('Dockerfile').join('\n');
   const entry = read('entrypoint.sh');
-  assert.match(docker, /npm install -g @anthropic-ai\/claude-code@2\.1\.332/);
+  assert.match(docker, /npm install -g --allow-scripts=@anthropic-ai\/claude-code @anthropic-ai\/claude-code@2\.1\.332/);
   assert.ok(docker.includes("claude --version | grep -Eq '^2\\.1\\.332( |$)'"));
+  assert.match(docker, /USER openclaw\nRUN .*claude auth --help/);
+  assert.ok(docker.includes('test "$(id -un)" = openclaw'));
   assert.match(docker, /^ENV CLAUDE_CONFIG_DIR=\/data\/claude$/m);
   assert.match(entry, /\[ ! -L \/data\/claude \] && install -d -m 700 -o openclaw -g openclaw \/data\/claude/);
   assert.match(entry, /export CLAUDE_CONFIG_DIR=\/data\/claude/);
