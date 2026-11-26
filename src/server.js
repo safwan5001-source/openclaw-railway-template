@@ -25,6 +25,7 @@ import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
+import { migrateDisabledWorkshop } from "./workshop-migration.js";
 import { registerStreamingExport } from "./export-stream.js";
 import { registerExportDownload } from "./exports-download.js";
 import { rebuildForwardedHeaders } from "./proxy-headers.js";
@@ -1968,6 +1969,8 @@ const server = app.listen(PORT, () => {
   // This prevents its first scan racing OpenClaw's legitimate state migrations.
   if (isConfigured()) {
     (async () => {
+      await recoverStaleGatewayLockOnBoot();
+      if (migrateDisabledWorkshop(configPath())) log.info("wrapper", "Removed disabled legacy skills.workshop; private backup preserved");
       try {
         log.info("wrapper", "running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
