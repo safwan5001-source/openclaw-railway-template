@@ -60,7 +60,7 @@ http.createServer((req, res) => {
     } else {
       reply = { text: "ack" };
     }
-    if (LOG) fs.appendFileSync(LOG, JSON.stringify({ n: n + 1, phase: c.phase, tools, lastRole: c.last?.role, datePath, reply: reply.toolCall ? `tool:${reply.toolCall.name}` : reply.text.slice(0, 40) }) + "\n");
+    if (LOG) fs.appendFileSync(LOG, JSON.stringify({ n: n + 1, phase: c.phase, tools, lastRole: c.last?.role, lastUser: text(c.lastUser).slice(-160), datePath, reply: reply.toolCall ? `tool:${reply.toolCall.name}` : reply.text.slice(0, 40) }) + "\n");
     respond(res, body, reply, c.phase === "chat" ? BIG : 2000);
   });
 }).listen(PORT, "127.0.0.1", () => console.log(`fake-llm on ${PORT}`));
