@@ -10,13 +10,13 @@
 // (OpenClaw's file logger appends to the live gateway's /tmp/openclaw log). It:
 //   * reads openclaw.json through an O_RDONLY|O_NOFOLLOW handle to report the owner entries and their forms;
 //   * derives the owner with the SAME normaliser as owner-check.mjs (whatsapp-owner.mjs, a mirror of OpenClaw
-//     2026.10.9's isConfiguredCommandOwner for WhatsApp), so the two tools cannot disagree about the owner;
+//     2026.11.10's isConfiguredCommandOwner for WhatsApp), so the two tools cannot disagree about the owner;
 //   * gets the tool-policy replay from owner-check.mjs, which runs it in a sandboxed child (throwaway HOME/TMPDIR/
 //     state, only tool-policy fields, OpenClaw logging silenced) and returns one masked line;
 //   * reads the patch marker and lists memory/<date>.md files (names + sizes only).
 // The replay covers, per agent that holds the owner's WhatsApp DM:
 //   owner_turn        the owner's normal WhatsApp turn
-//   flush_upstream    the pre-compaction memory flush as stock OpenClaw 2026.10.9 builds it (anonymous non-owner)
+//   flush_upstream    the pre-compaction memory flush as stock OpenClaw 2026.11.10 builds it (anonymous non-owner)
 //   flush_patched     the same flush with the BASHT owner-identity patch (verified owner identity kept)
 //   flush_impostor    a flush whose source turn came from a non-owner number (must never gain `write`)
 // Phone numbers and WhatsApp ids are masked in the output.
@@ -32,7 +32,7 @@ const JSON_OUT = process.argv.includes("--json");
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OWNER_CHECK = path.join(HERE, "owner-check.mjs");
 const PKG = process.env.OPENCLAW_PACKAGE_ROOT || "/usr/local/lib/node_modules/openclaw"; // same resolution as owner-check.mjs
-const PATCH_TARGET = "dist/agent-runner-memory-BkOUjtvi.mjs";
+const PATCH_TARGET = "dist/agent-runner-memory-Bmk5_PZf.mjs";
 const PATCH_MARKER = "basht-patch:memory-flush-owner-identity";
 
 export function maskId(value) {
@@ -50,7 +50,7 @@ export function classifyWhatsAppId(value) {
 
 /**
  * Mirrors the patch's fail-closed gate with OpenClaw's own owner rule: only commands.ownerAllowFrom proves ownership
- * (no command-owner authority exists for WhatsApp in 2026.10.9), in every form OpenClaw accepts ("whatsapp:+E164",
+ * (no command-owner authority exists for WhatsApp in 2026.11.10), in every form OpenClaw accepts ("whatsapp:+E164",
  * "whatsapp:<digits>" without "+", bare digits, user JIDs). channels.whatsapp.allowFrom admits a sender but does NOT
  * make it the owner; wildcards and other-channel entries never count.
  */
