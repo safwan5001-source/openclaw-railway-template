@@ -50,6 +50,12 @@ RUN npm install -g \
 # Pinned (was @latest): a rebuild must produce the same tool the previous build had. Bump deliberately.
 RUN npm install -g clawhub@0.27.0
 
+# Official Claude Code CLI, installed in the image rather than the persistent disk.
+RUN npm install -g @anthropic-ai/claude-code@2.1.332 \
+  && claude --version | grep -Eq '^2\.1\.332( |$)' \
+  && npm cache clean --force
+ENV CLAUDE_CONFIG_DIR=/data/claude
+
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
