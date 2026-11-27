@@ -24,7 +24,7 @@
     "test:transport": "node --test skills/basht-transport-sales/scripts/*.test.mjs"
   },
   "dependencies": {
-    "express": "^5.1.0",
+    "express": "^5.3.0",
     "http-proxy": "^1.18.1"
   }
 }

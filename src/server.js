@@ -22,7 +22,9 @@ import {
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
-import { createAppBridge } from "./app-bridge.js";
+import { createAppBridge, parseTranscribeOutput } from "./app-bridge.js";
+import { CONTROL_READ_RPC, CONTROL_WRITE_RPC, validateControlRpc } from "./app-control.js";
+import { createGatewayLink } from "./gateway-link.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
@@ -607,7 +609,9 @@ async function restartGateway() {
   gatewayRestartCount = 0;
   // Also after first-time onboarding / a raw config save: the app bridge needs the gateway's chat endpoint (no-op without the bridge).
   await ensureAppChatEndpoint();
-  return ensureGatewayRunning();
+  const started = await ensureGatewayRunning();
+  gatewayLink?.kick();
+  return started;
 }
 
 // Failed-login throttling (per client and global); successful requests are never counted. See src/setup-auth.js.
@@ -645,17 +649,37 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, gateway: health.gateway });
 });
 
-// The only gateway RPCs the app bridge may make (model control). Run as `openclaw gateway call` against the local gateway;
+// The only gateway RPCs the app bridge may make. Run as `openclaw gateway call` against the local gateway;
 // the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
-const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch"]);
+// Model control (M): models.list, sessions.describe, sessions.patch. Chat basics + media (B1/B2): sessions.reset (the app session
+// only, params built by the bridge), sessions.search, chat.history (anchored reads), artifacts.download (one image of one message).
+// App control (B5–B7): read methods and the two cron switches, whose params are re-checked here (validateControlRpc).
+const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch",
+  "sessions.reset", "sessions.search", "chat.history", "artifacts.download", ...CONTROL_READ_RPC, ...CONTROL_WRITE_RPC]);
+// an image artifact comes back as base64 inside the JSON (<= 10 MB image -> ~14 MB): only that call gets the bigger buffer
+const APP_BRIDGE_RPC_BUFFER = { "artifacts.download": 32 * 1024 * 1024 };
+// B0: reads go over the persistent gateway link when it is up (no process spawn); the CLI stays the fallback and the only path
+// for writes (sessions.patch, sessions.reset, cron.*) and for the reads the link does not carry (see LINK_METHODS in src/gateway-link.js).
+const APP_BRIDGE_LINK_READS = new Set(["models.list", "sessions.describe"]);
+let gatewayLink = null;
 function appBridgeGatewayCall(method, params) {
   if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
+  if (!validateControlRpc(method, params)) return Promise.reject(new Error(`gateway call ${method}: params not allowed`));
+  if (gatewayLink?.isUp() && APP_BRIDGE_LINK_READS.has(method)) {
+    return gatewayLink.request(method, params ?? {}).catch((err) => {
+      if (err?.code === "link_down" || err?.code === "timeout") return appBridgeCliCall(method, params);
+      throw err; // a refusal from the gateway (err.refused) is an answer, not an outage
+    });
+  }
+  return appBridgeCliCall(method, params);
+}
+function appBridgeCliCall(method, params) {
   const args = clawArgs(["gateway", "call", method, "--json", "--port", String(INTERNAL_GATEWAY_PORT),
     "--timeout", "15000", "--params", JSON.stringify(params ?? {})]);
   return new Promise((resolve, reject) => {
     childProcess.execFile(OPENCLAW_NODE, args, {
       env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
-      timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000, maxBuffer: APP_BRIDGE_RPC_BUFFER[method] ?? 8 * 1024 * 1024,
     }, (err, stdout) => {
       let j = null;
       try { j = JSON.parse(stdout); } catch { /* not JSON */ }
@@ -670,7 +694,43 @@ function appBridgeGatewayCall(method, params) {
   });
 }
 
+// Voice notes from the app (V3): transcribed exactly like WhatsApp voice notes, with the agent's own audio config (tools.media).
+// There is no transcription RPC, so the wrapper runs the CLI. The only argv from outside is the bridge's own temp file path;
+// no shell, no user text.
+// OpenClaw sniffs WebM as video/webm and its audio step then skips it ("No transcript returned"), while Chrome/Android record
+// voice notes as WebM/Opus. Such a note is remuxed (stream copy, no re-encode) to Ogg/Opus next to it, in the bridge's private dir.
+function remuxWebmToOgg(filePath) {
+  const out = String(filePath).replace(/\.webm$/, ".ogg");
+  return new Promise((resolve, reject) => {
+    childProcess.execFile("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", String(filePath), "-vn", "-map", "0:a:0", "-c:a", "copy", out],
+      { timeout: 30_000 }, (err) => (err ? reject(Object.assign(new Error("remux failed"), { badAudio: true })) : resolve(out)));
+  });
+}
+
+async function appBridgeTranscribe(filePath) {
+  const file = /\.webm$/.test(String(filePath)) ? await remuxWebmToOgg(filePath) : String(filePath);
+  const args = clawArgs(["infer", "audio", "transcribe", "--agent", "main", "--file", file, "--json"]);
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(OPENCLAW_NODE, args, {
+      env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
+      timeout: 90_000, maxBuffer: 4 * 1024 * 1024,
+    }, (err, stdout) => {
+      const j = parseTranscribeOutput(stdout);
+      if (!j || j.ok !== true) {
+        const type = typeof j?.error?.type === "string" ? j.error.type : err?.code ?? "no_json";
+        const e = new Error(`transcribe failed (${type})`);
+        e.refused = !!j && j.ok === false; // the CLI answered and said no (no audio model, provider error)
+        return reject(e);
+      }
+      const outputs = Array.isArray(j.outputs) ? j.outputs : [];
+      resolve(outputs.map((o) => (typeof o?.text === "string" ? o.text : "")).join("\n"));
+    });
+  });
+}
+
 // BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
+// B0: with the bridge on, one persistent loopback operator link to the gateway (src/gateway-link.js); it reconnects on its own.
+const pendingLink = createGatewayLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log });
 const appBridge = createAppBridge({
   token: process.env.BASHT_APP_TOKEN,
   gatewayUrl: GATEWAY_TARGET,
@@ -678,7 +738,12 @@ const appBridge = createAppBridge({
   configPath: configPath(),
   log,
   gatewayCall: appBridgeGatewayCall,
+  link: pendingLink,
+  stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
+  transcribe: appBridgeTranscribe,
 });
+if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
 if (appBridge) app.use("/app/v1", appBridge);
 else app.use("/app/v1", (_req, res) => res.status(404).json({ ok: false, error: "not_enabled" }));
@@ -2033,6 +2098,7 @@ const server = app.listen(PORT, () => {
       }
       await ensureAppChatEndpoint();
       await ensureGatewayRunning();
+      gatewayLink?.kick();
     })().catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     }).finally(() => {
@@ -2075,6 +2141,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
 
   clearInterval(setupLimiterSweep);
+  gatewayLink?.stop();
 
   server.close();
 
