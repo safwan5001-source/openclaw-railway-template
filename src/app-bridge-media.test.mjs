@@ -434,3 +434,40 @@ test("media roots are resolved lazily: a root created after start is honoured", 
     }
   } finally { s.close(); fs.rmSync(late, { recursive: true, force: true }); }
 });
+
+// Review (Codex, round 3): two «محادثة جديدة» in a row (nothing said between them) must not make paging return the same
+// conversation twice.
+test("two resets in a row: one ledger entry, and paging back never repeats a conversation", async () => {
+  const saved = { archive, appRows };
+  const st = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-twice-"));
+  archive = [row("conv-a-0001", "user", "أ", 1), row("conv-a-0002", "assistant", [{ type: "text", text: "ب" }], 2)];
+  appRows = [...archive];
+  const app = express();
+  app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: `http://127.0.0.1:${gateway.address().port}`, gatewayToken: GW_TOKEN,
+    configPath: path.join(dir, "openclaw.json"), gatewayCall: fakeGatewayCall, stateDir: st, workspaceDir: ws }));
+  const s = app.listen(0, "127.0.0.1"); await new Promise((r) => s.once("listening", r));
+  const b = `http://127.0.0.1:${s.address().port}/app/v1`;
+  const auth = { authorization: `Bearer ${APP_TOKEN}` };
+  const get = async (q = "") => (await fetch(`${b}/history?key=${encodeURIComponent(APP_SESSION_KEY)}${q}`, { headers: auth })).json();
+  try {
+    for (let i = 0; i < 2; i++) assert.equal((await fetch(`${b}/new`, { method: "POST", headers: auth })).status, 200);
+    const ledger = JSON.parse(fs.readFileSync(path.join(st, "app-bridge", "resets.json"), "utf8"));
+    assert.equal(ledger.length, 1, "the empty conversation between the two resets leaves no entry");
+    let cursor = (await get()).earlier;
+    assert.ok(cursor);
+    const seenIds = [];
+    for (let page = 0; cursor && page < 5; page++) {
+      const p = await get(`&before=${cursor}`);
+      for (const m of p.messages) { assert.ok(!seenIds.includes(m.id), `repeated ${m.id}`); seenIds.push(m.id); }
+      cursor = p.earlier;
+    }
+    assert.deepEqual(seenIds, ["conv-a-0001", "conv-a-0002"]);
+    assert.equal(cursor, null);
+    // a ledger written before this fix (two entries with the same anchor) is walked without repeating either
+    fs.writeFileSync(path.join(st, "app-bridge", "resets.json"), JSON.stringify([
+      { resetId: "old-reset-1", anchorId: "conv-a-0002", at: 1 }, { resetId: ledger[0].resetId, anchorId: "conv-a-0002", at: 2 }]));
+    const p1 = await get(`&before=${ledger[0].resetId}`);
+    assert.deepEqual(p1.messages.map((m) => m.id), ["conv-a-0001", "conv-a-0002"]);
+    assert.equal(p1.earlier, null);
+  } finally { s.close(); fs.rmSync(st, { recursive: true, force: true }); archive = saved.archive; appRows = saved.appRows; }
+});
