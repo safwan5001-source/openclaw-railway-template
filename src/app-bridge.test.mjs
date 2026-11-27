@@ -827,6 +827,26 @@ test("transcribe: uploads still arriving hold a slot — never more than two tra
   } finally { m.close(); }
 });
 
+test("transcribe: a late answer keeps its slot and its input until the subprocess finishes (Codex review on #56)", async () => {
+  const waiting = [];
+  const seen = [];
+  const finish = () => waiting.shift()?.();
+  const m = await mount({ transcribeTimeoutMs: 40, transcribe: async (file) => { await new Promise((r) => waiting.push(r)); seen.push(fs.existsSync(file)); return "late"; } });
+  try {
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 502, "the app gets an answer at the deadline");
+    const ok = upload(AUDIO, "audio/ogg", { b: m.b }); // the second slot
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 429, "the timed-out transcriber still holds its slot");
+    finish(); // the timed-out first transcriber ends now
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(seen, [true], "its input file still existed when it finished");
+    // its slot is free now: a new upload is accepted (it too answers 502 at the deadline, not 429)
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 502);
+    while (waiting.length) finish();
+    await ok;
+  } finally { m.close(); }
+});
+
 test("transcribe output parser: the CLI's JSON document, log lines before it skipped", () => {
   const doc = { ok: true, outputs: [{ text: "مرحبا" }] };
   assert.deepEqual(parseTranscribeOutput(JSON.stringify(doc, null, 2)), doc);
