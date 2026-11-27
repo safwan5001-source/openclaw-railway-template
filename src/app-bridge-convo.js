@@ -53,11 +53,12 @@ export function createResetLedger(stateDir) {
   return {
     list: read,
     anchorFor(resetId) { return read().findLast((r) => r.resetId === resetId)?.anchorId ?? null; },
-    add(entry) {
+    /** Appends one entry; `supersedes` (a reset id) is removed: that reset's conversation was empty and is now covered by this one. */
+    add(entry, supersedes = null) {
       if (!file) return false;
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        const rows = [...read(), entry].slice(-MAX_RESETS_KEPT);
+        const rows = [...read().filter((r) => !supersedes || r.resetId !== supersedes), entry].slice(-MAX_RESETS_KEPT);
         const tmp = `${file}.${process.pid}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify(rows), { mode: 0o600 });
         fs.renameSync(tmp, file);
@@ -99,14 +100,17 @@ export function registerConvoRoutes(router, ctx) {
       const rows = Array.isArray(before?.messages) ? before.messages : [];
       const last = rows.at(-1) ?? null;
       let anchorId = rowId(last);
-      if (last && isResetRow(last)) anchorId = ctx.ledger.anchorFor(anchorId) ?? null; // two resets in a row: keep the older anchor
+      // two resets with nothing said between them: the new reset takes over the older one's anchor, and the older (empty)
+      // conversation's ledger entry is dropped, so paging back never returns the same conversation twice
+      const supersedes = last && isResetRow(last) ? rowId(last) : null;
+      if (supersedes) anchorId = ctx.ledger.anchorFor(supersedes) ?? null;
       if (ctx.turnRunning()) return res.status(409).json({ ok: false, error: "busy" }); // re-checked right before the reset
       const r = await ctx.gatewayCall("sessions.reset", { key: ctx.appKey, reason: "new" });
       if (r?.ok === false || (r?.key && r.key !== ctx.appKey)) return res.status(400).json({ ok: false, error: "rejected" });
       const after = await ctx.invoke("sessions_history", { sessionKey: ctx.appKey, limit: 3 }).catch(() => null);
       const resetRow = (Array.isArray(after?.messages) ? after.messages : []).findLast(isResetRow);
       const resetId = rowId(resetRow);
-      const kept = !!(resetId && anchorId) && ctx.ledger.add({ resetId, anchorId, at: ctx.now() });
+      const kept = !!(resetId && anchorId) && ctx.ledger.add({ resetId, anchorId, at: ctx.now() }, supersedes);
       res.json({ ok: true, at: Number(resetRow?.timestamp) || ctx.now(), earlier: kept });
     } catch (err) {
       if (err?.refused) return res.status(400).json({ ok: false, error: "rejected" });
@@ -169,7 +173,11 @@ export async function anchoredPage(ctx, key, cursor, mode) {
   if (at >= PAGE && oldest) earlier = seg ? `${oldest}.${seg}` : oldest; // more rows in this segment
   else if (seg && key === ctx.appKey) { // this segment is done: the conversation before the previous reset, if the bridge made it
     const list = ctx.ledger.list(); const i = list.findIndex((x) => x.resetId === seg);
-    earlier = i > 0 ? list[i - 1].resetId : null;
+    const done = i >= 0 ? list[i].anchorId : null;
+    // skip entries that point at the conversation just returned (ledgers written before empty resets were collapsed)
+    let j = i - 1;
+    while (j >= 0 && list[j].anchorId === done) j--;
+    earlier = i > 0 && j >= 0 ? list[j].resetId : null;
   }
   return { messages, earlier, found: true };
 }
