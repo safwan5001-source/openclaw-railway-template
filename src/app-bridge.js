@@ -11,6 +11,7 @@
 //   POST /app/v1/model { model }   -> pins a listed, available model on the app session ("default" clears the pin)
 //   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
 //   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
+//   GET  /app/v1/events, /approvals, /approvals/history, POST /approvals/:id -> src/app-bridge-live.js (B0/B3, persistent link)
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -28,6 +29,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import express from "express";
 import { whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
+import { createLiveRoutes } from "./app-bridge-live.js";
 
 export const APP_SESSION = "app:owner";
 export const APP_SESSION_KEY = "agent:main:app:owner";
@@ -43,6 +45,8 @@ const MODELS_CACHE_MS = 60_000;
 const MAX_MODEL_REF = 200;
 const FAST_MODES = { on: true, off: false, default: null };
 const RESET_RECHECK_MS = 1500;
+const APPROVAL_GRACE_MS = 60_000; // a turn waiting on an approval may run until that approval expires, plus this
+const WATCH_MS = 20_000; // the app counts as "watching" a reply when it polled the bridge this recently
 
 /** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
 export function safeStr(v, max = 200) {
@@ -166,20 +170,29 @@ async function readCompletionStream(body, onText) {
  *           fetchImpl?: typeof fetch, now?: () => number,
  *           gatewayCall?: (method: "models.list" | "sessions.describe" | "sessions.patch", params: object) => Promise<any> }} opts
  *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
+ * @param {ReturnType<import("./gateway-link.js").createGatewayLink>} [opts.link] the persistent gateway link (events, approvals,
+ *   and the approval deadline that keeps a waiting turn alive); without it /events and /approvals* return 503 not_available.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
-export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall }) {
+export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall, link }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const router = express.Router();
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
+  // B4: a reply that finishes while the app was not polling (phone locked / app closed) is worth a push; /events is the server's
+  // own poller, never the app on screen, so it does not count.
+  let lastAppAt = 0;
+  link?.setDecorator((e) => (e.type === "chat.final" || e.type === "chat.error" ? { ...e, seen: now() - lastAppAt < WATCH_MS } : e));
 
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store");
     const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
     // A valid token always passes: anonymous failures must never lock the owner's app out (they only slow down guessing).
-    if (m && safeEqual(m[1].trim(), appToken)) return next();
+    if (m && safeEqual(m[1].trim(), appToken)) {
+      if (!req.path.startsWith("/events")) lastAppAt = now();
+      return next();
+    }
     const t = now();
     if (t - failures.windowStart > 60_000) failures = { windowStart: t, count: 0 };
     failures.count += 1;
@@ -225,7 +238,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     res.status(502).json({ ok: false, error: "engine_unavailable" });
   };
 
-  router.get("/status", (_req, res) => res.json({ ok: true, appSession: APP_SESSION_KEY }));
+  router.get("/status", (_req, res) => res.json({ ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" } }));
 
   router.get("/sessions", async (_req, res) => {
     try {
@@ -269,7 +282,13 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     runs.set(id, run);
     while (runs.size > MAX_RUNS_KEPT) runs.delete(runs.keys().next().value);
 
-    const timer = setTimeout(() => ctl.abort(), RUN_TIMEOUT_MS);
+    // A turn waiting on an exec/plugin approval must not time out before the approval itself does (30 min by default)
+    const onTimeout = () => {
+      const until = link?.approvalDeadline(APP_SESSION_KEY);
+      if (until && until > now()) { timer = setTimeout(onTimeout, until - now() + APPROVAL_GRACE_MS); return; }
+      ctl.abort();
+    };
+    let timer = setTimeout(onTimeout, RUN_TIMEOUT_MS);
     (async () => {
       await queue; // a model/thinking/fast change already under way applies BEFORE this turn starts (never mid-turn)
       const r = await fetchImpl(`${gatewayUrl}/v1/chat/completions`, {
@@ -472,6 +491,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       res.json({ ok: true, fast: { mode } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
   }));
+
+  router.use(createLiveRoutes({ link, log }));
 
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));

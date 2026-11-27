@@ -1,0 +1,359 @@
+// BASHT gateway link (B0): ONE persistent loopback WebSocket from the wrapper to its own OpenClaw gateway.
+//
+// Why: every `openclaw gateway call` spawns a full Node process (~1.5 s CPU). That is fine for a rare settings write, not for
+// approvals and live events. The gateway pushes what the app needs as WebSocket events; this module keeps one connection, turns
+// the few events the app needs into small fixed records in a bounded in-memory ring, and offers a short allowlist of RPCs.
+//
+// Connection (verified against OpenClaw 2026.11.10, see docs/BASHT_APP_BRIDGE.md "B0"):
+// - Gateway protocol v4 as documented in docs/gateway/protocol/handshake.md: wait for `connect.challenge`, send `connect`,
+//   expect `hello-ok`. Node's built-in WebSocket; no extra dependency.
+// - `client: { id: "gateway-client", mode: "backend" }` on direct loopback with the shared gateway token: the documented trusted
+//   local backend path. No device identity, no pairing record, no device token; the gateway grants exactly the requested scopes.
+// - Scopes `operator.read` + `operator.approvals` + `operator.admin`, cap `approvals`. Admin is needed because the gateway shows
+//   gateway-owned approvals (turns from the app's HTTP endpoint, WhatsApp, cron) only to admin connections; without it the list is
+//   empty and the approval is denied at once as "no-approval-route". The wrapper already holds the gateway token (full authority
+//   through its CLI); this link adds no authority, and `request()` refuses every method outside LINK_METHODS below.
+// - While this link is up it is an approval client: an exec that needs approval WAITS for an answer (up to the approval's own
+//   expiry, 30 min by default) instead of being denied by `askFallback`. Nothing answers on its own: only a decision the owner
+//   makes in the app (or Control UI / a chat channel) resolves it.
+//
+// Ring records carry fixed, trimmed fields only (no commands beyond a short preview, no paths, no env, no raw payloads).
+import crypto from "node:crypto";
+
+export const APP_SESSION_KEY = "agent:main:app:owner";
+export const LINK_SCOPES = Object.freeze(["operator.read", "operator.approvals", "operator.admin"]);
+export const LINK_CAPS = Object.freeze(["approvals"]);
+/** The ONLY gateway methods this link will send. Reads, plus the one approval write. Anything else is refused locally. */
+export const LINK_METHODS = Object.freeze(new Set([
+  "models.list", "sessions.describe",
+  "exec.approval.list", "plugin.approval.list", "openclaw.approval.list", "approval.get", "approval.history", "approval.resolve",
+]));
+export const APPROVAL_KINDS = Object.freeze({ exec: "exec", plugin: "plugin", openclaw: "system-agent" });
+const LIST_METHOD = { exec: "exec.approval.list", plugin: "plugin.approval.list", "system-agent": "openclaw.approval.list" };
+export const RING_SIZE = 500;
+export const MAX_SUMMARY = 300;
+const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+const CONNECT_TIMEOUT_MS = 30_000;
+const DEFAULT_TICK_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const SEEN_APPROVALS = 2_000;
+const PROTOCOL = 4;
+
+const str = (v, max = 200) => {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return s ? (s.length > max ? `${s.slice(0, max - 1)}…` : s) : null;
+};
+const int = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : null);
+
+/** Where an approval or run came from, as a label only (never the raw key: WhatsApp keys carry phone numbers). */
+export function sessionKind(key) {
+  const k = typeof key === "string" ? key : "";
+  if (k === APP_SESSION_KEY) return "app";
+  if (k === "agent:main:main") return "main";
+  if (/:whatsapp:/i.test(k)) return "whatsapp";
+  if (/:cron:/i.test(k)) return "cron";
+  return k ? "other" : "unknown";
+}
+
+/** A pending approval record (list item or `*.approval.requested` payload) in the bridge's fixed shape. Null if unusable. */
+export function approvalView(rec, kind) {
+  const id = str(rec?.id, 128);
+  if (!id || !Object.values(APPROVAL_KINDS).includes(kind)) return null;
+  const r = rec.request && typeof rec.request === "object" ? rec.request : {};
+  // exec: the command (preview first when the gateway made one); plugin / system-agent: their own title or description
+  const summary = str(r.commandPreview, MAX_SUMMARY) ?? str(r.command, MAX_SUMMARY) ?? str(r.title, MAX_SUMMARY)
+    ?? str(r.description, MAX_SUMMARY) ?? str(r.toolName, MAX_SUMMARY) ?? null;
+  const decisions = Array.isArray(r.allowedDecisions) ? r.allowedDecisions : ["allow-once", "deny"];
+  return {
+    id, kind, summary, title: str(r.title, 120), host: str(r.host, 20), agentId: str(r.agentId, 64),
+    session: sessionKind(r.sessionKey), isApp: r.sessionKey === APP_SESSION_KEY,
+    warning: str(r.warningText, 200),
+    createdAt: int(rec.createdAtMs), expiresAt: int(rec.expiresAtMs),
+    // the app offers allow-once and deny only (allow-always would mint a standing grant)
+    decisions: ["allow-once", "deny"].filter((d) => decisions.includes(d)),
+  };
+}
+
+const kindOfEvent = (name) => {
+  const m = /^(exec|plugin|openclaw)\.approval\.(requested|resolved)$/.exec(name);
+  return m ? { kind: APPROVAL_KINDS[m[1]], phase: m[2] } : null;
+};
+
+/**
+ * One gateway event as a ring record without id/at, or null when the app does not need it.
+ * Fixed fields only. `chat.*` is reported for the app session alone.
+ */
+export function normalizeEvent(name, p) {
+  if (!p || typeof p !== "object") return null;
+  const ap = kindOfEvent(name);
+  if (ap?.phase === "requested") {
+    const v = approvalView(p, ap.kind);
+    return v ? { type: "approval.requested", approval: v } : null;
+  }
+  if (ap?.phase === "resolved") {
+    const id = str(p.id, 128);
+    if (!id) return null;
+    const d = ["allow-once", "allow-always", "deny"].includes(p.decision) ? p.decision : null;
+    return { type: "approval.resolved", approvalId: id, kind: ap.kind, decision: d, session: sessionKind(p.request?.sessionKey) };
+  }
+  if (name === "chat" && p.sessionKey === APP_SESSION_KEY && (p.state === "final" || p.state === "error")) {
+    return { type: p.state === "final" ? "chat.final" : "chat.error", session: "app", runId: str(p.runId, 100) };
+  }
+  if (name === "cron" && p.action === "finished") {
+    const job = p.job && typeof p.job === "object" ? p.job : {};
+    const status = str(p.status, 20) ?? str(job.state?.lastRunStatus, 20) ?? str(job.state?.lastStatus, 20);
+    const failed = status !== null && !["ok", "success", "skipped"].includes(status);
+    return { type: failed ? "cron.failed" : "cron.finished", jobId: str(p.jobId ?? job.id, 100), name: str(job.name, 80), status };
+  }
+  return null;
+}
+
+/**
+ * @param {{ url: string, token: string, log?: any, WebSocketImpl?: any, now?: () => number, ringSize?: number,
+ *           clientVersion?: string, setTimer?: typeof setTimeout, clearTimer?: typeof clearTimeout, random?: () => number }} o
+ */
+export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.WebSocket, now = Date.now, ringSize = RING_SIZE,
+  clientVersion = "basht-bridge/1", setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random }) {
+  const epoch = crypto.randomBytes(6).toString("hex");
+  let nextId = now(); // ids keep increasing across wrapper restarts (seeded with the boot time), the epoch says "new ring"
+  const ring = [];
+  const waiters = new Set();
+  const pending = new Map(); // approval id -> { kind, sessionKey, expiresAt }
+  const seenApprovals = new Set();
+  let decorate = (e) => e;
+
+  let ws = null;
+  let state = "off"; // off | connecting | up | down
+  let since = now();
+  let lastUpAt = null;
+  let downSince = null;
+  let reconnects = 0;
+  let attempt = 0;
+  let lastError = null;
+  let reqSeq = 0;
+  const inflight = new Map();
+  let retryTimer = null;
+  let watchdog = null;
+  let tickMs = DEFAULT_TICK_MS;
+  let stopped = true;
+
+  const setState = (s, err) => {
+    if (state === s) return;
+    state = s; since = now();
+    if (err !== undefined) lastError = err;
+    log?.info?.("gateway-link", `${s}${err ? ` (${err})` : ""}`);
+  };
+
+  function push(rec) {
+    if (!rec) return;
+    const e = decorate({ id: ++nextId, at: now(), ...rec });
+    ring.push(e);
+    while (ring.length > ringSize) ring.shift();
+    for (const w of waiters) w();
+  }
+
+  function remember(id) {
+    seenApprovals.add(id);
+    if (seenApprovals.size > SEEN_APPROVALS) seenApprovals.delete(seenApprovals.values().next().value);
+  }
+
+  function trackApproval(view, sessionKey) {
+    pending.set(view.id, { kind: view.kind, sessionKey: sessionKey ?? null, expiresAt: view.expiresAt });
+    if (seenApprovals.has(view.id)) return;
+    remember(view.id);
+    push({ type: "approval.requested", approval: view });
+  }
+
+  function onEvent(name, payload) {
+    const ap = kindOfEvent(name);
+    if (ap?.phase === "requested") {
+      const v = approvalView(payload, ap.kind);
+      if (v) trackApproval(v, payload.request?.sessionKey);
+      return;
+    }
+    if (ap?.phase === "resolved") {
+      const id = str(payload?.id, 128);
+      if (id) pending.delete(id);
+    }
+    push(normalizeEvent(name, payload));
+  }
+
+  const send = (frame) => { try { ws?.send(JSON.stringify(frame)); return true; } catch { return false; } };
+
+  function armWatchdog() {
+    clearTimer(watchdog);
+    watchdog = setTimer(() => { const s = ws; ws = null; try { s?.close(4000, "stale"); } catch { /* ignore */ } dropped("stale"); }, Math.round(tickMs * 2.5));
+    watchdog?.unref?.();
+  }
+
+  function rpc(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const id = `l${++reqSeq}`;
+      const t = setTimer(() => { inflight.delete(id); reject(Object.assign(new Error(`${method} timed out`), { code: "timeout" })); }, timeoutMs);
+      t?.unref?.();
+      inflight.set(id, { resolve, reject, t });
+      if (!send({ type: "req", id, method, params: params ?? {} })) {
+        clearTimer(t); inflight.delete(id); reject(Object.assign(new Error("link_down"), { code: "link_down" }));
+      }
+    });
+  }
+
+  function failInflight(code) {
+    for (const [id, f] of inflight) { clearTimer(f.t); f.reject(Object.assign(new Error(code), { code })); inflight.delete(id); }
+  }
+
+  /** After (re)connecting: the pending approvals are read again, and any that arrived while the link was down enter the ring. */
+  async function resync() {
+    const seen = new Set();
+    for (const [kind, method] of Object.entries(LIST_METHOD)) {
+      let rows;
+      try { rows = await rpc(method, {}); } catch { continue; }
+      for (const r of Array.isArray(rows) ? rows : []) {
+        const v = approvalView(r, kind);
+        if (!v) continue;
+        seen.add(v.id);
+        trackApproval(v, r.request?.sessionKey);
+      }
+    }
+    for (const id of [...pending.keys()]) if (!seen.has(id)) pending.delete(id);
+  }
+
+  function dropped(reason) {
+    clearTimer(watchdog);
+    ws = null;
+    failInflight("link_down");
+    if (stopped) { setState("off"); return; }
+    if (state === "up") { downSince = now(); push({ type: "gateway.down" }); }
+    lastError = reason ?? lastError;
+    setState("down", lastError);
+    schedule();
+  }
+
+  function schedule(delayMs) {
+    clearTimer(retryTimer);
+    if (stopped) return;
+    const base = delayMs ?? BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+    attempt += 1;
+    retryTimer = setTimer(connect, Math.round(base * (0.8 + random() * 0.4)));
+    retryTimer?.unref?.();
+  }
+
+  function connect() {
+    if (stopped || ws) return;
+    if (typeof WebSocketImpl !== "function") { setState("down", "no_websocket"); return; }
+    if (state !== "up") setState(state === "off" ? "connecting" : state);
+    let sock;
+    try { sock = new WebSocketImpl(url); } catch { lastError = "connect_failed"; setState("down", lastError); schedule(); return; }
+    ws = sock;
+    let helloDone = false;
+    let why = null; // why THIS attempt ended
+    const connectTimer = setTimer(() => { if (!helloDone) { why = "connect_timeout"; try { sock.close(); } catch { /* ignore */ } } }, CONNECT_TIMEOUT_MS);
+    connectTimer?.unref?.();
+    const closed = () => {
+      clearTimer(connectTimer);
+      if (ws !== sock) return;
+      dropped(why ?? "closed");
+    };
+    sock.onclose = closed;
+    sock.onerror = () => { why ??= "socket_error"; };
+    sock.onmessage = (m) => {
+      if (ws !== sock) return;
+      let f;
+      try { f = JSON.parse(typeof m.data === "string" ? m.data : String(m.data)); } catch { return; }
+      if (helloDone) armWatchdog();
+      if (f?.type === "res") {
+        const w = inflight.get(f.id);
+        if (!w) return;
+        clearTimer(w.t); inflight.delete(f.id);
+        if (f.ok) w.resolve(f.payload);
+        else w.reject(Object.assign(new Error(str(f.error?.message, 200) ?? "gateway error"), { code: str(f.error?.code, 60) ?? "error", refused: true,
+          reason: str(f.error?.details?.reason, 60), retryAfterMs: int(f.error?.details?.retryAfterMs) }));
+        return;
+      }
+      if (f?.type !== "event") return;
+      if (f.event === "connect.challenge" && !helloDone) {
+        rpc("connect", {
+          minProtocol: PROTOCOL, maxProtocol: PROTOCOL,
+          client: { id: "gateway-client", version: clientVersion, platform: process.platform, mode: "backend" },
+          role: "operator", scopes: [...LINK_SCOPES], caps: [...LINK_CAPS], auth: { token },
+        }, CONNECT_TIMEOUT_MS).then((hello) => {
+          helloDone = true;
+          clearTimer(connectTimer);
+          const granted = Array.isArray(hello?.auth?.scopes) ? hello.auth.scopes : [];
+          if (!LINK_SCOPES.every((s) => granted.includes(s))) {
+            why = "scopes_not_granted"; // e.g. a gateway that requires pairing for this client: never run half-authorized
+            try { sock.close(4001, "scopes"); } catch { /* ignore */ }
+            return;
+          }
+          tickMs = int(hello?.policy?.tickIntervalMs) || DEFAULT_TICK_MS;
+          attempt = 0;
+          const downFor = downSince ? now() - downSince : null;
+          lastUpAt = now(); downSince = null; lastError = null;
+          reconnects += 1;
+          push({ type: "gateway.up", downForMs: downFor });
+          setState("up");
+          armWatchdog();
+          resync().catch(() => {});
+        }).catch((err) => {
+          why = err?.code === "UNAVAILABLE" ? "gateway_starting" : str(err?.code, 60) ?? "connect_refused";
+          if (err?.retryAfterMs) attempt = 0;
+          try { sock.close(); } catch { /* ignore */ }
+        });
+        return;
+      }
+      if (helloDone && typeof f.event === "string") onEvent(f.event, f.payload);
+    };
+  }
+
+  return {
+    epoch,
+    start() { if (!stopped) return; stopped = false; attempt = 0; connect(); },
+    stop() {
+      stopped = true; clearTimer(retryTimer); clearTimer(watchdog);
+      const s = ws; ws = null; failInflight("link_down");
+      try { s?.close(1000, "stop"); } catch { /* ignore */ }
+      setState("off");
+      for (const w of waiters) w();
+    },
+    /** Connect now instead of waiting for the backoff (e.g. right after the wrapper started the gateway). */
+    kick() { if (!stopped && !ws) { clearTimer(retryTimer); attempt = 0; connect(); } },
+    isUp: () => state === "up",
+    status: () => ({ state, since, lastUpAt, reconnects: Math.max(0, reconnects - 1), lastError: state === "up" ? null : lastError, pendingApprovals: pending.size }),
+    /** One allowlisted RPC over the link. Rejects with code "link_down" when the link is not up, "not_allowed" off the list. */
+    request(method, params, { timeoutMs } = {}) {
+      if (!LINK_METHODS.has(method)) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
+      if (state !== "up") return Promise.reject(Object.assign(new Error("link_down"), { code: "link_down" }));
+      return rpc(method, params, timeoutMs);
+    },
+    /** Records with id > after (oldest first, at most `limit`). `truncated`: some records after `after` already left the ring. */
+    events(after, limit = 100) {
+      const a = Number.isSafeInteger(after) ? after : 0;
+      const out = ring.filter((e) => e.id > a).slice(0, Math.max(1, Math.min(limit, 200)));
+      const oldest = ring[0]?.id ?? null;
+      return { epoch, latest: ring.at(-1)?.id ?? nextId, oldest, truncated: a > 0 && oldest !== null && a < oldest - 1, events: out };
+    },
+    /** Resolves when a record newer than `after` exists, after `ms`, or on `signal` abort. */
+    waitForEvents(after, ms, signal) {
+      if ((ring.at(-1)?.id ?? 0) > after || ms <= 0) return Promise.resolve();
+      return new Promise((resolve) => {
+        const done = () => { clearTimer(t); waiters.delete(done); signal?.removeEventListener?.("abort", done); resolve(); };
+        const t = setTimer(done, ms);
+        waiters.add(done);
+        signal?.addEventListener?.("abort", done, { once: true });
+      });
+    },
+    /** Latest expiry of a pending approval for this session (ms), or null. Lets a turn that waits on an approval outlive its timer. */
+    approvalDeadline(sessionKey) {
+      let max = null;
+      const t = now();
+      for (const p of pending.values()) if (p.sessionKey === sessionKey && p.expiresAt && p.expiresAt > t) max = Math.max(max ?? 0, p.expiresAt);
+      return max;
+    },
+    /** Kind of a pending approval this link has seen (exec / plugin / system-agent), or null. */
+    pendingKind: (id) => pending.get(id)?.kind ?? null,
+    forgetApproval: (id) => { pending.delete(id); },
+    /** The bridge adds facts only it knows (e.g. whether the app was watching when a reply finished). */
+    setDecorator(fn) { decorate = typeof fn === "function" ? fn : (e) => e; },
+  };
+}
