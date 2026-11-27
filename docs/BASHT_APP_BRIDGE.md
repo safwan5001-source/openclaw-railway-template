@@ -1,4 +1,4 @@
-# BASHT app bridge (C2 + C4 + M + B0/B3 + voice)
+# BASHT app bridge (C2 + C4 + M + B0/B3 + voice + B1/B2)
 
 How the BASHT app (`safwan-smart-assistant`) reads the owner's conversations and chats with BASHT live. The code is in
 `src/app-bridge.js` and the tests are in `src/app-bridge.test.mjs`.
@@ -32,6 +32,11 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `POST /app/v1/approvals/:id {decision}` | B3: `"allow-once"` or `"deny"` only | link: `approval.get` (kind), `approval.resolve` |
 | `POST /app/v1/speak {text}` | The text spoken in BASHT's own voice; returns the audio bytes (`audio/mpeg`) | `tts` tool via `/tools/invoke`, session `agent:main:app:owner` |
 | `POST /app/v1/transcribe` (raw audio body) | A voice note transcribed with the engine's own audio config; returns `{ok, text}` | CLI `openclaw infer audio transcribe --agent main --file <temp> --json` |
+| `POST /app/v1/send {message, images?}` | B2: up to 8 photos ride on the same turn as `image_url` data parts | `/v1/chat/completions` (as above) |
+| `GET /app/v1/history?key=&before=\|around=` | B1: earlier rows (also across a reset) or a window around one message | RPC `chat.history {messageId}` (anchored) |
+| `POST /app/v1/new` | B1 «محادثة جديدة»: a fresh context for the app session; nothing is deleted | RPC `sessions.reset {key: app session, reason: "new"}` |
+| `GET /app/v1/search?q=` | B1: search the readable conversations only | RPC `sessions.search {sessionKeys: readable keys}` |
+| `GET /app/v1/media?key=&msg=&ref=` | B2: one image/file of one message of a readable conversation (bytes) | RPC `artifacts.download`, or an engine-owned file |
 
 `/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Assistant messages in
 `/history` carry `provider` and `model`. The notice OpenClaw writes when it switches models carries
@@ -148,6 +153,43 @@ cannot choose a voice, provider, model or session.
   deny list, but a `tools.profile` / `tools.allow` / `tools.deny` or `gateway.tools.deny` that excludes it makes `/speak` 503.
 - Transcription uses `tools.media` (explicit `tools.media.models` with an `audio` capability, or auto-detection). If WhatsApp
   voice notes are transcribed today, `/transcribe` works with the same settings. `ffmpeg` is already in the image.
+## Chat basics and media (B1 + B2)
+
+Code: `src/app-bridge-convo.js` and `src/app-bridge-media.js`. Tests: `src/app-bridge-media.test.mjs`. The wrapper's CLI allowlist
+adds `sessions.reset`, `sessions.search`, `chat.history` and `artifacts.download`; only `artifacts.download` gets a 32 MB output
+buffer. Every call is built by the bridge with the app session key or a key that passed `isReadable`.
+
+- **Photos in.** Only `/send` takes a larger body (19 MB); every other route keeps 64 kB. `images: [{mime, data}]` (base64, no
+  `data:` prefix). Limits follow the engine: at most 8 images, 10 MB each, 14 MB per message (so the request stays under the
+  engine's 20 MiB cap). MIME must be on the engine's list and the first bytes must match it. Refusals are `too_many_images`,
+  `image_too_large`, `images_too_large` and `unsupported_image`. The app re-encodes photos on the device first (no EXIF or GPS).
+  A text-only model gets no image at all (lab: the engine drops it silently), so the app warns before sending.
+- **Rows.** `/history` rows carry `id` (`__openclaw.id`) and `media`. A reset boundary is `{role: "system", kind: "reset"}`.
+  `MEDIA:` lines (the engine's rule: standalone, outside code) and `[media attached: …]` markers are removed from `text` and
+  become `media: [{ref, kind: image|file, name, mime, size, available}]`, or `{kind: "link", url}` for a public https URL.
+  A `ref` is `sha256(key, messageId, position, source)`. Paths and artifact ids never leave the bridge.
+- **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
+  `chat.history`), so it only works for the message it came from.
+  - Image blocks are fetched with `artifacts.download` (image types only, bytes must match).
+  - Allowed roots are resolved per request (a root created after the wrapper started is honoured).
+  - Files are served only if their realpath (symlinks resolved, `O_NOFOLLOW`) is a regular file inside the agent workspace or
+    `<stateDir>/media`, the extension is on a fixed list (images, PDF, txt/md/csv/json, docx/xlsx/pptx, mp3/m4a/ogg/wav, mp4),
+    the first bytes match the type, and the size is at most 20 MB. Relative paths resolve against the workspace.
+    `media://inbound/<id>` maps to the inbound store. Other schemes are never followed, and nothing is listed.
+  - Responses carry `Content-Disposition: attachment`, `nosniff` and `CSP: sandbox`. SVG is never inline.
+- **Steps.** While the app polls `/runs/:id`, the bridge reads the app session's last 12 rows (`sessions_history`,
+  `includeTools`) at most every 1.5 s, and returns `steps: [{tool, done}]`: tool names only.
+- **New conversation.** Refused while a turn runs (409); while a reset is under way `/send` answers 409 `busy` too (one shared
+  exclusion), and the reset re-checks for a running turn right before `sessions.reset`. OpenClaw keeps the same session id and transcript. Its default
+  projection then starts at the reset row, while older rows stay reachable by an anchored read. That read stays inside one
+  reset segment, and a forged `cursor` gets `windowReset`. So the bridge records, per reset it makes, `{resetId, anchorId}` (ids
+  only) in `<stateDir>/app-bridge/resets.json` (0600, last 50). `/history` returns `earlier: <resetId>` when the first row is such a
+  reset. `before=<cursor>` pages back and chains across earlier resets the bridge made. Resets made elsewhere (for example `/new`
+  in the Control UI) have no anchor, so their earlier rows are not offered to the app; they stay in the engine.
+- **Search.** `sessionKeys` is always the readable keys (app, main and the owner's WhatsApp direct chats). Results are filtered
+  again, toolResult hits are dropped, and snippets lose `MEDIA:` lines, markers and absolute paths.
+- **Not offered.** Documents/PDFs to BASHT (they need `chat.send` attachments: over the CLI argv cap; waits for a WebSocket
+  client). No edit or rewind (admin, branches). No parallel app sessions.
 
 ## Rules
 
@@ -173,7 +215,7 @@ cannot choose a voice, provider, model or session.
     owner's WhatsApp chat then appears as its own `…:direct:<owner>` conversation) or make WhatsApp an owner-only allowlist.
     An unreadable config fails closed.
 
-  Groups, other people's chats, subagents and cron jobs are never listed or read. History returns text parts only: no tool payloads and no thinking. OpenClaw caps each message at 4,000 characters in `sessions_history`.
+  Groups, other people's chats, subagents and cron jobs are never listed or read. History returns text parts only (plus B2 media refs): no tool payloads and no thinking. OpenClaw caps each message at 4,000 characters in `sessions_history`.
 - **Turns are robust.**
   - The wrapper holds the upstream request, so a turn keeps running if the phone disconnects.
   - Only one turn runs at a time; a second request gets 409.
@@ -234,6 +276,15 @@ Chat and conversations (C2 + C4):
 - Sessions and history follow the allowlist.
 - Anonymous public `/tools/invoke` and `/v1/chat/completions` still return 401.
 - No token appears in the logs.
+
+B1/B2 (lab-cm: this wrapper in front of the real 2026.11.10 gateway, mock provider that logs image parts), 23/23 via the app:
+- A 3000×2000 JPEG with GPS EXIF reached the provider as one `image/jpeg` part of 148 KB with no EXIF.
+- After the turn, the user row carries the engine's image block as media (served through `artifacts.download`).
+- `MEDIA:` image and PDF were shown; the PDF download was byte-identical. `/etc/passwd`, a symlink out of the workspace and
+  `../` were `available: false` / 404.
+- Tool step shown («قراءة ملف»); stop, then retry, re-sent the same message.
+- Search found an engine message and jumped to it.
+- After `/new`, the first turn reached the provider with 3 messages instead of 22, and the earlier rows were paged back in.
 
 ## B0: the persistent gateway link (`src/gateway-link.js`)
 

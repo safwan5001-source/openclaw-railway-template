@@ -648,11 +648,16 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, gateway: health.gateway });
 });
 
-// The only gateway RPCs the app bridge may make (model control). Run as `openclaw gateway call` against the local gateway;
+// The only gateway RPCs the app bridge may make. Run as `openclaw gateway call` against the local gateway;
 // the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
-const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch"]);
+// Model control (M): models.list, sessions.describe, sessions.patch. Chat basics + media (B1/B2): sessions.reset (the app session
+// only, params built by the bridge), sessions.search, chat.history (anchored reads), artifacts.download (one image of one message).
+const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch",
+  "sessions.reset", "sessions.search", "chat.history", "artifacts.download"]);
+// an image artifact comes back as base64 inside the JSON (<= 10 MB image -> ~14 MB): only that call gets the bigger buffer
+const APP_BRIDGE_RPC_BUFFER = { "artifacts.download": 32 * 1024 * 1024 };
 // B0: reads go over the persistent gateway link when it is up (no process spawn); the CLI stays the fallback and the only path
-// for writes (sessions.patch).
+// for writes (sessions.patch, sessions.reset) and for the reads the link does not carry (see LINK_METHODS in src/gateway-link.js).
 const APP_BRIDGE_LINK_READS = new Set(["models.list", "sessions.describe"]);
 let gatewayLink = null;
 function appBridgeGatewayCall(method, params) {
@@ -671,7 +676,7 @@ function appBridgeCliCall(method, params) {
   return new Promise((resolve, reject) => {
     childProcess.execFile(OPENCLAW_NODE, args, {
       env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
-      timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+      timeout: 30_000, maxBuffer: APP_BRIDGE_RPC_BUFFER[method] ?? 8 * 1024 * 1024,
     }, (err, stdout) => {
       let j = null;
       try { j = JSON.parse(stdout); } catch { /* not JSON */ }
@@ -732,6 +737,7 @@ const appBridge = createAppBridge({
   gatewayCall: appBridgeGatewayCall,
   link: pendingLink,
   stateDir: STATE_DIR,
+  workspaceDir: WORKSPACE_DIR,
   transcribe: appBridgeTranscribe,
 });
 if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
