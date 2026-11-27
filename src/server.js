@@ -22,7 +22,7 @@ import {
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
-import { createAppBridge } from "./app-bridge.js";
+import { createAppBridge, parseTranscribeOutput } from "./app-bridge.js";
 import { createGatewayLink } from "./gateway-link.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
@@ -686,6 +686,40 @@ function appBridgeCliCall(method, params) {
   });
 }
 
+// Voice notes from the app (V3): transcribed exactly like WhatsApp voice notes, with the agent's own audio config (tools.media).
+// There is no transcription RPC, so the wrapper runs the CLI. The only argv from outside is the bridge's own temp file path;
+// no shell, no user text.
+// OpenClaw sniffs WebM as video/webm and its audio step then skips it ("No transcript returned"), while Chrome/Android record
+// voice notes as WebM/Opus. Such a note is remuxed (stream copy, no re-encode) to Ogg/Opus next to it, in the bridge's private dir.
+function remuxWebmToOgg(filePath) {
+  const out = String(filePath).replace(/\.webm$/, ".ogg");
+  return new Promise((resolve, reject) => {
+    childProcess.execFile("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", String(filePath), "-vn", "-map", "0:a:0", "-c:a", "copy", out],
+      { timeout: 30_000 }, (err) => (err ? reject(Object.assign(new Error("remux failed"), { badAudio: true })) : resolve(out)));
+  });
+}
+
+async function appBridgeTranscribe(filePath) {
+  const file = /\.webm$/.test(String(filePath)) ? await remuxWebmToOgg(filePath) : String(filePath);
+  const args = clawArgs(["infer", "audio", "transcribe", "--agent", "main", "--file", file, "--json"]);
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(OPENCLAW_NODE, args, {
+      env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
+      timeout: 90_000, maxBuffer: 4 * 1024 * 1024,
+    }, (err, stdout) => {
+      const j = parseTranscribeOutput(stdout);
+      if (!j || j.ok !== true) {
+        const type = typeof j?.error?.type === "string" ? j.error.type : err?.code ?? "no_json";
+        const e = new Error(`transcribe failed (${type})`);
+        e.refused = !!j && j.ok === false; // the CLI answered and said no (no audio model, provider error)
+        return reject(e);
+      }
+      const outputs = Array.isArray(j.outputs) ? j.outputs : [];
+      resolve(outputs.map((o) => (typeof o?.text === "string" ? o.text : "")).join("\n"));
+    });
+  });
+}
+
 // BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
 // B0: with the bridge on, one persistent loopback operator link to the gateway (src/gateway-link.js); it reconnects on its own.
 const pendingLink = createGatewayLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log });
@@ -697,6 +731,8 @@ const appBridge = createAppBridge({
   log,
   gatewayCall: appBridgeGatewayCall,
   link: pendingLink,
+  stateDir: STATE_DIR,
+  transcribe: appBridgeTranscribe,
 });
 if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
