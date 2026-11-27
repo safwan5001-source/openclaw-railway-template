@@ -573,15 +573,25 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (Number.isFinite(declared) && declared > MAX_AUDIO_BYTES) return res.status(413).json({ ok: false, error: "too_large" });
     if (!transcribeLimit()) return res.status(429).json({ ok: false, error: "rate_limited" });
     if (transcribing >= TRANSCRIBES_IN_FLIGHT) return res.status(429).json({ ok: false, error: "rate_limited" });
+    // Reserve the slot BEFORE the body is read: uploads still arriving count, so overlapping uploads can never start more than
+    // TRANSCRIBES_IN_FLIGHT transcribers. Released exactly once: by the handler when it finishes, or when the response ends
+    // without the handler having run (parse error, too large, client gone).
+    transcribing++;
+    const slot = { handled: false, released: false };
+    req.voiceSlot = slot;
+    const release = () => { if (!slot.released) { slot.released = true; transcribing--; } };
+    slot.release = release;
+    res.on("close", () => { if (!slot.handled) release(); });
     req.audioExt = AUDIO_TYPES[type];
     rawAudio(req, res, (err) => {
       if (err) return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? "too_large" : "bad_request" });
       next();
     });
   }, async (req, res) => {
+    const slot = req.voiceSlot;
+    slot.handled = true;
     const audio = Buffer.isBuffer(req.body) ? req.body : null;
-    if (!audio || audio.length < MIN_AUDIO_BYTES) return res.status(422).json({ ok: false, error: "no_speech" });
-    transcribing++;
+    if (!audio || audio.length < MIN_AUDIO_BYTES) { slot.release(); return res.status(422).json({ ok: false, error: "no_speech" }); }
     let dir = null;
     try {
       dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "basht-voice-")); // 0700, unpredictable name
@@ -599,7 +609,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (err?.badAudio) return res.status(415).json({ ok: false, error: "unsupported_audio" }); // the recording could not be read
       fail(res, err, "transcribe");
     } finally {
-      transcribing--;
+      slot.release();
       if (dir) fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   });
