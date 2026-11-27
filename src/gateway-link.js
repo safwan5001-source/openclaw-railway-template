@@ -23,11 +23,25 @@ import crypto from "node:crypto";
 export const APP_SESSION_KEY = "agent:main:app:owner";
 export const LINK_SCOPES = Object.freeze(["operator.read", "operator.approvals", "operator.admin"]);
 export const LINK_CAPS = Object.freeze(["approvals"]);
-/** The ONLY gateway methods this link will send. Reads, plus the one approval write. Anything else is refused locally. */
+/**
+ * The ONLY gateway methods this link will send. Reads, the one approval write, and `tts.speak` (BASHT's voice: it returns audio bytes
+ * and writes nothing; its params are closed, see PARAM_VALIDATORS). Anything else is refused locally.
+ */
 export const LINK_METHODS = Object.freeze(new Set([
   "models.list", "sessions.describe",
   "exec.approval.list", "plugin.approval.list", "openclaw.approval.list", "approval.get", "approval.history", "approval.resolve",
+  "tts.speak",
 ]));
+export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
+/**
+ * Methods whose params the link checks itself before anything is sent (a closed shape). A method without an entry keeps the
+ * gateway's own validation only. `tts.speak` takes `text` and nothing else: the gateway rejects any other param, and a voice, a
+ * provider or a model must never ride along from this side.
+ */
+const PARAM_VALIDATORS = Object.freeze({
+  "tts.speak": (p) => isPlainObject(p) && Object.keys(p).length === 1 && typeof p.text === "string" && p.text.length >= 1 && p.text.length <= TTS_SPEAK_MAX_CHARS,
+});
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
 export const APPROVAL_KINDS = Object.freeze({ exec: "exec", plugin: "plugin", openclaw: "system-agent" });
 const LIST_METHOD = { exec: "exec.approval.list", plugin: "plugin.approval.list", "system-agent": "openclaw.approval.list" };
 export const RING_SIZE = 500;
@@ -36,6 +50,7 @@ const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 const CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_TICK_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_REQUEST_TIMEOUT_MS = 120_000; // a caller may ask for longer than the default (tts.speak: 60 s), never unbounded
 const SEEN_APPROVALS = 2_000;
 const PROTOCOL = 4;
 
@@ -136,6 +151,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   let retryTimer = null;
   let watchdog = null;
   let tickMs = DEFAULT_TICK_MS;
+  let serverVersion = null; // hello-ok `server.version` of the current connection (an engine version label, nothing else)
   let stopped = true;
 
   const setState = (s, err) => {
@@ -292,6 +308,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
             return;
           }
           tickMs = int(hello?.policy?.tickIntervalMs) || DEFAULT_TICK_MS;
+          serverVersion = typeof hello?.server?.version === "string" && /^[0-9A-Za-z._+-]{1,40}$/.test(hello.server.version) ? hello.server.version : null;
           attempt = 0;
           const downFor = downSince ? now() - downSince : null;
           lastUpAt = now(); downSince = null; lastError = null;
@@ -325,11 +342,20 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
     kick() { if (!stopped && !ws) { clearTimer(retryTimer); attempt = 0; connect(); } },
     isUp: () => state === "up",
     status: () => ({ state, since, lastUpAt, reconnects: Math.max(0, reconnects - 1), lastError: state === "up" ? null : lastError, pendingApprovals: pending.size }),
-    /** One allowlisted RPC over the link. Rejects with code "link_down" when the link is not up, "not_allowed" off the list. */
+    /** The engine version the gateway reported in hello-ok, or null (unknown / link never up). Costs nothing: no request is made. */
+    serverVersion: () => serverVersion,
+    /**
+     * One allowlisted RPC over the link. Rejects with code "not_allowed" off the list, "bad_params" when the method's closed params
+     * do not match (nothing is sent), "link_down" when the link is not up, "timeout" after `timeoutMs` (default 15 s, at most 120 s).
+     * A timeout only stops WAITING: the gateway may still finish the work (a provider call is still billed), so callers must not
+     * retry a call that costs money.
+     */
     request(method, params, { timeoutMs } = {}) {
       if (!LINK_METHODS.has(method)) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
+      if (PARAM_VALIDATORS[method] && !PARAM_VALIDATORS[method](params)) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
       if (state !== "up") return Promise.reject(Object.assign(new Error("link_down"), { code: "link_down" }));
-      return rpc(method, params, timeoutMs);
+      const t = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, MAX_REQUEST_TIMEOUT_MS) : REQUEST_TIMEOUT_MS;
+      return rpc(method, params, t);
     },
     /** Records with id > after (oldest first, at most `limit`). `truncated`: some records after `after` already left the ring. */
     events(after, limit = 100) {
