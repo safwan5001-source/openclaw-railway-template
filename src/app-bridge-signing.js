@@ -13,7 +13,10 @@
 // request-target = the URL exactly as received (path and query, e.g. /app/v1/history?key=x), i.e. express `req.originalUrl`.
 //
 // This module is pure: no express, no I/O, an injectable clock. The router (src/app-bridge.js) runs the header phase in its auth
-// middleware and the body phase once the body parser has produced the raw bytes.
+// middleware and the body phase once the body parser has produced the raw bytes. The verifier only ANSWERS (ok / reason); what a
+// failure means is the router's call: "required" refuses it (401 bad_signature, counted in the failed-auth limiter), "optional"
+// processes the request as UNSIGNED (never as verified), logs the reason and remembers it for /status, so a mistyped secret can
+// never lock the owner out.
 import crypto from "node:crypto";
 
 export const SIGNING_SPEC = "basht-bridge-v1";
@@ -106,7 +109,8 @@ export function createSigningVerifier({ secret, previousSecret, mode = "off", no
     /**
      * Header phase (before the body is read). `req`: { method, originalUrl, headers }.
      * @returns {{ ok: true, signed: boolean, contentSha256?: string } | { ok: false, reason: string }}
-     *   signed:false = no signing header at all, accepted because the mode is "optional" (or "off").
+     *   signed:false = no signing header at all, accepted because the mode is "optional" (or "off"). ok:false = headers present but not
+     *   valid (or absent in "required"); in "optional" the router treats that request as unsigned.
      */
     checkHeaders(req) {
       if (effective === "off") return { ok: true, signed: false };

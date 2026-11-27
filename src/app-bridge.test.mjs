@@ -764,7 +764,7 @@ test("speak: never reads or deletes a file outside the speech directory (travers
 });
 
 test("speak: a tool refusal or a tool the policy does not allow is voice_unavailable (503); no engine is 502", async () => {
-  for (const [mode, reason] of [["refuse", "unconfigured"], ["not_allowed", "tool_denied"]]) {
+  for (const [mode, reason] of [["refuse", "provider_error"], ["not_allowed", "tool_denied"]]) {
     ttsMode = mode;
     const r = await speak({ text: "مرحبا" });
     assert.equal(r.status, 503, mode);

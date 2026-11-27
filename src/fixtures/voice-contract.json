@@ -1,0 +1,22 @@
+{
+  "note": "Shared contract between the engine bridge and the app API/BFF. Both sides must keep their allowlists identical to this file (tests compare against it). Reasons are fixed tokens, never free text.",
+  "reasons": [
+    "identity_mismatch",
+    "tool_denied",
+    "unconfigured",
+    "provider_error",
+    "link_down",
+    "timeout",
+    "bad_audio",
+    "engine_error",
+    "in_flight",
+    "per_minute",
+    "text_rejected",
+    "tool_path_only",
+    "tool_path_unavailable",
+    "no_tts_config",
+    "config_unreadable"
+  ],
+  "features": ["voice.speak.v2", "voice.transcribe.v1", "voice.status.v1", "signing.v1"],
+  "speakStates": ["ready", "degraded", "unconfigured", "mismatch", "unknown"]
+}

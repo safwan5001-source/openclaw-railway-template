@@ -31,7 +31,7 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `GET /app/v1/approvals` | B3: pending exec, plugin and system-agent approvals, fixed shape | link: `exec.approval.list`, `plugin.approval.list`, `openclaw.approval.list` |
 | `GET /app/v1/approvals/history?limit=N` | B3: last decided approvals (≤50) | link: `approval.history` |
 | `POST /app/v1/approvals/:id {decision}` | B3: `"allow-once"` or `"deny"` only | link: `approval.get` (kind), `approval.resolve` |
-| `POST /app/v1/speak {text}` | The text spoken in BASHT's own voice; returns the audio bytes (`audio/mpeg`, or `audio/ogg` / `audio/wav`) | link RPC `tts.speak {text}` when the voice identity guard says `match` / `global_only`; otherwise the `tts` tool via `/tools/invoke`, session `agent:main:app:owner` (see Voice) |
+| `POST /app/v1/speak {text}` | The text spoken in BASHT's own voice; returns the audio bytes (`audio/mpeg`, or `audio/ogg` / `audio/wav`) | link RPC `tts.speak {text}` when the voice identity guard says `match`; otherwise the `tts` tool via `/tools/invoke`, session `agent:main:app:owner` (see Voice) |
 | `POST /app/v1/transcribe` (raw audio body) | A voice note transcribed with the engine's own audio config; returns `{ok, text}` | CLI `openclaw infer audio transcribe --agent main --file <temp> --json` |
 | `POST /app/v1/send {message, images?}` | B2: up to 8 photos ride on the same turn as `image_url` data parts | `/v1/chat/completions` (as above) |
 | `GET /app/v1/history?key=&before=\|around=` | B1: earlier rows (also across a reset) or a window around one message | RPC `chat.history {messageId}` (anchored) |
@@ -60,21 +60,27 @@ removed with the same rules as history rows, and while the reply is still stream
 
 ```json
 { "ok": true, "appSession": "agent:main:app:owner", "link": { "state": "up", ... },
-  "features": ["voice.speak.v2", "signing.v1"],
+  "features": ["voice.speak.v2", "voice.transcribe.v1", "voice.status.v1", "signing.v1"],
   "voice": { "speak": "ready", "reason": "…", "warnings": [] },
   "runs": { "active": 0 },
-  "signing": { "mode": "optional" },
+  "signing": { "mode": "optional", "lastRejected": { "reason": "skew", "at": 0 } },
   "engine": { "version": "…" } }
 ```
 
-- `features`: capability hints for the app. `voice.speak.v2` = `/speak` answers with a `reason` on every refusal and can use the link
-  path; `signing.v1` = the engine can verify `basht-bridge-v1` signatures (whether it enforces them is `signing.mode`).
-- `voice.speak`: `ready` (guard `match` / `global_only` and the link is up) · `degraded` (`link_down`: the link is down; or
-  `tool_path_only`: the global `tts` block is not there yet, so only the tool path speaks) · `mismatch` (`identity_mismatch`) ·
-  `unconfigured` (`no_tts_config`, or `tool_path_unavailable`) · `unknown` (`config_unreadable`). `warnings` are codes only
-  (`global_auto_enabled`, `global_prefs_path`), see Voice.
+- `features`: capability hints for the app, equal to the shared contract file `src/fixtures/voice-contract.json` (an identical copy
+  lives in the app; both sides' tests compare against it). `voice.speak.v2` = `/speak` answers with a `reason` on every refusal and can
+  use the link path; `voice.transcribe.v1` = `/transcribe`; `voice.status.v1` = the `voice` block below; `signing.v1` = the engine can
+  verify `basht-bridge-v1` signatures (whether it enforces them is `signing.mode`). The same file fixes every `reason` token
+  and every `voice.speak` value: reasons are fixed tokens, never free text.
+- `voice.speak`: `ready` (guard `match` and the link is up) · `degraded` (`link_down`: the link is down; or `tool_path_only`: the
+  link path cannot be used yet — no global `tts` block, or no agent block to compare with — so only the tool path speaks) ·
+  `mismatch` (`identity_mismatch`) · `unconfigured` (`no_tts_config`, or `tool_path_unavailable`) · `unknown` (`config_unreadable`).
+  `warnings` are codes only (`global_auto_enabled`, `global_prefs_path`, `prefs_file_overrides`), see Voice.
 - `runs.active`: app turns running in this bridge right now. Deploy tooling must read it before a restart (release rule below).
-- `signing.mode`: `off` | `optional` | `required` as in effect (never a secret).
+- `signing.mode`: `off` | `optional` | `required` **as in effect** (never a secret). A `required` (or `optional`) without a valid secret
+  degrades to `off` with a warning in the log, and this field is where that shows. `signing.lastRejected {reason, at}`: the last
+  signature this bridge did not accept (`reason` is `missing`, `malformed`, `skew`, `signature`, `replay` or `body`; `at` in ms), absent
+  until there was one.
 - `engine.version`: the engine version the gateway reported in `hello-ok` on the persistent link; absent until the link has been up once.
 
 ## Model control (M)
@@ -151,8 +157,11 @@ cannot choose a voice, provider, model or session.
   - **Link path (v2).** The bridge sends the gateway RPC `tts.speak {text}` over the existing persistent link, with a 60 s timeout
     (the link's default is 15 s; a provider can take longer). `tts.speak` accepts `text` only (a closed schema: the link refuses any
     other param locally, `bad_params`) and speaks with the **global** `tts` block, never the agent block. It returns
-    `{audioBase64, provider, outputFormat, mimeType, fileExtension}`. The bridge decodes the audio and checks it: not empty, at
-    most 8 MB, `mimeType` one of `audio/mpeg` (`audio/mp3`), `audio/ogg` (`audio/opus`), `audio/wav` (`audio/x-wav`, `audio/wave`) and,
+    `{audioBase64, provider, outputFormat, mimeType, fileExtension}`. The gateway may fall back to **another provider** when the
+    first fails, and the closed params cannot disable that, so the bridge compares the answer's `provider` (normalised like the guard's)
+    with the approved one and, when it differs or is missing, refuses with 503 `identity_mismatch` and returns **no audio**. A refusal
+    here can still have been billed (the provider already spoke), as can any audio the checks below reject. The bridge decodes the
+    audio and checks it: not empty, at most 8 MB, `mimeType` one of `audio/mpeg` (`audio/mp3`), `audio/ogg` (`audio/opus`), `audio/wav` (`audio/x-wav`, `audio/wave`) and,
     when given, a `fileExtension` in `.mp3` / `.opus` / `.ogg` / `.wav`. Then it sends the bytes with `Content-Length`,
     `Cache-Control: no-store`. Nothing is written to disk.
   - **Tool path (unchanged).** The agent's `tts` tool through `/tools/invoke` with the fixed session key `agent:main:app:owner`
@@ -161,7 +170,10 @@ cannot choose a voice, provider, model or session.
     twice: the bridge makes exactly one attempt. If the link is down it answers 502 `engine_unavailable` (`link_down`); it does **not**
     fall back to the CLI / admin path (owner decision).
   - Anything else in the request body (`sessionKey`, `voice`, `provider`, …) is ignored.
-  - `text`: string, trimmed, 1–1500 characters. The app splits longer replies on sentence boundaries (the engine's own hard cap,
+  - `text`: string, trimmed, 1–1500 characters, counted in **UTF-16 code units** (JavaScript `string.length`, which is also how the
+    engine counts); an app that counts code points (emoji, some scripts take two units) must count the same way or stay well below
+    1500. The engine's own text rules can be stricter (a lower `tts.maxTextLength`): its rejection is 400 `bad_request` /
+    `text_rejected`. The app splits longer replies on sentence boundaries (the engine's own hard cap,
     `tts.maxTextLength`, defaults to 4096 and this path does no chunking). The engine strips markdown before speaking.
   - The tool writes `<STATE_DIR>/media/tool-speech-synthesis/voice---<uuid>.mp3` and returns that local path. The bridge resolves it
     (`realpath`) and reads it only if it is a regular file **inside** that directory with an audio extension (`.mp3`, `.opus`,
@@ -169,33 +181,54 @@ cannot choose a voice, provider, model or session.
     anywhere else (traversal, symlink out, wrong type) is never read or deleted: the answer is 503 `voice_unavailable`.
   - 30 requests a minute, and at most 2 in flight (429 `rate_limited`, reason `in_flight` / `per_minute`). A refusal logs one line
     with the reason only, never the text.
-- **Voice identity guard (`src/app-bridge-voice.js`).** `tts.speak` knows nothing of the agent block. With no matching global block
-  it does not fail: it silently speaks with a **different default voice and no instructions**, which is unacceptable for BASHT. So
-  before every link speak the bridge compares the *identity* of the agent block with the global `tts` block: `{provider,
-  providers.<provider>}` with secret-looking keys (`apiKey`, `token`, `secret`, `password`, `key`, `*Key`, `*Token`, `authorization`,
-  `headers`, …) removed first, compared as canonical JSON (key order does not matter). The guard returns a state, a 12-character
-  sha256 prefix of the identity and warning codes. It never returns or logs text, instructions or keys.
+- **Voice identity guard (`src/app-bridge-voice.js`).** `tts.speak` is agent-less: it speaks with the **global** `tts` block alone,
+  and with no matching global block it does not fail: it silently speaks with a **different default voice and no instructions**,
+  which is unacceptable for BASHT. The gateway builds the agent's own voice as the global block with the agent block merged over it
+  (deep merge, the agent's keys win). So the guard computes both effective identities the way the gateway does (verified against
+  OpenClaw 2026.11.10) and requires them to be equal:
+  - **Agent identity** = `merge(global tts, agents.entries.main.tts)`; **RPC identity** = the global block alone. Compared:
+    the provider and that provider's settings (`model`, `speakerVoice`, `instructions`, …), as canonical JSON (key order does not matter).
+  - The provider id is normalised like the gateway (trim, lower-case, `edge` = `microsoft`). An id that is not a plain token
+    (`[a-z0-9._-]`, ≤ 64) or is a registry alias whose settings cannot be told apart from here (`azure`, `cli`) fails closed as a
+    mismatch. Provider settings are read as `providers.<id>`, else the legacy top-level `<id>: {…}` entry, on both sides; the voice
+    aliases (`voice`, `speakerVoice`, `voiceName`, and the `…Id` forms) are unified as the gateway does.
+  - Secret-looking keys (`apiKey`, `token`, `secret`, `password`, `key`, `*Key`, `*Token`, `authorization`, `headers`, …) are removed
+    first, so keys are not compared, hashed or logged.
+  - **Personas.** A global `persona` / `personas` (non-empty) is a mismatch: the RPC would speak something the agent block never
+    approved. In the agent's merged block, any persona that has more than `label` / `description` (a provider, voice, model, instructions…)
+    is a mismatch, because the global copy cannot carry it. A persona with only `label` / `description` never reaches the provider
+    request (lab-verified) and is fine.
+  - **The preferences file.** The gateway always reads a TTS preferences file (the config `prefsPath`, else the environment variable
+    `OPENCLAW_TTS_PREFS`, else `<state dir>/settings/tts.json`) whose provider, persona and auto settings override the config for
+    everyone. The guard reads it (read-only; missing, unreadable or malformed means none, as for the gateway). A provider other than
+    the approved one, or a persona that is not harmless, is a mismatch; `auto`/`enabled` is a warning. (A machine-wide path kept in the
+    gateway's state database is not visible from here.) Its content is never logged or returned.
+  - The result is a state, the effective provider id, a 12-character sha256 prefix of the identity and warning codes: never text,
+    instructions, keys or paths.
 
   | State | Meaning | `/speak` does | `voice.speak` |
   |---|---|---|---|
-  | `match` | global identity equals the agent identity | link path | `ready` (link up) / `degraded` `link_down` |
-  | `global_only` | no agent block, the global block names a provider | link path | same |
-  | `no_global` | agent block, no global block (production **before** the config change) | tool path, as before | `degraded` `tool_path_only` |
-  | `mismatch` | both exist and differ | 503, **nothing is called** | `mismatch` |
-  | `no_agent_block` | neither names a provider | 503 | `unconfigured` |
+  | `match` | agent block present, global block names a provider, the two effective identities are equal, nothing else can change them | link path | `ready` (link up) / `degraded` `link_down` |
+  | `no_global` | agent block, the global block names no provider (production **before** the config change) | tool path, as before | `degraded` `tool_path_only` |
+  | `global_only` | no agent block, the global block names a provider | tool path (nothing to compare with) | `degraded` `tool_path_only` |
+  | `mismatch` | any difference above | 503, **nothing is called** | `mismatch` |
+  | `no_agent_block` | no provider anywhere | 503 | `unconfigured` |
   | `unknown` | `openclaw.json` unreadable or malformed | tool path | `unknown` |
 
-  Warnings (never a refusal): `global_auto_enabled` (global `auto` is anything but `off`: the engine would speak replies on its own)
-  and `global_prefs_path` (`prefsPath` is set: a mutable preferences file could change the voice behind the bridge's back).
+  Warnings (never a refusal by themselves): `global_auto_enabled` (the global `auto` is anything but `off`: the engine would speak
+  replies on its own), `global_prefs_path` (a `prefsPath` is configured), `prefs_file_overrides` (the preferences file sets a
+  provider, a persona or auto mode).
 - **Reasons.** Every refusal of `/speak` keeps the existing `{ok:false, error}` and adds `reason`; a client that ignores `reason` is
-  unaffected. `bad_request` (400) carries none.
+  unaffected. The tokens are the shared contract (`src/fixtures/voice-contract.json`). The plain validation `bad_request` (400:
+  empty or over-long text, checked before anything runs) carries none.
 
   | Status | `error` | `reason` | When |
   |---|---|---|---|
-  | 503 | `voice_unavailable` | `identity_mismatch` | guard `mismatch` (no provider was called) |
-  | 503 | `voice_unavailable` | `unconfigured` | guard `no_agent_block`; or the tool answered `tool_error`; or no state dir for the tool path |
+  | 503 | `voice_unavailable` | `identity_mismatch` | guard `mismatch` (no provider was called), or the gateway answered with another provider's audio (dropped) |
+  | 503 | `voice_unavailable` | `unconfigured` | guard `no_agent_block`; or no state dir for the tool path |
   | 503 | `voice_unavailable` | `tool_denied` | the tool path got 404/403: the `tts` tool is not allowed by the tool policy |
-  | 503 | `voice_unavailable` | `provider_error` | the gateway answered `ok:false` (e.g. `UNAVAILABLE`); or an unexpected tool refusal |
+  | 503 | `voice_unavailable` | `provider_error` | the gateway answered `ok:false` (e.g. `UNAVAILABLE`); or the tool path was refused (HTTP 500 `tool_error`, any other refusal) |
+  | 400 | `bad_request` | `text_rejected` | the gateway rejected the text itself (`INVALID_REQUEST`, e.g. longer than its `tts.maxTextLength`) |
   | 503 | `voice_unavailable` | `bad_audio` | empty / over 8 MB / type not allowed / path outside the speech directory |
   | 502 | `engine_unavailable` | `link_down` | link path and the link is not up (or dropped mid-request); no fallback |
   | 502 | `engine_unavailable` | `timeout` | no answer within 60 s (kept in the existing vocabulary instead of a 504); not retried |
@@ -237,17 +270,20 @@ Until the operator adds it, `/speak` uses the tool path and `voice.speak` reads 
 
 That is: `provider` plus `providers.<provider>.{model, speakerVoice, instructions}`. The provider's key stays where it is today
 (`tts.providers.<provider>.apiKey` or the environment): keys are not part of the comparison. **Do not add `auto`, a persona,
-`prefsPath` or any extra field.** The global block is also the agent's *own* voice configuration (for example for voice replies on
-chat channels), so an extra field leaks into the agent's own speech; `auto` other than `off` would make the engine speak replies by
-itself. Verify with `GET /app/v1/status`: `voice.speak` must read `ready` and `voice.warnings` must be empty. A copy that differs in a
-single character reads `mismatch` and `/speak` refuses with `identity_mismatch` rather than speak in another voice.
+`prefsPath` or any extra field.** The agent's own voice is built from the global block with the agent block on top, so a field added
+to the global block is inherited by the agent's own speech (for example voice replies on chat channels), and `auto` other than `off`
+would make the engine speak replies by itself. The guard sees the merge, so a global extra does not by itself read as a mismatch: it
+changes the agent's voice too, which you may not want. Verify with `GET /app/v1/status`: `voice.speak` must read `ready` and
+`voice.warnings` must be empty. A copy that differs in a single character reads `mismatch` and `/speak` refuses with
+`identity_mismatch` rather than speak in another voice. Also check there is no TTS preferences file that sets another provider or a
+persona (`<state dir>/settings/tts.json`): it would read `mismatch` too.
 
 ### Production prerequisites
 
 - `agents.entries.main.tts` (or the global `tts`) must name a configured provider. For OpenAI the key comes from
   `tts.providers.openai.apiKey` or `OPENAI_API_KEY`; `models.providers.openai` alone does not configure TTS. Without it the
   tool fails (`openai: not configured`) and `/speak` is 503.
-- Tool path only (guard `no_global` / `unknown`): the `tts` tool must be reachable on `/tools/invoke` for the shared-secret caller. It
+- Tool path only (guard `no_global` / `global_only` / `unknown`): the `tts` tool must be reachable on `/tools/invoke` for the shared-secret caller. It
   is **not** on the gateway's default HTTP deny list, but a `tools.profile` / `tools.allow` / `tools.deny` or `gateway.tools.deny` that
   excludes it makes `/speak` 503 `tool_denied`. The link path does not need the tool: it calls the RPC `tts.speak` (the link is already
   an operator connection; `tts.speak` is on its fixed method list and takes `{text}` only).
@@ -402,8 +438,9 @@ tests verify every one byte for byte and so should the app's.
    only by a request whose signature was genuine. The cache is **in memory**: a restart empties it, and the 60 s timestamp window is
    what bounds a replay across a restart.
 5. After the body is read, `sha256(body bytes)` must equal `X-Basht-Content-SHA256`. Every parser keeps the raw bytes it was given:
-   the 64 kB JSON parser, the larger `/send` JSON parser and the raw-audio `/transcribe` body. GET and empty bodies hash as the empty
-   string.
+   the 64 kB JSON parser, the larger `/send` JSON parser and the raw-audio `/transcribe` body. The hash covers the bytes the parser
+   hands over, i.e. **after any content decoding** (a `Content-Encoding` is undone before the hash is taken), so the signer must hash
+   the decoded body it intends the server to see. GET and empty bodies hash as the empty string.
 
 **Environment** (read once at boot, then deleted from `process.env`):
 
@@ -413,8 +450,8 @@ tests verify every one byte for byte and so should the app's.
 | `BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS` | previous secret, accepted next to the current one during a rotation (ignored without a current secret) |
 | `BASHT_BRIDGE_SIGNING_MODE` | `off` · `optional` · `required`. Default: `optional` when a valid secret is set, `off` otherwise |
 
-`required` (or `optional`) without a valid secret **cannot be enforced**: signing stays `off` and one warning is logged, so a typo can
-never lock the owner out. An unknown mode value falls back to the default with a warning. With none of the variables set the bridge
+`required` (or `optional`) without a valid secret **cannot be enforced**: signing silently degrades to `off` with one warning in the
+log, and `GET /status` → `signing.mode` then reads `off` (that is where to look), so a typo can never lock the owner out. An unknown mode value falls back to the default with a warning. With none of the variables set the bridge
 behaves exactly as before.
 
 **Modes.**
@@ -422,12 +459,14 @@ behaves exactly as before.
 | Mode | Request with no `X-Basht-*` signing header | Request with any signing header |
 |---|---|---|
 | `off` | accepted | headers ignored |
-| `optional` | accepted | must verify fully, else 401 `bad_signature` (a half-set or wrong signature is never ignored) |
-| `required` | 401 `bad_signature` | must verify fully |
+| `optional` | accepted | verified if valid; if present but **not valid** (wrong secret, skew, replay, body hash mismatch, malformed) it is processed as an **unsigned** request, never as verified |
+| `required` | 401 `bad_signature` | must verify fully, else 401 `bad_signature` |
 
-A failed signature (header phase or body hash) counts in the **same** limiter as a bad token: after 20 failures a minute the answer is
-429 `rate_limited`. A request with a valid token and a valid signature always passes, so an anonymous flood cannot lock the owner out.
-`GET /status` reports `signing.mode` and the `signing.v1` feature.
+`optional` never locks the owner out: the bearer token check still applies, and the reason of a rejected signature is logged (once a
+minute per reason, no header value, no secret) and shown in `GET /status` → `signing.lastRejected {reason, at}`. Only `required`
+refuses, and only `required` counts a failed signature (header phase or body hash) in the **same** limiter as a bad token: after 20
+failures a minute the answer is 429 `rate_limited`. A request with a valid token and a valid signature always passes, so an
+anonymous flood cannot lock the owner out. `GET /status` reports `signing.mode` and the `signing.v1` feature.
 
 **Compatibility matrix.**
 
@@ -435,7 +474,7 @@ A failed signature (header phase or body hash) counts in the **same** limiter as
 |---|---|---|
 | old (no signing) | new, `optional` (default once a secret is set) | works: unsigned requests are accepted |
 | new (signs) | old / signing not configured | works: the extra `X-Basht-*` headers are unknown headers and are ignored |
-| new (signs) | new, `optional` | works, and every request is verified |
+| new (signs) | new, `optional` | works; valid signatures are verified, an invalid one is accepted as unsigned and shows in `signing.lastRejected` |
 | old (no signing) | new, `required` | **401**: switch to `required` only after the app signs |
 | new (signs) | new, `required` | works; the full protection |
 
@@ -444,7 +483,7 @@ A failed signature (header phase or body hash) counts in the **same** limiter as
 1. Engine: set `BASHT_BRIDGE_SIGNING_SECRET` (new value, ≥ 32 random characters), keep the old value in
    `BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS`, mode `optional`. Deploy (see the release rule below).
 2. App: switch the signing secret to the new value. Both secrets verify meanwhile.
-3. Check `signing.mode` on `/status` and that the app's calls succeed.
+3. Check `signing.mode` on `/status` and that the app's calls succeed (no new `signing.lastRejected`).
 4. Engine: remove `BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS` and deploy. A leaked old secret is dead from here.
 5. First enablement: set the secret on both sides in `optional`, confirm signed calls work, then set `BASHT_BRIDGE_SIGNING_MODE=required`
    on the engine. To roll back, set the mode to `optional` (or `off`) or remove the variables.

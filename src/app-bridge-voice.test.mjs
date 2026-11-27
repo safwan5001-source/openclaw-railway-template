@@ -8,8 +8,9 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { APP_SESSION_KEY, createAppBridge } from "./app-bridge.js";
-import { canonicalize, evaluateVoiceGuard, identityHash, isSecretKey, readVoiceGuard, speakStatus, stripSecrets, voiceIdentity } from "./app-bridge-voice.js";
+import { FEATURES, REASONS, SPEAK_STATES, canonicalize, evaluateVoiceGuard, mergeDeep, normalizeSpeechProviderId, prefsPathFor, identityHash, isSecretKey, readVoiceGuard, speakStatus, stripSecrets, voiceIdentity } from "./app-bridge-voice.js";
 
+const CONTRACT = JSON.parse(fs.readFileSync(new URL("./fixtures/voice-contract.json", import.meta.url), "utf8"));
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
 const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
 const SECRET_INSTRUCTIONS = "synthetic-private-instructions-do-not-leak";
@@ -43,7 +44,10 @@ test("guard: a mismatch is any difference in provider, model, voice or instructi
   assert.equal(states(voiceBlock({ speakerVoice: "another-voice" })), "mismatch");
   assert.equal(states(voiceBlock({ instructions: `${SECRET_INSTRUCTIONS} ` })), "mismatch");
   assert.equal(states(voiceBlock({ instructions: undefined })), "mismatch");
-  assert.equal(states(voiceBlock({ extraSetting: 1 })), "mismatch");
+  // the agent's effective block is global + agent: an extra setting in the GLOBAL block is inherited by the agent, so both speak the same
+  assert.equal(states(voiceBlock({ extraSetting: 1 })), "match");
+  // ... while an extra setting only in the AGENT block is not in what tts.speak would use
+  assert.equal(evaluateVoiceGuard(cfgWith({ agent: voiceBlock({ extraSetting: 1 }), global: voiceBlock() })).state, "mismatch");
   assert.equal(states({ provider: "elevenlabs", providers: { elevenlabs: base.providers.openai } }), "mismatch");
   assert.equal(states({ provider: "openai", providers: {} }), "mismatch", "a provider without its settings is the default voice");
   assert.equal(states({ provider: "openai" }), "mismatch");
@@ -76,10 +80,10 @@ test("guard: secret-looking keys are removed before comparing, hashing and loggi
 
 test("guard: the result carries a state, a short hash and warning codes — never text, instructions or keys", () => {
   const r = evaluateVoiceGuard(cfgWith({ agent: voiceBlock({ apiKey: FAKE_KEY }), global: voiceBlock({ apiKey: FAKE_KEY }) }));
-  assert.deepEqual(Object.keys(r).sort(), ["hash", "state", "warnings"]);
+  assert.deepEqual(Object.keys(r).sort(), ["hash", "provider", "state", "warnings"]);
   assert.match(r.hash, /^[0-9a-f]{12}$/);
   const blob = JSON.stringify(r);
-  for (const leak of [SECRET_INSTRUCTIONS, FAKE_KEY, "synthetic-voice", "synthetic-model", "openai"]) assert.ok(!blob.includes(leak), leak);
+  for (const leak of [SECRET_INSTRUCTIONS, FAKE_KEY, "synthetic-voice", "synthetic-model"]) assert.ok(!blob.includes(leak), leak);
   const m = evaluateVoiceGuard(cfgWith({ agent: voiceBlock(), global: voiceBlock({ model: "x" }) }));
   assert.match(m.hash, /^[0-9a-f]{12}$/);
   assert.match(m.globalHash, /^[0-9a-f]{12}$/);
@@ -120,7 +124,7 @@ test("guard: an unreadable, missing or malformed config is state unknown; a fres
 test("speakStatus: the voice state shown on /status", () => {
   const g = (state) => ({ state, warnings: [] });
   assert.deepEqual(speakStatus(g("match"), { linkUp: true }), { speak: "ready" });
-  assert.deepEqual(speakStatus(g("global_only"), { linkUp: true }), { speak: "ready" });
+  assert.deepEqual(speakStatus(g("global_only"), { linkUp: true }), { speak: "degraded", reason: "tool_path_only" }, "no agent block to compare with: tool path only");
   assert.deepEqual(speakStatus(g("match"), { linkUp: false }), { speak: "degraded", reason: "link_down" });
   assert.deepEqual(speakStatus(g("no_global"), { linkUp: true }), { speak: "degraded", reason: "tool_path_only" });
   assert.deepEqual(speakStatus(g("no_global"), { linkUp: false, toolPath: false }), { speak: "unconfigured", reason: "tool_path_unavailable" });
@@ -133,6 +137,7 @@ test("speakStatus: the voice state shown on /status", () => {
 // ---------------------------------------------------------------- POST /speak ---------------------------------------------------------
 
 let dir, configPath, stateDir, speechDir;
+const EMITTED = new Set(); // every `reason` a bridge in this file logged or showed on /status (checked against the contract at the end)
 const MP3 = Buffer.concat([Buffer.from("ID3"), crypto.randomBytes(3000)]);
 const setConfig = (cfg) => fs.writeFileSync(configPath, typeof cfg === "string" ? cfg : JSON.stringify(cfg));
 
@@ -178,14 +183,18 @@ const noFetch = () => fakeFetch(() => { throw new Error("the tool path must not 
 
 async function mount(opts = {}) {
   const lines = [];
-  const log = { warn: (_t, m) => lines.push(String(m)), info: (_t, m) => lines.push(String(m)) };
+  const log = { warn: (_t, m) => { lines.push(String(m)); const r = /\((\w+)\)$/.exec(String(m)); if (r) EMITTED.add(r[1]); }, info: (_t, m) => lines.push(String(m)) };
   const app = express();
   app.use("/v", createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath, stateDir, log, ...opts }));
   const srv = app.listen(0, "127.0.0.1");
   await new Promise((r) => srv.once("listening", r));
   const b = `http://127.0.0.1:${srv.address().port}/v`;
   const post = (body, { token = APP_TOKEN } = {}) => fetch(`${b}/speak`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
-  const get = (p) => fetch(`${b}${p}`, { headers: { authorization: `Bearer ${APP_TOKEN}` } }).then(async (r) => ({ status: r.status, json: await r.json() }));
+  const get = (p) => fetch(`${b}${p}`, { headers: { authorization: `Bearer ${APP_TOKEN}` } }).then(async (r) => {
+    const json = await r.json();
+    if (json?.voice?.reason) EMITTED.add(json.voice.reason);
+    return { status: r.status, json };
+  });
   return { b, post, get, lines, close: () => srv.close() };
 }
 
@@ -210,13 +219,17 @@ test("speak (match): one tts.speak on the link with {text} only and a 60 s timeo
   } finally { m.close(); }
 });
 
-test("speak (global_only): the global block is the voice, so the link speaks", async () => {
+test("speak (global_only, no agent block): NOT the link path — the legacy tool path, like no_global", async () => {
   setConfig(cfgWith({ global: voiceBlock() }));
   const link = fakeLink();
-  const m = await mount({ link, fetchImpl: noFetch() });
+  const fetchImpl = fakeFetch(async () => ({ status: 404, json: { ok: false, error: { type: "not_found", message: "Tool not available: tts" } } }));
+  const m = await mount({ link, fetchImpl });
   try {
-    assert.equal((await m.post({ text: "مرحبا" })).status, 200);
-    assert.equal(link.calls.length, 1);
+    const r = await m.post({ text: "مرحبا" });
+    assert.equal(r.status, 503);
+    assert.deepEqual(await r.json(), { ok: false, error: "voice_unavailable", reason: "tool_denied" });
+    assert.equal(link.calls.length, 0, "the link was not used");
+    assert.equal(fetchImpl.calls.length, 1, "the tool was");
   } finally { m.close(); }
 });
 
@@ -248,7 +261,7 @@ test("speak (no_agent_block): 503 voice_unavailable/unconfigured, nothing called
   } finally { m.close(); }
 });
 
-test("speak (no_global, the situation before the config change): the existing tool path, unchanged; 404 = tool_denied, tool_error = unconfigured", async () => {
+test("speak (no_global, the situation before the config change): the existing tool path, unchanged; 404 = tool_denied, any tool refusal = provider_error", async () => {
   setConfig(cfgWith({ agent: voiceBlock() }));
   const link = fakeLink();
   let mode = "ok";
@@ -267,7 +280,7 @@ test("speak (no_global, the situation before the config change): the existing to
     assert.ok(Buffer.from(await good.arrayBuffer()).equals(MP3));
     assert.deepEqual(fetchImpl.calls.map((c) => [c.url, c.body]), [["http://127.0.0.1:9/tools/invoke", { tool: "tts", args: { text: "**مرحبا**" }, sessionKey: APP_SESSION_KEY }]]);
     assert.equal(link.calls.length, 0, "the tool path does not use the link");
-    for (const [x, status, reason] of [["404", 503, "tool_denied"], ["tool_error", 503, "unconfigured"], ["other", 503, "provider_error"]]) {
+    for (const [x, status, reason] of [["404", 503, "tool_denied"], ["tool_error", 503, "provider_error"], ["other", 503, "provider_error"]]) {
       mode = x;
       const r = await m.post({ text: "مرحبا" });
       assert.equal(r.status, status, x);
@@ -354,7 +367,8 @@ test("speak (link path): the audio is validated — non-empty, <= 8 MB, an allow
     { audioBase64: Buffer.alloc(8 * 1024 * 1024 + 1, 1).toString("base64"), mimeType: "audio/mpeg" },
     { audioBase64: "A".repeat(20 * 1024 * 1024), mimeType: "audio/mpeg" },
   ];
-  for (const payload of bad) {
+  for (const raw of bad) {
+    const payload = { provider: "openai", ...raw };
     const link = fakeLink({ impl: async () => payload });
     const m = await mount({ link, fetchImpl: noFetch() });
     try {
@@ -385,7 +399,7 @@ test("speak: validates the text before anything else; auth first; 30 a minute; a
   setConfig(MATCH);
   let t = 1_000_000;
   const release = [];
-  const link = fakeLink({ impl: () => new Promise((res) => release.push(() => res({ audioBase64: MP3.toString("base64"), mimeType: "audio/mpeg" }))) });
+  const link = fakeLink({ impl: () => new Promise((res) => release.push(() => res({ audioBase64: MP3.toString("base64"), mimeType: "audio/mpeg", provider: "openai" }))) });
   const m = await mount({ link, fetchImpl: noFetch(), now: () => t });
   try {
     assert.equal((await m.post({ text: "x" }, { token: null })).status, 401);
@@ -445,7 +459,7 @@ test("status: additive fixed fields — features, voice, runs, signing; engine v
     assert.equal(json.ok, true);
     assert.equal(json.appSession, APP_SESSION_KEY);
     assert.equal(json.link.state, "up", "existing fields stay");
-    assert.deepEqual(json.features, ["voice.speak.v2", "signing.v1"]);
+    assert.deepEqual(json.features, CONTRACT.features);
     assert.deepEqual(json.voice, { speak: "ready", warnings: [] });
     assert.deepEqual(json.runs, { active: 0 });
     assert.deepEqual(json.signing, { mode: "off" });
@@ -472,7 +486,7 @@ test("status: voice.speak follows the guard and the link", async () => {
   const cases = [
     [MATCH, true, { speak: "ready" }],
     [MATCH, false, { speak: "degraded", reason: "link_down" }],
-    [cfgWith({ global: voiceBlock() }), true, { speak: "ready" }],
+    [cfgWith({ global: voiceBlock() }), true, { speak: "degraded", reason: "tool_path_only" }],
     [cfgWith({ agent: voiceBlock() }), true, { speak: "degraded", reason: "tool_path_only" }],
     [cfgWith({ agent: voiceBlock(), global: voiceBlock({ model: "x" }) }), true, { speak: "mismatch", reason: "identity_mismatch" }],
     [cfgWith({}), true, { speak: "unconfigured", reason: "no_tts_config" }],
@@ -532,4 +546,209 @@ test("status: runs.active counts the app turns running right now", async () => {
     for (let i = 0; i < 100 && (await m.get("/status")).json.runs.active > 0; i++) await new Promise((x) => setTimeout(x, 10));
     assert.equal((await m.get("/status")).json.runs.active, 0);
   } finally { m.close(); finish?.(); }
+});
+
+// ---------------------------------------------------------------- C1: the gateway's real merge semantics --------------------------------
+
+const guardState = (cfg, prefs) => evaluateVoiceGuard(cfg, prefs).state;
+const agentOnly = (block) => cfgWith({ agent: block });
+
+test("guard (C1): the agent's effective identity is merge(global, agent); the RPC uses the global block alone", () => {
+  // legacy top-level shape: the agent changes the voice and adds instructions on top of a global alloy voice
+  assert.equal(guardState({ tts: { provider: "openai", openai: { voice: "alloy" } }, agents: { entries: { main: { tts: { provider: "openai", openai: { voice: "nova", instructions: "BASHT" } } } } } }), "mismatch");
+  assert.equal(guardState({ tts: { provider: "openai", openai: { voice: "nova", instructions: "BASHT" } }, agents: { entries: { main: { tts: { provider: "openai" } } } } }), "match", "the agent inherits everything from global");
+  // provider id written in another case: normalised like the gateway; a difference in the settings is still a mismatch
+  assert.equal(guardState({ tts: { provider: "OpenAI", providers: { openai: { voice: "alloy" } } }, agents: { entries: { main: { tts: { provider: "OpenAI", providers: { openai: { voice: "nova" } } } } } } }), "mismatch");
+  assert.equal(guardState({ tts: { provider: "OpenAI", providers: { OPENAI: { voice: "nova" } } }, agents: { entries: { main: { tts: { provider: " openai ", providers: { openai: { voice: "nova" } } } } } } }), "match");
+  // an agent block WITHOUT a provider, that changes the provider's voice
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voice: "alloy" } } }, agents: { entries: { main: { tts: { providers: { openai: { voice: "nova" } } } } } } }), "mismatch");
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voice: "nova" } } }, agents: { entries: { main: { tts: { providers: { openai: { voice: "nova" } } } } } } }), "match");
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voice: "nova" } } }, agents: { entries: { main: { tts: { auto: "off" } } } } }), "match", "an agent block with no voice setting at all");
+  // legacy on one side, providers[] on the other, same settings: the same voice (providers[p] first, then the legacy entry)
+  assert.equal(guardState({ tts: { provider: "openai", openai: { voice: "nova" } }, agents: { entries: { main: { tts: { providers: { openai: { voice: "nova" } } } } } } }), "match");
+  // the agent selects another provider
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voice: "nova" } } }, agents: { entries: { main: { tts: { provider: "elevenlabs" } } } } }), "mismatch");
+  // the voice aliases are unified like the gateway does (voice == speakerVoice == voiceName)
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voice: "nova" } } }, agents: { entries: { main: { tts: { provider: "openai", providers: { openai: { speakerVoice: "nova" } } } } } } }), "match");
+  assert.equal(guardState({ tts: { provider: "openai", providers: { openai: { voiceName: "nova" } } }, agents: { entries: { main: { tts: { provider: "openai", providers: { openai: { speakerVoice: "alloy" } } } } } } }), "mismatch");
+});
+
+test("guard (C1): provider ids — trim, lower-case, edge = microsoft; an id that is not a plain canonical token or is a registry alias fails closed", () => {
+  assert.equal(normalizeSpeechProviderId(" OpenAI "), "openai");
+  assert.equal(normalizeSpeechProviderId("Edge"), "microsoft");
+  for (const bad of [undefined, null, "", "  ", 5, "__proto__", "constructor", "prototype"]) assert.equal(normalizeSpeechProviderId(bad), undefined, String(bad));
+  const same = (provider) => cfgWith({ agent: { provider, providers: { [provider]: { voice: "v" } } }, global: { provider, providers: { [provider]: { voice: "v" } } } });
+  assert.equal(guardState(same("openai")), "match");
+  assert.equal(guardState(cfgWith({ agent: { provider: "edge", providers: { edge: { voice: "v" } } }, global: { provider: "microsoft", providers: { microsoft: { voice: "v" } } } })), "match", "edge is microsoft");
+  for (const id of ["azure", "cli", "open ai", "../x", "https://openrouter.ai/v1", "a".repeat(80), "ünï", "x/y"]) assert.equal(guardState(same(id)), "mismatch", id);
+  assert.equal(mergeDeep({ a: { b: 1, c: 2 }, d: [1] }, { a: { c: 3 }, d: [2] }).a.b, 1);
+  assert.deepEqual(mergeDeep({ a: { b: 1 } }, { a: { c: 3 }, d: [2], e: undefined }), { a: { b: 1, c: 3 }, d: [2] });
+  assert.deepEqual(mergeDeep({ a: 1 }, JSON.parse('{"__proto__": {"x": 1}, "b": 2}')), { a: 1, b: 2 }, "blocked keys never merge");
+});
+
+test("guard (C1): personas — a global persona is a mismatch; an agent persona that carries anything but label/description is a mismatch", () => {
+  const base = voiceBlock();
+  const withGlobal = (extra) => cfgWith({ agent: base, global: { ...voiceBlock(), ...extra } });
+  assert.equal(guardState(withGlobal({})), "match");
+  assert.equal(guardState(withGlobal({ persona: "" })), "match", "an empty persona is none");
+  assert.equal(guardState(withGlobal({ personas: {} })), "match");
+  assert.equal(guardState(withGlobal({ persona: "warm" })), "mismatch");
+  assert.equal(guardState(withGlobal({ personas: { warm: { label: "Warm" } } })), "mismatch", "any global persona differs from what was approved");
+  assert.equal(guardState(withGlobal({ persona: "x", personas: { x: { provider: "elevenlabs" } } })), "mismatch");
+  assert.equal(guardState(withGlobal({ persona: "x", personas: { x: { providers: { openai: { speakerVoice: "other" } } } } })), "mismatch", "a global persona that changes the voice");
+  const agentWith = (persona) => cfgWith({ agent: { ...base, ...persona }, global: voiceBlock() });
+  assert.equal(guardState(agentWith({ persona: "warm", personas: { warm: { label: "Warm", description: "friendly" } } })), "match", "label/description never reach the provider request");
+  for (const extra of [{ providers: { openai: { speakerVoice: "other" } } }, { voice: "x" }, { model: "m" }, { instructions: "i" }, { provider: "elevenlabs" }, { prompt: "p" }, { fallbackPolicy: "none" }]) {
+    assert.equal(guardState(agentWith({ persona: "warm", personas: { warm: { label: "Warm", ...extra } } })), "mismatch", Object.keys(extra)[0]);
+  }
+  assert.equal(guardState(agentWith({ personas: { other: { instructions: "i" } } })), "mismatch", "an unselected persona could be selected from the preferences file");
+  assert.equal(guardState(agentWith({ personas: { warm: "text" } })), "mismatch", "not an object: fail closed");
+});
+
+// ---------------------------------------------------------------- I2: the preferences file --------------------------------------------
+
+test("guard (I2): a preferences file that sets another provider or a persona is a mismatch; the same provider is a warning only; no content leaks", () => {
+  const cfg = cfgWith({ agent: voiceBlock(), global: voiceBlock() });
+  const withPrefs = (prefs) => evaluateVoiceGuard(cfg, { agentPrefs: prefs, globalPrefs: prefs });
+  assert.equal(withPrefs({}).state, "match");
+  assert.deepEqual(withPrefs({}).warnings, []);
+  assert.equal(withPrefs({ tts: { provider: "elevenlabs" } }).state, "mismatch");
+  assert.equal(withPrefs({ tts: { provider: "ELEVENLABS " } }).state, "mismatch");
+  assert.equal(withPrefs({ tts: { persona: "warm" } }).state, "mismatch", "a persona the config does not define is not 'no persona'");
+  const p = withPrefs({ tts: { provider: "OpenAI" } });
+  assert.equal(p.state, "match", "the same provider changes nothing");
+  assert.deepEqual(p.warnings, ["prefs_file_overrides"]);
+  assert.deepEqual(withPrefs({ tts: { auto: "always" } }).warnings, ["prefs_file_overrides"]);
+  assert.deepEqual(withPrefs({ tts: { enabled: true } }).warnings, ["prefs_file_overrides"]);
+  assert.deepEqual(withPrefs({ tts: { auto: "off", maxLength: 500 } }).warnings, []);
+  assert.deepEqual(withPrefs(null).warnings, []);
+  // only one side's file is different: still a mismatch
+  assert.equal(evaluateVoiceGuard(cfg, { agentPrefs: {}, globalPrefs: { tts: { provider: "elevenlabs" } } }).state, "mismatch");
+  assert.equal(evaluateVoiceGuard(cfg, { agentPrefs: { tts: { provider: "elevenlabs" } }, globalPrefs: {} }).state, "mismatch");
+  // a persona the config defines with label/description only is harmless
+  const labelled = cfgWith({ agent: { ...voiceBlock(), personas: { warm: { label: "Warm" } } }, global: voiceBlock() });
+  const sameFile = { tts: { persona: "Warm" } }; // the gateway reads ONE file for both sides: the RPC side does not define that persona
+  assert.equal(evaluateVoiceGuard(labelled, { agentPrefs: sameFile, globalPrefs: sameFile }).state, "mismatch");
+  assert.equal(evaluateVoiceGuard(labelled, { agentPrefs: { tts: { persona: "warm" } }, globalPrefs: {} }).state, "match");
+  assert.ok(!JSON.stringify(p).includes("elevenlabs"));
+});
+
+test("guard (I2): the file is found where the gateway reads it (config prefsPath, env OPENCLAW_TTS_PREFS, <state dir>/settings/tts.json), read-only, missing or broken = none", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "voice-prefs-"));
+  try {
+    const state = path.join(root, "state");
+    fs.mkdirSync(path.join(state, "settings"), { recursive: true });
+    const cfgFile = path.join(root, "openclaw.json");
+    const write = (cfg) => fs.writeFileSync(cfgFile, JSON.stringify(cfg));
+    const base = cfgWith({ agent: voiceBlock(), global: voiceBlock() });
+    write(base);
+    assert.equal(readVoiceGuard(cfgFile, { stateDir: state, env: {} }).state, "match", "no prefs file");
+    const defaultFile = path.join(state, "settings", "tts.json");
+    fs.writeFileSync(defaultFile, JSON.stringify({ tts: { provider: "elevenlabs", maxLength: 1500 } }));
+    const g = readVoiceGuard(cfgFile, { stateDir: state, env: {} });
+    assert.equal(g.state, "mismatch", "the default location");
+    assert.ok(!JSON.stringify(g).includes(defaultFile) && !JSON.stringify(g).includes("elevenlabs"));
+    fs.writeFileSync(defaultFile, "{ not json");
+    assert.equal(readVoiceGuard(cfgFile, { stateDir: state, env: {} }).state, "match", "unreadable = the gateway uses its configured defaults too");
+    fs.writeFileSync(defaultFile, JSON.stringify({ tts: { persona: "x" } }));
+    // the env variable takes the place of the default location
+    const envFile = path.join(root, "elsewhere.json");
+    fs.writeFileSync(envFile, JSON.stringify({ tts: { auto: "off" } }));
+    assert.equal(readVoiceGuard(cfgFile, { stateDir: state, env: { OPENCLAW_TTS_PREFS: envFile } }).state, "match");
+    // a config prefsPath beats the env variable
+    const cfgFileFile = path.join(root, "cfg-prefs.json");
+    fs.writeFileSync(cfgFileFile, JSON.stringify({ tts: { provider: "elevenlabs" } }));
+    write({ ...base, tts: { ...base.tts, prefsPath: cfgFileFile } });
+    const w = readVoiceGuard(cfgFile, { stateDir: state, env: { OPENCLAW_TTS_PREFS: envFile } });
+    assert.equal(w.state, "mismatch");
+    assert.ok(w.warnings.includes("global_prefs_path"));
+    // the guard only reads: the files are as they were
+    assert.equal(fs.readFileSync(cfgFileFile, "utf8"), JSON.stringify({ tts: { provider: "elevenlabs" } }));
+    assert.equal(prefsPathFor({}, { env: {}, stateDir: "/s" }), path.join("/s", "settings", "tts.json"));
+    assert.equal(prefsPathFor({}, { env: { OPENCLAW_TTS_PREFS: "/e/p.json" }, stateDir: "/s" }), "/e/p.json");
+    assert.equal(prefsPathFor({ prefsPath: "/c/p.json" }, { env: { OPENCLAW_TTS_PREFS: "/e/p.json" }, stateDir: "/s" }), "/c/p.json");
+    assert.equal(prefsPathFor({}, { env: {} }), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("speak (I2): a preferences file that overrides the provider makes /speak refuse with identity_mismatch (nothing is called)", async () => {
+  setConfig(MATCH);
+  fs.mkdirSync(path.join(stateDir, "settings"), { recursive: true });
+  const prefs = path.join(stateDir, "settings", "tts.json");
+  fs.writeFileSync(prefs, JSON.stringify({ tts: { provider: "elevenlabs" } }));
+  const link = fakeLink();
+  const m = await mount({ link, fetchImpl: noFetch() });
+  try {
+    const r = await m.post({ text: "مرحبا" });
+    assert.deepEqual(await r.json(), { ok: false, error: "voice_unavailable", reason: "identity_mismatch" });
+    assert.equal(link.calls.length, 0);
+    const st = (await m.get("/status")).json.voice;
+    assert.deepEqual([st.speak, st.reason], ["mismatch", "identity_mismatch"]);
+    assert.deepEqual(st.warnings, ["prefs_file_overrides"]);
+  } finally { m.close(); fs.rmSync(path.join(stateDir, "settings"), { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- C2: the provider that actually spoke ---------------------------------
+
+test("speak (C2): audio from another provider than the approved one is refused, with no audio returned", async () => {
+  setConfig(MATCH);
+  for (const provider of ["elevenlabs", "microsoft", "", undefined, null, 5, "openai-compatible"]) {
+    const link = fakeLink({ impl: ok({ provider }) });
+    const m = await mount({ link, fetchImpl: noFetch() });
+    try {
+      const r = await m.post({ text: "مرحبا" });
+      assert.equal(r.status, 503, String(provider));
+      const body = await r.text();
+      assert.deepEqual(JSON.parse(body), { ok: false, error: "voice_unavailable", reason: "identity_mismatch" });
+      assert.ok(!body.includes("ID3"));
+      assert.equal(link.calls.length, 1, "one attempt, never retried");
+      assert.deepEqual(m.lines, ["speak refused: voice_unavailable (identity_mismatch)"]);
+    } finally { m.close(); }
+  }
+  // the approved provider, written in any case the gateway might answer with, is fine
+  for (const provider of ["openai", "OpenAI", " openai "]) {
+    const m = await mount({ link: fakeLink({ impl: ok({ provider }) }), fetchImpl: noFetch() });
+    try { assert.equal((await m.post({ text: "مرحبا" })).status, 200, provider); } finally { m.close(); }
+  }
+  // edge is microsoft on both sides
+  setConfig(cfgWith({ agent: { provider: "edge", providers: { edge: { voice: "v" } } }, global: { provider: "Edge", providers: { edge: { voice: "v" } } } }));
+  const m = await mount({ link: fakeLink({ impl: ok({ provider: "microsoft" }) }), fetchImpl: noFetch() });
+  try { assert.equal((await m.post({ text: "مرحبا" })).status, 200); } finally { m.close(); }
+  assert.equal(readVoiceGuard(configPath).provider, "microsoft");
+});
+
+// ---------------------------------------------------------------- I4: the shared contract ----------------------------------------------
+
+test("speak (I4): the gateway rejecting the text (INVALID_REQUEST) is 400 bad_request/text_rejected, not a missing voice", async () => {
+  setConfig(MATCH);
+  const link = fakeLink({ impl: async () => { throw Object.assign(new Error("tts.speak text too long"), { code: "INVALID_REQUEST", refused: true }); } });
+  const m = await mount({ link, fetchImpl: noFetch() });
+  try {
+    const r = await m.post({ text: "مرحبا" });
+    assert.equal(r.status, 400);
+    assert.deepEqual(await r.json(), { ok: false, error: "bad_request", reason: "text_rejected" });
+    assert.equal(link.calls.length, 1);
+  } finally { m.close(); }
+});
+
+test("contract: reasons, speak states and features are exactly the shared fixture (src/fixtures/voice-contract.json)", () => {
+  assert.deepEqual([...Object.values(REASONS)].sort(), [...CONTRACT.reasons].sort(), "the code's reason constants and the fixture agree both ways");
+  assert.deepEqual([...SPEAK_STATES], CONTRACT.speakStates);
+  assert.deepEqual([...FEATURES], CONTRACT.features);
+  assert.equal(new Set(Object.values(REASONS)).size, Object.values(REASONS).length);
+  // no reason is written as a string literal in the code that emits it: every one goes through REASONS
+  for (const f of ["./app-bridge.js", "./app-bridge-voice.js"]) {
+    const src = fs.readFileSync(new URL(f, import.meta.url), "utf8");
+    assert.ok(!/refuseSpeak\(res, \d+, "[a-z_]+", "/.test(src), `${f}: a literal reason passed to refuseSpeak`);
+    for (const m of src.matchAll(/\breason: "([a-z_]+)"/g)) assert.ok(CONTRACT.reasons.includes(m[1]), `${f}: literal reason ${m[1]}`);
+  }
+  // every `error` code the contract's consumers already know is untouched
+  for (const r of CONTRACT.reasons) assert.match(r, /^[a-z_]+$/);
+});
+
+test("contract: every reason this file's bridges logged or showed on /status is in the fixture (and the main ones were really emitted)", () => {
+  assert.ok(EMITTED.size >= 8, [...EMITTED].join());
+  for (const r of EMITTED) assert.ok(CONTRACT.reasons.includes(r), `emitted a reason outside the contract: ${r}`);
+  for (const r of ["identity_mismatch", "unconfigured", "link_down", "timeout", "provider_error", "bad_audio", "engine_error", "in_flight", "per_minute",
+    "text_rejected", "tool_denied", "tool_path_only", "no_tts_config", "config_unreadable"]) assert.ok(EMITTED.has(r), `never emitted: ${r}`);
 });

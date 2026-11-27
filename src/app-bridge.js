@@ -51,7 +51,7 @@ import path from "node:path";
 import express from "express";
 import { normalizeWhatsAppSender, whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
 import { createLiveRoutes } from "./app-bridge-live.js";
-import { readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
+import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
@@ -92,7 +92,7 @@ const SPEAK_PER_MINUTE = 30;
 const TRANSCRIBE_PER_MINUTE = 20;
 const TRANSCRIBES_IN_FLIGHT = 2; // each one spawns the OpenClaw CLI
 const SPEAKS_IN_FLIGHT = 2; // each one is a billed provider call that can take tens of seconds
-const SIGNATURE_LOG_EVERY_MS = 10_000; // rejected signatures are logged (reason only) at most this often
+const SIGNATURE_LOG_EVERY_MS = 60_000; // a rejected signature is logged (reason only) at most this often per reason
 /** Recorded audio the app may upload: MIME (without parameters) -> the file extension the transcriber sees. */
 export const AUDIO_TYPES = { "audio/ogg": ".ogg", "audio/webm": ".webm", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
   "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav" };
@@ -311,12 +311,16 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (failures.count > AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
     return res.status(401).json({ ok: false, error });
   };
-  let signatureLoggedAt = 0;
-  const signatureRejected = (res, reason) => {
+  // A signature this bridge did not accept: remembered (reason + time, for /status) and logged once a minute per reason. Never a header value.
+  let lastRejected = null;
+  const loggedAt = new Map();
+  const noteRejected = (reason) => {
     const t = now();
-    if (t - signatureLoggedAt > SIGNATURE_LOG_EVERY_MS) { signatureLoggedAt = t; log?.warn?.("app-bridge", `signature rejected: ${reason}`); }
-    return authFailure(res, "bad_signature");
+    lastRejected = { reason, at: t };
+    if (t - (loggedAt.get(reason) ?? -Infinity) >= SIGNATURE_LOG_EVERY_MS) { loggedAt.set(reason, t); log?.warn?.("app-bridge", `signature rejected: ${reason} (mode ${verifier.mode})`); }
   };
+  // "required" refuses (and counts in the failed-auth limiter); "optional" never locks anyone out: the request is processed as UNSIGNED.
+  const signatureRejected = (res, reason) => { noteRejected(reason); return authFailure(res, "bad_signature"); };
 
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store");
@@ -325,14 +329,23 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (!(m && safeEqual(m[1].trim(), appToken))) return authFailure(res, "unauthorized");
     // Signing (when configured) comes on top of the token, never instead of it. Header phase here; the body hash is checked once the body is read.
     const sig = verifier.checkHeaders(req);
-    if (!sig.ok) return signatureRejected(res, sig.reason);
-    if (sig.signed) res.locals.signedSha256 = sig.contentSha256;
+    if (!sig.ok) {
+      if (verifier.mode === "required") return signatureRejected(res, sig.reason);
+      noteRejected(sig.reason); // optional: present but not valid = treated as unsigned, never as verified
+    } else if (sig.signed) res.locals.signedSha256 = sig.contentSha256;
     if (!req.path.startsWith("/events")) lastAppAt = now();
     return next();
   });
   // The signature covers the exact body bytes: every parser keeps the raw buffer it was given (the verify hook runs before parsing)
   const keepRaw = (req, _res, buf) => { req.rawBody = buf; };
-  const bodyMatchesSignature = (req, res) => res.locals.signedSha256 === undefined || verifier.checkBody(res.locals.signedSha256, req.rawBody);
+  // The body hash of a request whose headers verified. A mismatch is a bad signature in "required"; in "optional" the request goes on as unsigned.
+  const bodyMatchesSignature = (req, res) => {
+    if (res.locals.signedSha256 === undefined || verifier.checkBody(res.locals.signedSha256, req.rawBody)) return true;
+    if (verifier.mode === "required") return false;
+    res.locals.signedSha256 = undefined;
+    noteRejected("body");
+    return true;
+  };
   const jsonBody = express.json({ limit: "64kb", verify: keepRaw });
   const sendBody = express.json({ limit: SEND_BODY_LIMIT, verify: keepRaw }); // photos ride on the turn (B2); every other JSON route keeps 64 kB
   // /transcribe takes raw audio only (its own express.raw, 10 MiB, inside the route); /send takes the bigger JSON body
@@ -380,15 +393,16 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
   // Cheap by design (the deploy tooling and the app poll it): the config file and in-memory state only. No gateway call, no TTS call.
   router.get("/status", (_req, res) => {
-    const guard = readVoiceGuard(configPath);
+    const guard = readVoiceGuard(configPath, { stateDir });
     const version = link?.serverVersion?.() ?? null;
     res.json({
       ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" },
-      features: ["voice.speak.v2", "signing.v1"],
+      features: [...FEATURES], // the shared contract with the app (src/fixtures/voice-contract.json)
       voice: { ...speakStatus(guard, { linkUp: link?.isUp?.() === true, toolPath: !!speechDir }), warnings: guard.warnings },
       // turns running right now: a restart of the engine while this is above 0 makes the gateway re-run them (docs: release rule)
       runs: { active: [...runs.values()].filter((r) => r.status === "running").length },
-      signing: { mode: verifier.mode },
+      // the mode in effect (a "required" without a valid secret reads "off"), and the last signature this bridge did not accept: a reason and a time
+      signing: { mode: verifier.mode, ...(lastRejected ? { lastRejected } : {}) },
       ...(version ? { engine: { version } } : {}),
     });
   });
@@ -730,8 +744,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   }
 
   /**
-   * A refused speak. `{ok:false, error:<code the app already knows>, reason}`: a client that ignores `reason` keeps working.
-   * One log line with the reason only: never the text, never what the engine said.
+   * A refused speak. `{ok:false, error:<code the app already knows>, reason}`: a client that ignores `reason` keeps working. `reason`
+   * is always a member of REASONS (the shared contract). One log line with the reason only: never the text, never what the engine said.
    */
   const refuseSpeak = (res, status, error, reason) => {
     log?.warn?.("app-bridge", `speak refused: ${error} (${reason})`);
@@ -740,30 +754,35 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   let speaking = 0;
 
   /**
-   * Speak over the persistent link: the RPC `tts.speak` ({text} only). It uses the GLOBAL `tts` block, which the guard has just
-   * confirmed carries the agent's voice identity. NEVER retried here: a timed-out call may still be running at the provider, and a
+   * Speak over the persistent link: the RPC `tts.speak` ({text} only). It speaks with the GLOBAL `tts` block, which the guard has just
+   * confirmed is the same voice as the agent's. NEVER retried here: a timed-out call may still be running at the provider, and a
    * second one would be billed twice. No fallback to the CLI/admin path either (owner decision): a down link is an answer.
+   * The gateway may fall back to ANOTHER provider when the first fails (closed params cannot disable that): the answer names the
+   * provider that spoke, and anything but the approved one is refused, with no audio returned.
    */
-  async function speakViaLink(res, text) {
-    if (!link?.isUp?.()) return refuseSpeak(res, 502, "engine_unavailable", "link_down");
+  async function speakViaLink(res, text, guard) {
+    if (!link?.isUp?.()) return refuseSpeak(res, 502, "engine_unavailable", REASONS.LINK_DOWN);
     let d;
     try {
       d = await link.request("tts.speak", { text }, { timeoutMs: SPEAK_TIMEOUT_MS });
     } catch (err) {
-      if (err?.code === "link_down") return refuseSpeak(res, 502, "engine_unavailable", "link_down");
-      if (err?.code === "timeout") return refuseSpeak(res, 502, "engine_unavailable", "timeout"); // existing status vocabulary: no 504
-      if (err?.refused) return refuseSpeak(res, 503, "voice_unavailable", "provider_error"); // the gateway answered ok:false (e.g. UNAVAILABLE)
-      return refuseSpeak(res, 502, "engine_unavailable", "engine_error");
+      if (err?.code === "link_down") return refuseSpeak(res, 502, "engine_unavailable", REASONS.LINK_DOWN);
+      if (err?.code === "timeout") return refuseSpeak(res, 502, "engine_unavailable", REASONS.TIMEOUT); // existing status vocabulary: no 504
+      if (err?.refused && err.code === "INVALID_REQUEST") return refuseSpeak(res, 400, "bad_request", REASONS.TEXT_REJECTED); // the engine's own text rules (e.g. a lower max length)
+      if (err?.refused) return refuseSpeak(res, 503, "voice_unavailable", REASONS.PROVIDER_ERROR); // the gateway answered ok:false (e.g. UNAVAILABLE)
+      return refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
     }
+    // another provider spoke (or the answer does not say which): not BASHT's voice. The audio is dropped, not returned.
+    if (normalizeSpeechProviderId(d?.provider) !== guard.provider) return refuseSpeak(res, 503, "voice_unavailable", REASONS.IDENTITY_MISMATCH);
     const b64 = typeof d?.audioBase64 === "string" ? d.audioBase64 : "";
     const mime = String(d?.mimeType ?? "").split(";")[0].trim().toLowerCase();
     const ext = d?.fileExtension === undefined || d?.fileExtension === null ? null : String(d.fileExtension).toLowerCase();
     // check the encoded size first: a huge answer must not be decoded into memory just to be refused
     if (!b64 || b64.length > Math.ceil((MAX_SPEECH_BYTES * 4) / 3) + 4 || !Object.hasOwn(SPEECH_MIMES, mime) || (ext !== null && !Object.hasOwn(SPEECH_TYPES, ext))) {
-      return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+      return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
     }
     const audio = Buffer.from(b64, "base64");
-    if (audio.length < 1 || audio.length > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+    if (audio.length < 1 || audio.length > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
     res.set({ "Content-Type": SPEECH_MIMES[mime], "Content-Length": String(audio.length), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     return res.status(200).end(audio);
   }
@@ -776,23 +795,22 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       d = await invoke("tts", { text }, { sessionKey: APP_SESSION_KEY, timeoutMs: SPEAK_TIMEOUT_MS });
     } catch (err) {
       if (err?.answered) {
-        // 404/403: the tool policy does not allow `tts` for this caller; a tool_error: the tool ran and refused (no provider configured…)
-        const reason = err.status === 404 || err.status === 403 ? "tool_denied" : err.toolError ? "unconfigured" : "provider_error";
-        return refuseSpeak(res, 503, "voice_unavailable", reason);
+        // 404/403: the tool policy does not allow `tts` for this caller; anything else the tool or the provider refused with
+        return refuseSpeak(res, 503, "voice_unavailable", err.status === 404 || err.status === 403 ? REASONS.TOOL_DENIED : REASONS.PROVIDER_ERROR);
       }
-      return refuseSpeak(res, 502, "engine_unavailable", "engine_error");
+      return refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
     }
     const file = await speechFile(d?.audioPath);
     // never read (or delete) anything outside the speech directory
-    if (!file) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+    if (!file) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
     try {
-      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
       const audio = await fs.promises.readFile(file.real);
       res.set({ "Content-Type": SPEECH_TYPES[path.extname(file.real).toLowerCase()], "Content-Length": String(audio.length),
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
       res.status(200).end(audio);
     } catch {
-      refuseSpeak(res, 502, "engine_unavailable", "engine_error");
+      refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
     } finally {
       fs.promises.unlink(file.real).catch(() => {}); // one-shot: the app plays it, the engine keeps no copy
     }
@@ -800,19 +818,20 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
   router.post("/speak", async (req, res) => {
     const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request");
-    if (!speakLimit()) return refuseSpeak(res, 429, "rate_limited", "per_minute");
+    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request"); // UTF-16 code units, like the engine's own count
+    if (!speakLimit()) return refuseSpeak(res, 429, "rate_limited", REASONS.PER_MINUTE);
     // BASHT's voice is the agent block's. Decide which engine path can speak it, from the config as it is right now.
-    const guard = readVoiceGuard(configPath);
-    if (guard.state === "mismatch") return refuseSpeak(res, 503, "voice_unavailable", "identity_mismatch"); // no provider is called
-    if (guard.state === "no_agent_block") return refuseSpeak(res, 503, "voice_unavailable", "unconfigured");
-    const viaLink = guard.state === "match" || guard.state === "global_only";
-    // no_global / unknown: the tool path, as before the RPC existed (it works wherever the `tts` tool is allowed)
-    if (!viaLink && !speechDir) return refuseSpeak(res, 503, "voice_unavailable", "unconfigured");
-    if (speaking >= SPEAKS_IN_FLIGHT) return refuseSpeak(res, 429, "rate_limited", "in_flight");
+    const guard = readVoiceGuard(configPath, { stateDir });
+    if (guard.state === "mismatch") return refuseSpeak(res, 503, "voice_unavailable", REASONS.IDENTITY_MISMATCH); // no provider is called
+    if (guard.state === "no_agent_block") return refuseSpeak(res, 503, "voice_unavailable", REASONS.UNCONFIGURED);
+    // The link path (RPC `tts.speak`, global block) is used only when an agent block exists and the guard proved the global block
+    // is the same voice. Everything else (no_global, global_only, unknown) takes the tool path, as before the RPC existed.
+    const viaLink = guard.state === "match";
+    if (!viaLink && !speechDir) return refuseSpeak(res, 503, "voice_unavailable", REASONS.UNCONFIGURED);
+    if (speaking >= SPEAKS_IN_FLIGHT) return refuseSpeak(res, 429, "rate_limited", REASONS.IN_FLIGHT);
     speaking++;
     try {
-      await (viaLink ? speakViaLink(res, text) : speakViaTool(res, text));
+      await (viaLink ? speakViaLink(res, text, guard) : speakViaTool(res, text));
     } finally { speaking--; }
   });
 

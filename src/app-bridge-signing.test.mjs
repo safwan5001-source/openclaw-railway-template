@@ -347,14 +347,20 @@ test("router: modes over HTTP — off ignores signatures; optional: unsigned pas
       assert.equal((await m.plain("/status", { headers: { "x-basht-signature": "garbage", "x-basht-nonce": "x" } })).status, 200, `${label}: garbage headers are ignored`);
       assert.deepEqual((await m.plain("/status")).json.signing, { mode: "off" });
     }
-    // optional
+    // optional: never locks anyone out. A signature that is present but not valid is processed as an UNSIGNED request (the bearer
+    // token still applies) and the reason is remembered for /status
     assert.equal((await optional.plain("/status")).status, 200, "an old app (no headers) keeps working");
-    assert.deepEqual((await optional.plain("/status")).json.signing, { mode: "optional" });
-    assert.equal((await optional.plain("/status", { headers: { "x-basht-signature": "garbage" } })).status, 401);
-    assert.equal((await optional.plain("/status", { headers: { "x-basht-nonce": "a".repeat(20) } })).status, 401, "one header alone must verify fully");
+    assert.deepEqual((await optional.plain("/status")).json.signing, { mode: "optional" }, "nothing rejected so far");
+    const garbage = await optional.plain("/status", { headers: { "x-basht-signature": "garbage" } });
+    assert.equal(garbage.status, 200, "a wrong signature does not lock the owner out");
+    assert.deepEqual(garbage.json.signing.mode, "optional");
+    assert.deepEqual((await optional.plain("/status")).json.signing, { mode: "optional", lastRejected: { reason: "malformed", at: clock.t } });
+    assert.equal((await optional.plain("/status", { headers: { "x-basht-nonce": "a".repeat(20) } })).status, 200, "one header alone: unsigned");
     const g = V.cases[0];
     assert.equal((await optional.send(g)).status, 200, "a valid signed GET passes");
-    assert.equal((await optional.send({ ...g, nonce: "n-get-0000000009" })).status, 401, "a header set that does not match is refused, not ignored");
+    assert.equal((await optional.send({ ...g, nonce: "n-get-0000000009" })).status, 200, "a header set that does not match: accepted as unsigned");
+    assert.equal((await optional.plain("/status")).json.signing.lastRejected.reason, "signature");
+    assert.equal((await optional.plain("/status", { token: "wrong" })).status, 401, "the bearer token check still applies");
     // required
     assert.deepEqual((await required.plain("/status")).json, { ok: false, error: "bad_signature" });
     assert.equal((await required.plain("/status")).status, 401);
@@ -403,8 +409,8 @@ test("router: rotation — the previous secret keeps working next to the new one
   const prev = V.cases.find((c) => c.signedWith === "previous");
   const cur = V.cases[0];
   const clock = { t: prev.timestamp * 1000 };
-  const both = await mount({ signing: CONF, clock });
-  const onlyNew = await mount({ signing: { secret: CURRENT, mode: "optional" }, clock });
+  const both = await mount({ signing: { ...CONF, mode: "required" }, clock });
+  const onlyNew = await mount({ signing: { secret: CURRENT, mode: "required" }, clock });
   try {
     assert.ok(passed(await both.send(prev)), "signed with the previous secret");
     assert.ok(passed(await both.send(cur)), "signed with the current secret");
@@ -416,7 +422,7 @@ test("router: rotation — the previous secret keeps working next to the new one
 test("router: clock skew and replay over HTTP", async () => {
   const c = V.cases[0];
   const clock = { t: c.timestamp * 1000 };
-  const m = await mount({ signing: CONF, clock });
+  const m = await mount({ signing: { ...CONF, mode: "required" }, clock });
   try {
     clock.t = (c.timestamp + 61) * 1000;
     assert.equal((await m.send(c)).status, 401, "61 s late");
@@ -430,7 +436,7 @@ test("router: clock skew and replay over HTTP", async () => {
 
 test("router: the request target is signed as received — a query change, a path change or another method is refused", async () => {
   const c = V.cases[0];
-  const m = await mount({ signing: CONF, clock: { t: c.timestamp * 1000 } });
+  const m = await mount({ signing: { ...CONF, mode: "required" }, clock: { t: c.timestamp * 1000 } });
   try {
     assert.equal((await m.send(c, { target: "/app/v1/history?key=agent%3Amain%3Aapp%3Aowner&limit=51" })).status, 401);
     assert.equal((await m.send({ ...c, nonce: "n-get-0000000010" }, { target: c.target })).status, 401);
@@ -450,7 +456,7 @@ test("router: status reports the mode and never a secret", async () => {
     c.bodyBase64 = "";
     const ok = await m.send(c);
     assert.equal(ok.status, 200);
-    assert.deepEqual(ok.json.signing, { mode: "required" });
+    assert.deepEqual(ok.json.signing, { mode: "required", lastRejected: { reason: "signature", at: V.cases[0].timestamp * 1000 } }, "the refused attempt above is what /status remembers");
     const blob = JSON.stringify(ok.json);
     assert.ok(!blob.includes(CURRENT) && !blob.includes(PREVIOUS));
   } finally { m.close(); }
@@ -495,4 +501,81 @@ test("server.js reads the signing variables once, passes them to the bridge and 
   assert.ok(bridge > 0 && read > bridge, "read while the bridge is being created");
   assert.ok(delToken > read && delSecret > read && delPrev > read, "removed only after it was read");
   assert.equal([...src.matchAll(/BASHT_BRIDGE_SIGNING_SECRET\b(?!_PREVIOUS)/g)].length, 1, "the secret's name appears once in server.js (the delete)");
+});
+
+test("router (I3): in optional a present-but-invalid signature is processed as UNSIGNED, never as verified — skew, replay, wrong secret, tampered body, wrong target", async () => {
+  const [get, jsonPost] = V.cases;
+  const clock = { t: get.timestamp * 1000 };
+  const m = await mount({ signing: { ...CONF, mode: "optional" }, clock });
+  const last = async () => (await m.plain("/status")).json.signing.lastRejected;
+  try {
+    // skew
+    clock.t = (get.timestamp + 120) * 1000;
+    assert.equal((await m.send(get)).status, 200);
+    assert.equal((await last()).reason, "skew");
+    // replay: the first is verified (no new rejection), the second is a replay and still accepted as unsigned
+    clock.t = get.timestamp * 1000;
+    assert.equal((await m.send(get)).status, 200);
+    assert.equal((await last()).reason, "skew", "a valid signed request is not a rejection");
+    assert.equal((await m.send(get)).status, 200);
+    assert.equal((await last()).reason, "replay");
+    // a wrong secret (a typo on one side)
+    const typo = await mount({ signing: { secret: "another-secret-another-secret-another-secret", mode: "optional" }, clock });
+    try {
+      assert.equal((await typo.send(get)).status, 200, "the owner is not locked out by a mistyped secret");
+      assert.equal((await typo.plain("/status")).json.signing.lastRejected.reason, "signature");
+    } finally { typo.close(); }
+    // a tampered body with valid-looking headers: accepted as an unsigned request, but NOT trusted as signed (reason "body")
+    const tampered = await m.send(jsonPost, { body: Buffer.from('{"message":"another message"}') });
+    assert.equal(tampered.status, 202, "processed like an unsigned request (the turn starts)");
+    assert.equal((await last()).reason, "body");
+    // the original body of that very request was not spent as verified: it still verifies once (its nonce is the one the tamper used)
+    const target = await m.send(get, { target: "/app/v1/sessions" });
+    assert.equal(target.status, 200);
+    // no rejection ever shows a header value or a secret
+    const blob = JSON.stringify((await m.plain("/status")).json);
+    assert.ok(!blob.includes(CURRENT) && !blob.includes(get.nonce) && !blob.includes(get.signature));
+  } finally { m.close(); }
+});
+
+test("router (I3): only required counts signature failures in the limiter; optional failures never reach 429", async () => {
+  const c = V.cases[0];
+  const m = await mount({ signing: { ...CONF, mode: "optional" }, clock: { t: c.timestamp * 1000 } });
+  try {
+    for (let i = 0; i < 30; i++) assert.equal((await m.plain("/status", { headers: { "x-basht-signature": "garbage" } })).status, 200, `attempt ${i}`);
+    assert.equal((await m.plain("/status", { token: "wrong" })).status, 401, "bad TOKENS still count and still answer 401 first");
+  } finally { m.close(); }
+});
+
+test("router (I3): the rejection reason is logged once a minute per reason, without any header value", async () => {
+  const c = V.cases[0];
+  const clock = { t: c.timestamp * 1000 };
+  const lines = [];
+  const app = express();
+  app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath, fetchImpl: gateway, now: () => clock.t,
+    log: { warn: (_t, m) => lines.push(m), info() {} }, signing: { ...CONF, mode: "optional" } }));
+  const srv = app.listen(0, "127.0.0.1");
+  await new Promise((r) => srv.once("listening", r));
+  const hit = (headers) => fetch(`http://127.0.0.1:${srv.address().port}/app/v1/status`, { headers: { authorization: `Bearer ${APP_TOKEN}`, ...headers } });
+  try {
+    for (let i = 0; i < 5; i++) await hit({ "x-basht-signature": "garbage-value-xyz" });
+    assert.deepEqual(lines, ["signature rejected: malformed (mode optional)"]);
+    clock.t += 30_000;
+    await hit({ "x-basht-signature": "garbage-value-xyz" });
+    assert.equal(lines.length, 1, "still within the minute");
+    clock.t += 31_000;
+    await hit({ "x-basht-signature": "garbage-value-xyz" });
+    assert.equal(lines.length, 2);
+    assert.ok(!lines.join().includes("garbage-value-xyz"));
+  } finally { srv.close(); }
+});
+
+test("router (I3): 'required' without a valid secret degrades to off, visible as status.signing.mode", async () => {
+  const clock = { t: V.cases[0].timestamp * 1000 };
+  const m = await mount({ signing: signingConfigFromEnv({ BASHT_BRIDGE_SIGNING_MODE: "required" }, () => {}), clock });
+  try {
+    const r = await m.plain("/status");
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.signing, { mode: "off" });
+  } finally { m.close(); }
 });
