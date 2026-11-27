@@ -170,10 +170,20 @@ export function extractMedia(m, key, text = textOf(m)) {
   return { text: rest, media, messageId: id };
 }
 
-/** Engine-owned roots a MEDIA: file may live in (real paths). */
+/**
+ * Engine-owned roots a MEDIA: file may live in, as a getter of real paths. Resolved lazily on every call: a root that does not
+ * exist yet (a fresh volume: no <stateDir>/media until the first upload) is picked up as soon as it appears; a root is cached
+ * only once it resolved.
+ */
 export function mediaRoots(workspaceDir, stateDir) {
-  return [workspaceDir, stateDir && path.join(stateDir, "media")].filter(Boolean).map((r) => { try { return fs.realpathSync(r); } catch { return null; } }).filter(Boolean);
+  const wanted = [workspaceDir, stateDir && path.join(stateDir, "media")].filter(Boolean);
+  const known = new Map();
+  return () => wanted.map((r) => {
+    if (known.has(r)) return known.get(r);
+    try { const real = fs.realpathSync(r); known.set(r, real); return real; } catch { return null; }
+  }).filter(Boolean);
 }
+const rootList = (roots) => (typeof roots === "function" ? roots() : roots ?? []);
 
 /** A file reference -> the absolute path it names (relative to the workspace, ~/ to home, media://inbound/<id> to the store). */
 export function resolveSource(src, { workspaceDir, stateDir }) {
@@ -200,7 +210,7 @@ export async function openMediaFile(src, { workspaceDir, stateDir, roots }) {
   if (!abs) return { error: "unavailable" };
   let real;
   try { real = await fs.promises.realpath(abs); } catch { return { error: "unavailable" }; }
-  if (!roots.some((r) => real.startsWith(r + path.sep))) return { error: "unavailable" };
+  if (!rootList(roots).some((r) => real.startsWith(r + path.sep))) return { error: "unavailable" };
   const t = typeOf(real);
   if (!t) return { error: "unsupported" };
   let fh;

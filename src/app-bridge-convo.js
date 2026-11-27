@@ -78,17 +78,19 @@ export function cleanSnippet(s) {
 }
 
 /**
- * Registers POST /new and GET /search. ctx: { gatewayCall, invoke, appKey, readableKeys() -> Promise<string[]>, readable(key),
+ * Registers POST /new and GET /search. ctx: { gatewayCall, invoke, appKey, resetState: {active} (shared with /send), readableKeys() -> Promise<string[]>, readable(key),
  * labelOf(key), turnRunning(), ledger, log, now, fail(res, err, what) }
  */
 export function registerConvoRoutes(router, ctx) {
   const needsCall = (res) => { if (ctx.gatewayCall) return false; res.status(503).json({ ok: false, error: "not_available" }); return true; };
-  let resetting = false;
+  // ONE exclusion shared with /send (ctx.resetState): while a reset is under way no turn is accepted, and a reset never starts
+  // while a turn runs — so the context is never reset under a message the bridge already accepted.
+  const lock = ctx.resetState;
 
   router.post("/new", async (_req, res) => {
     if (needsCall(res)) return;
-    if (resetting || ctx.turnRunning()) return res.status(409).json({ ok: false, error: "busy" });
-    resetting = true;
+    if (lock.active || ctx.turnRunning()) return res.status(409).json({ ok: false, error: "busy" });
+    lock.active = true;
     try {
       const d = await ctx.gatewayCall("sessions.describe", { key: ctx.appKey });
       if (d?.session?.hasActiveRun === true) return res.status(409).json({ ok: false, error: "busy" });
@@ -98,6 +100,7 @@ export function registerConvoRoutes(router, ctx) {
       const last = rows.at(-1) ?? null;
       let anchorId = rowId(last);
       if (last && isResetRow(last)) anchorId = ctx.ledger.anchorFor(anchorId) ?? null; // two resets in a row: keep the older anchor
+      if (ctx.turnRunning()) return res.status(409).json({ ok: false, error: "busy" }); // re-checked right before the reset
       const r = await ctx.gatewayCall("sessions.reset", { key: ctx.appKey, reason: "new" });
       if (r?.ok === false || (r?.key && r.key !== ctx.appKey)) return res.status(400).json({ ok: false, error: "rejected" });
       const after = await ctx.invoke("sessions_history", { sessionKey: ctx.appKey, limit: 3 }).catch(() => null);
@@ -108,7 +111,7 @@ export function registerConvoRoutes(router, ctx) {
     } catch (err) {
       if (err?.refused) return res.status(400).json({ ok: false, error: "rejected" });
       ctx.fail(res, err, "new");
-    } finally { resetting = false; }
+    } finally { lock.active = false; }
   });
 
   let searches = [];

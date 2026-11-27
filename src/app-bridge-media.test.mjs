@@ -28,13 +28,17 @@ const rpc = [];  // gatewayCall(method, params)
 let appRows = []; // the app session's current projection (sessions_history)
 let archive = []; // every row ever (chat.history anchored reads)
 let hasActiveRun = false;
+let describeDelay = 0; // ms a sessions.describe takes (holds a reset in flight)
 let resets = 0;
 
 const row = (id, role, content, ts, extra = {}) => ({ role, content, timestamp: ts, __openclaw: { id, ...(extra.kind ? { kind: extra.kind } : {}) }, ...extra.fields });
 
 async function fakeGatewayCall(method, params) {
   rpc.push({ method, params });
-  if (method === "sessions.describe") return { session: { key: params.key, hasActiveRun } };
+  if (method === "sessions.describe") {
+    if (describeDelay) await new Promise((r) => setTimeout(r, describeDelay));
+    return { session: { key: params.key, hasActiveRun } };
+  }
   if (method === "sessions.reset") {
     resets++;
     const reset = row(`reset-row-${resets}`, "system", [{ type: "text", text: "Reset" }], 5000 + resets, { kind: "reset" });
@@ -381,4 +385,52 @@ test("run view: steps are tool names only, refreshed from the app session while 
   assert.ok(!JSON.stringify(done).includes("سر"));
   const histCall = seen.findLast((s) => s.url === "/tools/invoke" && JSON.parse(s.body).args?.includeTools === true);
   assert.equal(JSON.parse(histCall.body).args.sessionKey, APP_SESSION_KEY);
+});
+
+// Review (Codex #1): a turn must never be accepted while «محادثة جديدة» is under way — the reset would wipe its context.
+test("send during a reset is refused (409); the reset completes and sending works again", async () => {
+  await waitRun((await call("/send", { method: "POST", body: { message: "قبل" } })).json.runId).catch(() => {});
+  describeDelay = 150;
+  const resets0 = rpc.filter((c) => c.method === "sessions.reset").length;
+  const reset = call("/new", { method: "POST" });
+  await new Promise((r) => setTimeout(r, 40)); // the reset is awaiting sessions.describe
+  const turns0 = seen.filter((s) => s.url === "/v1/chat/completions").length;
+  const send = await call("/send", { method: "POST", body: { message: "أثناء إعادة الضبط" } });
+  assert.equal(send.status, 409);
+  assert.equal(send.json.error, "busy");
+  assert.equal((await reset).status, 200);
+  describeDelay = 0;
+  assert.equal(rpc.filter((c) => c.method === "sessions.reset").length, resets0 + 1);
+  assert.equal(seen.filter((s) => s.url === "/v1/chat/completions").length, turns0, "the refused turn never reached the engine");
+  const after = await call("/send", { method: "POST", body: { message: "بعد" } });
+  assert.equal(after.status, 202);
+  await waitRun(after.json.runId);
+});
+
+// Review (Codex #2): <stateDir>/media (or the workspace) may not exist when the wrapper starts; files that appear later are served.
+test("media roots are resolved lazily: a root created after start is honoured", async () => {
+  const late = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-late-"));
+  const lateState = path.join(late, "state"); const lateWs = path.join(late, "workspace");
+  fs.mkdirSync(lateState, { recursive: true }); // no media/ and no workspace/ yet
+  const app = express();
+  app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: `http://127.0.0.1:${gateway.address().port}`, gatewayToken: GW_TOKEN,
+    configPath: path.join(dir, "openclaw.json"), gatewayCall: fakeGatewayCall, stateDir: lateState, workspaceDir: lateWs }));
+  const s = app.listen(0, "127.0.0.1"); await new Promise((r) => s.once("listening", r));
+  try {
+    fs.mkdirSync(path.join(lateState, "media", "inbound"), { recursive: true });
+    fs.writeFileSync(path.join(lateState, "media", "inbound", "late---1.pdf"), PDF);
+    fs.mkdirSync(path.join(lateWs, "out"), { recursive: true });
+    fs.writeFileSync(path.join(lateWs, "out", "late.png"), PNG);
+    appRows = [row("msg-late-01", "assistant", [{ type: "text", text: "تم\n\nMEDIA:./out/late.png" }], Date.now()),
+      row("msg-late-02", "user", "خذ [media attached: media://inbound/late---1.pdf]", Date.now())];
+    const b = `http://127.0.0.1:${s.address().port}/app/v1`;
+    const auth = { headers: { authorization: `Bearer ${APP_TOKEN}` } };
+    const h = await (await fetch(`${b}/history?key=${encodeURIComponent(APP_SESSION_KEY)}`, auth)).json();
+    const items = h.messages.flatMap((m) => m.media.map((x) => ({ ...x, msg: m.id })));
+    assert.deepEqual(items.map((x) => [x.name, x.available]), [["late.png", true], ["late---1.pdf", true]]);
+    for (const it of items) {
+      const r = await fetch(`${b}/media?key=${encodeURIComponent(APP_SESSION_KEY)}&msg=${it.msg}&ref=${it.ref}`, auth);
+      assert.equal(r.status, 200, it.name);
+    }
+  } finally { s.close(); fs.rmSync(late, { recursive: true, force: true }); }
 });

@@ -183,6 +183,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const router = express.Router();
+  const resetState = { active: false }; // B1: shared by /new and /send (see app-bridge-convo.js)
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
 
@@ -256,7 +257,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   // ---- B1/B2 shared state: the reset ledger, the refs handed out, the roots a MEDIA: file may come from ----
   const ledger = createResetLedger(stateDir);
   const refs = createRefCache();
-  const roots = mediaRoots(workspaceDir, stateDir);
+  const roots = mediaRoots(workspaceDir, stateDir); // a getter: roots are resolved lazily
   const mediaCtx = { workspaceDir, stateDir, roots };
   /** Transcript rows -> the app's rows: text (MEDIA: lines and attachment markers removed), media refs, id, reset boundaries. */
   const mapRows = (key, rows) => rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))).map((m) => {
@@ -267,7 +268,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (it.kind === "link" || it.artifact) return publicMedia(it, true);
       const abs = resolveSource(it.file, mediaCtx);
       let size = null; let ok = false;
-      try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots.some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }
+      try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots().some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }
       return publicMedia({ ...it, size }, ok);
     });
     return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(m.role === "assistant" ? assistantMeta(m) : {}) };
@@ -302,6 +303,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   });
 
   router.post("/send", (req, res) => {
+    if (resetState.active) return res.status(409).json({ ok: false, error: "busy" }); // «محادثة جديدة» under way (B1)
     const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
     const pics = parseImages(req.body?.images);
     if (pics.error) return res.status(400).json({ ok: false, error: pics.error });
@@ -532,7 +534,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
   // ---- B1/B2 routes: «محادثة جديدة», search, media ----
   const readableKey = (key) => isReadable({ key }, ownersFromConfig(configPath));
-  const convoCtx = { gatewayCall, invoke, appKey: APP_SESSION_KEY, ledger, log, now, fail, turnRunning, readable: readableKey,
+  const convoCtx = { gatewayCall, invoke, appKey: APP_SESSION_KEY, ledger, resetState, log, now, fail, turnRunning, readable: readableKey,
     labelOf: (key) => sessionLabel({ key }),
     readableKeys: async () => { const owners = ownersFromConfig(configPath); const keys = (await allSessions()).filter((r) => isReadable(r, owners)).map((r) => r.key);
       return [...new Set([APP_SESSION_KEY, MAIN_SESSION_KEY, ...keys])]; } };

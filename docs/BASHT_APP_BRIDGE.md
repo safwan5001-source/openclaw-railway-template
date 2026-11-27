@@ -117,6 +117,7 @@ buffer. Every call is built by the bridge with the app session key or a key that
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
   - Image blocks are fetched with `artifacts.download` (image types only, bytes must match).
+  - Allowed roots are resolved per request (a root created after the wrapper started is honoured).
   - Files are served only if their realpath (symlinks resolved, `O_NOFOLLOW`) is a regular file inside the agent workspace or
     `<stateDir>/media`, the extension is on a fixed list (images, PDF, txt/md/csv/json, docx/xlsx/pptx, mp3/m4a/ogg/wav, mp4),
     the first bytes match the type, and the size is at most 20 MB. Relative paths resolve against the workspace.
@@ -124,7 +125,8 @@ buffer. Every call is built by the bridge with the app session key or a key that
   - Responses carry `Content-Disposition: attachment`, `nosniff` and `CSP: sandbox`. SVG is never inline.
 - **Steps.** While the app polls `/runs/:id`, the bridge reads the app session's last 12 rows (`sessions_history`,
   `includeTools`) at most every 1.5 s, and returns `steps: [{tool, done}]`: tool names only.
-- **New conversation.** Refused while a turn runs (409). OpenClaw keeps the same session id and transcript. Its default
+- **New conversation.** Refused while a turn runs (409); while a reset is under way `/send` answers 409 `busy` too (one shared
+  exclusion), and the reset re-checks for a running turn right before `sessions.reset`. OpenClaw keeps the same session id and transcript. Its default
   projection then starts at the reset row, while older rows stay reachable by an anchored read. That read stays inside one
   reset segment, and a forged `cursor` gets `windowReset`. So the bridge records, per reset it makes, `{resetId, anchorId}` (ids
   only) in `<stateDir>/app-bridge/resets.json` (0600, last 50). `/history` returns `earlier: <resetId>` when the first row is such a
