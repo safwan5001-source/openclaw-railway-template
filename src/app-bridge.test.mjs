@@ -28,6 +28,8 @@ const FILLER = Array.from({ length: 120 }, (_, i) => ({ key: `agent:main:whatsap
 
 // ---- fake model control: what `openclaw gateway call` and the `sessions` tool would answer (shapes seen on 2026.11.10) ----
 const rpc = []; // every gatewayCall the bridge made
+const timeline = []; // order in which writes and turns reached the (fake) gateway
+let patchDelay = 0;  // ms a sessions.patch takes (to hold a write in flight)
 let clockOffset = 0; // moves the bridge's clock (models cache)
 const RUNTIME = { id: "openclaw", source: "implicit" };
 const MODELS = [
@@ -53,6 +55,8 @@ async function fakeGatewayCall(method, params) {
   if (method === "models.list") return { models: MODELS, decisionModels: [{ id: "x" }], accountSelection: { kind: "automatic" } };
   if (method === "sessions.describe") return { session: params.key === APP_SESSION_KEY ? appSession : null };
   if (method === "sessions.patch") {
+    if (patchDelay) await new Promise((r) => setTimeout(r, patchDelay));
+    timeline.push(`patch:${Object.keys(params).filter((k) => k !== "key").join(",")}`);
     if (params.key !== APP_SESSION_KEY) { otherPatched.push(params); return { ok: true }; }
     if ("thinkingLevel" in params) { if (params.thinkingLevel === null) delete appSession.thinkingLevel; else appSession.thinkingLevel = params.thinkingLevel; }
     if ("fastMode" in params) {
@@ -65,6 +69,7 @@ async function fakeGatewayCall(method, params) {
 }
 
 const fakeSessionsTool = (args) => {
+  timeline.push(`model:${args.model}`);
   if (args.sessionKey !== APP_SESSION_KEY) { otherPatched.push(args); return { status: "updated", sessionKey: args.sessionKey }; }
   if (args.model === "mock/policy") return null; // the engine's own policy refuses it
   if (args.model === "default") Object.assign(appSession, { modelProvider: "mock", model: "echo", modelOverrideSource: null });
@@ -121,6 +126,7 @@ before(async () => {
         return res.end(JSON.stringify({ ok: false }));
       }
       if (req.url === "/v1/chat/completions") {
+        timeline.push("turn");
         res.writeHead(200, { "content-type": "text/event-stream" });
         const send = (d) => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: d }] })}\n\n`);
         send({ role: "assistant" });
@@ -514,4 +520,66 @@ test("a delayed reset re-check never undoes a newer write made meanwhile", async
   assert.equal((await post("/thinking", { level: "high" })).status, 200); // valid for echo
   assert.equal((await first).status, 200);
   assert.equal(appSession.thinkingLevel, "high", "the newer level survives the first request's re-check");
+});
+
+// ── concurrency: two devices, and a message started during a change ─────────
+test("two devices at once: a model switch and a thinking change never interleave into an unsupported level", async () => {
+  appSession = freshSession(); // echo: levels off/low/high
+  patchDelay = 40;
+  const [a, b] = await Promise.all([post("/model", { model: "mock/echo2" }), post("/thinking", { level: "high" })]); // echo2: levels off only
+  patchDelay = 0;
+  assert.equal(a.status, 200);
+  assert.ok(b.status === 400 && b.json.error === "unsupported_level", `the level is judged against the model it would land on (${b.status})`);
+  assert.equal(appSession.model, "echo2");
+  assert.ok(appSession.thinkingLevel === undefined || LEVELS["mock/echo2"].includes(appSession.thinkingLevel));
+  // the other order: the level first, then the switch clears it
+  appSession = freshSession();
+  patchDelay = 40;
+  const [c, d] = await Promise.all([post("/thinking", { level: "high" }), post("/model", { model: "mock/echo2" })]);
+  patchDelay = 0;
+  assert.equal(c.status, 200);
+  assert.deepEqual(d.json.reset, { thinking: true, fast: false });
+  assert.equal(appSession.thinkingLevel, undefined);
+});
+
+test("two devices at once: fast on + switch to a model without it ends consistent, whatever the order", async () => {
+  appSession = { ...freshSession(), modelProvider: "xai", model: "grok-3", thinkingLevels: LEVELS["xai/grok-3"] };
+  patchDelay = 30;
+  const [f, m] = await Promise.all([post("/fast", { mode: "on" }), post("/model", { model: "mock/echo" })]);
+  patchDelay = 0;
+  assert.equal(f.status, 200);
+  assert.equal(m.status, 200);
+  assert.equal(appSession.model, "echo");
+  assert.equal(appSession.effectiveFastMode, false, "echo has no fast mode: the later switch cleared it");
+});
+
+test("a message sent while a model change is in flight starts only after the change — never mid-change", async () => {
+  appSession = freshSession();
+  timeline.length = 0;
+  patchDelay = 80; // the reset patch after the switch is slow
+  appSession = { ...freshSession(), thinkingLevel: "high" };
+  const change = post("/model", { model: "mock/echo2" }); // will reset "high" (slow patch)
+  await new Promise((r) => setTimeout(r, 10));
+  const sent = await call("/send", { method: "POST", body: { message: "أثناء التبديل" } });
+  assert.equal(sent.status, 202);
+  assert.equal((await change).status, 200);
+  await waitRun(sent.json.runId);
+  patchDelay = 0;
+  const iModel = timeline.indexOf("model:mock/echo2"), iReset = timeline.indexOf("patch:thinkingLevel"), iTurn = timeline.indexOf("turn");
+  assert.ok(iModel >= 0 && iReset > iModel && iTurn > iReset, `order: ${timeline.join(" → ")}`);
+});
+
+test("a change while this bridge's own turn is starting is refused (even before the engine flags the run)", async () => {
+  appSession = { ...freshSession(), hasActiveRun: false }; // the engine has not flagged it yet
+  let open;
+  chatGate = new Promise((r) => (open = r));
+  const sent = await call("/send", { method: "POST", body: { message: "طويلة" } });
+  await new Promise((r) => setTimeout(r, 20));
+  const r = await post("/model", { model: "mock/echo2" });
+  assert.equal(r.status, 409);
+  assert.deepEqual(r.json, { ok: false, error: "busy" });
+  open(); chatGate = null;
+  await waitRun(sent.json.runId);
+  assert.equal(appSession.model, "echo", "nothing changed mid-turn");
+  assert.equal((await post("/model", { model: "mock/echo2" })).status, 200, "allowed once the turn is over");
 });

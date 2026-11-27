@@ -271,6 +271,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
     const timer = setTimeout(() => ctl.abort(), RUN_TIMEOUT_MS);
     (async () => {
+      await queue; // a model/thinking/fast change already under way applies BEFORE this turn starts (never mid-turn)
       const r = await fetchImpl(`${gatewayUrl}/v1/chat/completions`, {
         method: "POST",
         headers: { ...gatewayHeaders, "x-openclaw-session-key": APP_SESSION },
@@ -335,11 +336,17 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     return s;
   }
 
+  // Settings writes (model / thinking / fast) run one at a time — two devices changing settings together never interleave
+  // (e.g. a level validated against the old model landing on the new one). A new turn waits for the queue to drain.
+  let queue = Promise.resolve();
+  const serial = (fn) => { const p = queue.then(fn, fn); queue = p.catch(() => {}); return p; };
+  const turnRunning = () => [...runs.values()].some((r) => r.status === "running");
   let writes = 0; // every settings write bumps this; a delayed re-check only acts if nothing was written since
   const patchApp = (fields) => { writes++; return gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields }); };
   // A change made while a turn is running is overwritten when that turn saves the session: refuse it (409 busy) instead.
   const busy = (res, s) => {
-    if (s?.hasActiveRun !== true) return false;
+    // the engine's flag can lag right at the start of a turn: this bridge's own running turn counts too
+    if (s?.hasActiveRun !== true && !turnRunning()) return false;
     res.status(409).json({ ok: false, error: "busy" });
     return true;
   };
@@ -391,7 +398,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } catch (err) { fail(res, err, "model"); }
   });
 
-  router.post("/model", async (req, res) => {
+  router.post("/model", (req, res) => serial(async () => {
     if (needsCall(res)) return;
     const want = typeof req.body?.model === "string" ? req.body.model.trim() : "";
     if (!want || want.length > MAX_MODEL_REF) return bad(res, "bad_request");
@@ -434,9 +441,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (err?.toolError || err?.refused) return bad(res, "rejected");
       fail(res, err, "model patch");
     }
-  });
+  }));
 
-  router.post("/thinking", async (req, res) => {
+  router.post("/thinking", (req, res) => serial(async () => {
     if (needsCall(res)) return;
     const level = typeof req.body?.level === "string" ? req.body.level.trim() : "";
     if (!level || level.length > 40) return bad(res, "bad_request");
@@ -447,9 +454,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       await patchApp({ thinkingLevel: level === "default" ? null : level });
       res.json({ ok: true, thinking: { level: level === "default" ? null : level } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "thinking patch"); }
-  });
+  }));
 
-  router.post("/fast", async (req, res) => {
+  router.post("/fast", (req, res) => serial(async () => {
     if (needsCall(res)) return;
     const mode = typeof req.body?.mode === "string" ? req.body.mode.trim() : "";
     if (!Object.hasOwn(FAST_MODES, mode)) return bad(res, "bad_request");
@@ -464,7 +471,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       await patchApp({ fastMode: FAST_MODES[mode] });
       res.json({ ok: true, fast: { mode } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
-  });
+  }));
 
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));
