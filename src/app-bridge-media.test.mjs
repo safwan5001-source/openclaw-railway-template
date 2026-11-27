@@ -437,6 +437,32 @@ test("new conversation (integration with model control): waits for a settings wr
   } finally { describeDelay = 0; }
 });
 
+// Review (Codex, integration PR): a /new whose client gave up while it waited in the settings queue left that queue
+// pending for ever (its response had already closed, so neither finish nor close fired again): every later model/thinking
+// /fast write and every /send stalled until a restart. An abandoned reset is skipped and the queue moves on.
+test("new conversation abandoned while queued: the settings queue is released (later writes and sends still work)", async () => {
+  describeDelay = 150;
+  const resets0 = rpc.filter((c) => c.method === "sessions.reset").length;
+  try {
+    const write = call("/thinking", { method: "POST", body: { level: "high" } }); // holds the settings queue
+    await new Promise((r) => setTimeout(r, 30));
+    const ac = new AbortController();
+    const reset = fetch(base + "/new", { method: "POST", headers: { authorization: `Bearer ${APP_TOKEN}` }, signal: ac.signal }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 30));
+    ac.abort(); // the owner closed the app while the reset waited
+    await reset;
+    await write;
+  } finally { describeDelay = 0; }
+  const next = await Promise.race([call("/thinking", { method: "POST", body: { level: "high" } }), new Promise((r) => setTimeout(() => r("stalled"), 3000))]);
+  assert.notEqual(next, "stalled", "a later settings write must not wait behind the abandoned reset");
+  assert.equal(next.status, 400);
+  assert.equal(rpc.filter((c) => c.method === "sessions.reset").length, resets0, "the abandoned reset never ran");
+  const send = await Promise.race([call("/send", { method: "POST", body: { message: "بعد الإلغاء" } }), new Promise((r) => setTimeout(() => r("stalled"), 3000))]);
+  assert.notEqual(send, "stalled", "/send must not wait behind the abandoned reset");
+  assert.equal(send.status, 202);
+  await waitRun(send.json.runId);
+});
+
 test("media roots are resolved lazily: a root created after start is honoured", async () => {
   const late = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-late-"));
   const lateState = path.join(late, "state"); const lateWs = path.join(late, "workspace");
