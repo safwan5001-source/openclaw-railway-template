@@ -6,11 +6,19 @@
 //   POST /app/v1/send { message }  -> starts ONE owner turn in the app's own session; returns { runId } at once
 //   GET  /app/v1/runs/:id          -> that turn's live text and status (the app polls it)
 //   POST /app/v1/runs/:id/stop     -> stops that turn
+//   GET  /app/v1/models            -> the models the agent may use (models.list, default view), cached 60 s
+//   GET  /app/v1/model             -> the app session's model, thinking level, fast mode, usage, last fallback, last-run latency
+//   POST /app/v1/model { model }   -> pins a listed, available model on the app session ("default" clears the pin)
+//   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
+//   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
 //   or SETUP_PASSWORD. The bridge calls the loopback gateway itself, with a FIXED set of operations:
 //   `sessions_list` / `sessions_history` (read) and `/v1/chat/completions` on ONE session key (write). Nothing else.
+// - Model control (M) adds, through an injected `gatewayCall` (the wrapper runs `openclaw gateway call`): `models.list`,
+//   `sessions.describe` and `sessions.patch` (thinkingLevel / fastMode), and the `sessions` tool `patch` (model). Every
+//   write targets APP_SESSION_KEY only, with values validated against what the engine itself listed. No config writes.
 // - The app is the owner's own client, so its turns are owner turns (same agent, same shared memory, same tool policy and
 //   approval rules as the Control UI). They run in their own session (`app:owner`), separate from the WhatsApp chat.
 // - Reads are limited to the owner's own conversations: the app session, the main session and the owner's direct WhatsApp
@@ -31,6 +39,58 @@ const RUN_TIMEOUT_MS = 15 * 60_000;
 const READ_TIMEOUT_MS = 15_000;
 const AUTH_FAILURES_PER_MINUTE = 20;
 const MAX_LIST_PAGES = 20; // up to 2000 sessions
+const MODELS_CACHE_MS = 60_000;
+const MAX_MODEL_REF = 200;
+const FAST_MODES = { on: true, off: false, default: null };
+
+/** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
+export function safeStr(v, max = 200) {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  return s ? s.slice(0, max) : null;
+}
+
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const bool = (v) => (typeof v === "boolean" ? v : null);
+
+/** The selectable `provider/model` ref of a catalog row (an id that already carries its provider is kept as it is). */
+export function modelRef(provider, id) {
+  const p = safeStr(provider, MAX_MODEL_REF);
+  const m = safeStr(id, MAX_MODEL_REF);
+  if (!m) return null;
+  return p && !m.startsWith(`${p}/`) ? `${p}/${m}` : m;
+}
+
+const levelIds = (levels) => (Array.isArray(levels) ? levels : [])
+  .map((l) => safeStr(typeof l === "string" ? l : l?.id, 40)).filter(Boolean);
+
+/** One models.list row in the bridge's fixed shape. Raw upstream objects never leave the bridge. */
+export function mapModel(r) {
+  const id = modelRef(r?.provider, r?.id);
+  if (!id) return null;
+  const available = r.available === true;
+  const manualSelectionAllowed = r.manualSelectionAllowed !== false; // only capable clients receive the flag; the gateway re-checks policy on patch
+  return {
+    id, name: safeStr(r.name) ?? id, provider: safeStr(r.provider, 100), providerName: safeStr(r.providerName, 100),
+    available, unavailableReason: safeStr(r.unavailableReason), unavailableUntil: num(r.unavailableUntil),
+    contextWindow: num(r.contextWindow), reasoning: r.reasoning === true, thinkingLevels: levelIds(r.thinkingLevels),
+    thinkingDefault: safeStr(r.thinkingDefault, 40), supportsFastMode: r.supportsFastMode === true, supportsTools: bool(r.supportsTools),
+    input: (Array.isArray(r.input) ? r.input : []).map((x) => safeStr(x, 20)).filter(Boolean), recommended: r.recommended === true,
+    selectable: available && manualSelectionAllowed,
+  };
+}
+
+/** Provider/model of an assistant transcript message, plus the structured fallback record OpenClaw writes on a model switch. */
+export function assistantMeta(m) {
+  const out = { provider: safeStr(m?.provider, 100), model: safeStr(m?.model, MAX_MODEL_REF) };
+  const fb = m?.openclawDeliveryMirror;
+  if (fb && fb.kind === "model-fallback") {
+    out.fallback = { from: safeStr(fb.fromModel, MAX_MODEL_REF), to: safeStr(fb.toModel, MAX_MODEL_REF), reason: safeStr(fb.reason, 60) };
+  }
+  return out;
+}
+
+const isMirror = (m) => m?.provider === "openclaw" || m?.openclawDeliveryMirror != null;
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
@@ -73,7 +133,7 @@ function sessionLabel(row) {
   return String(row.label || row.title || row.key);
 }
 
-/** Reads the SSE stream of /v1/chat/completions, calling onText with the growing text. Resolves when [DONE]. */
+/** Reads the SSE stream of /v1/chat/completions, calling onText with the growing text (the first call marks the first token). */
 async function readCompletionStream(body, onText) {
   const decoder = new TextDecoder();
   let buf = "";
@@ -101,14 +161,16 @@ async function readCompletionStream(body, onText) {
 
 /**
  * @param {{ token?: string, gatewayUrl: string, gatewayToken: string, configPath: string, log?: any,
- *           fetchImpl?: typeof fetch, now?: () => number }} opts
+ *           fetchImpl?: typeof fetch, now?: () => number,
+ *           gatewayCall?: (method: "models.list" | "sessions.describe" | "sessions.patch", params: object) => Promise<any> }} opts
+ *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
-export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now }) {
+export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const router = express.Router();
-  const runs = new Map(); // runId -> { id, status, text, error, startedAt, finishedAt, abort }
+  const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
 
   router.use((req, res, next) => {
@@ -134,7 +196,11 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
     const j = await res.json().catch(() => null);
-    if (!res.ok || j?.ok !== true) throw new Error(`gateway ${tool} failed (${res.status})`);
+    if (!res.ok || j?.ok !== true) {
+      const err = new Error(`gateway ${tool} failed (${res.status})`);
+      err.toolError = j?.error?.type === "tool_error"; // the tool ran and refused (bad input), not an outage
+      throw err;
+    }
     return j.result?.details ?? {};
   }
 
@@ -184,7 +250,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const h = await invoke("sessions_history", args);
       const messages = (Array.isArray(h.messages) ? h.messages : [])
         .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-        .map((m) => ({ role: m.role, text: messageText(m), at: Number(m.timestamp) || 0 }))
+        .map((m) => ({ role: m.role, text: messageText(m), at: Number(m.timestamp) || 0, ...(m.role === "assistant" ? assistantMeta(m) : {}) }))
         .filter((m) => m.text.trim() !== "");
       res.json({ ok: true, key, messages, nextOffset: Number.isInteger(h.nextOffset) ? h.nextOffset : null, hasMore: h.hasMore === true });
     } catch (err) { fail(res, err, "history"); }
@@ -197,7 +263,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
     const id = crypto.randomUUID();
     const ctl = new AbortController();
-    const run = { id, status: "running", text: "", error: null, startedAt: now(), finishedAt: null, abort: () => ctl.abort() };
+    const run = { id, status: "running", text: "", error: null, startedAt: now(), firstTokenAt: null, finishedAt: null, abort: () => ctl.abort() };
     runs.set(id, run);
     while (runs.size > MAX_RUNS_KEPT) runs.delete(runs.keys().next().value);
 
@@ -210,7 +276,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         signal: ctl.signal,
       });
       if (!r.ok || !r.body) throw new Error(`chat ${r.status}`);
-      run.text = await readCompletionStream(r.body, (t) => { run.text = t; });
+      run.text = await readCompletionStream(r.body, (t) => { run.firstTokenAt ??= now(); run.text = t; });
       run.status = "done";
     })()
       .catch((err) => {
@@ -223,7 +289,11 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     res.status(202).json({ ok: true, runId: id });
   });
 
-  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: r.text, error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt });
+  const latency = (r) => ({
+    firstTokenMs: r.firstTokenAt == null ? null : r.firstTokenAt - r.startedAt,
+    totalMs: r.finishedAt == null ? null : r.finishedAt - r.startedAt,
+  });
+  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: r.text, error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r) });
 
   router.get("/runs/:id", (req, res) => {
     const r = runs.get(req.params.id);
@@ -235,6 +305,130 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (!r) return res.status(404).json({ ok: false, error: "not_found" });
     if (r.status === "running") r.abort();
     res.json({ ok: true });
+  });
+
+  // ---- Model control (M). Reads: models.list + sessions.describe. Writes: the app session only, validated values only. ----
+  let modelsCache = { at: 0, rows: null, pending: null };
+
+  /** The agent's model catalog in the bridge shape. Default view: the agent's modelPolicy allowlist when one is set. */
+  async function listModels() {
+    if (modelsCache.rows && now() - modelsCache.at < MODELS_CACHE_MS) return { rows: modelsCache.rows, at: modelsCache.at, cached: true };
+    modelsCache.pending ??= (async () => {
+      try {
+        const r = await gatewayCall("models.list", { agentId: "main", sessionKey: APP_SESSION_KEY, view: "default", includeDetails: true });
+        if (!Array.isArray(r?.models)) throw new Error("models.list: no models array");
+        const seen = new Set();
+        const rows = r.models.map(mapModel).filter((m) => m && !seen.has(m.id) && seen.add(m.id));
+        modelsCache = { at: now(), rows, pending: null };
+        return { rows, at: modelsCache.at, cached: false };
+      } finally { modelsCache.pending = null; }
+    })();
+    return modelsCache.pending;
+  }
+
+  async function describeApp() {
+    const d = await gatewayCall("sessions.describe", { key: APP_SESSION_KEY });
+    const s = d?.session;
+    if (!s || s.key !== APP_SESSION_KEY) throw new Error("sessions.describe: unexpected session");
+    return s;
+  }
+
+  const patchApp = (fields) => gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields });
+  const needsCall = (res) => {
+    if (gatewayCall) return false;
+    res.status(503).json({ ok: false, error: "not_available" });
+    return true;
+  };
+  const bad = (res, error) => res.status(400).json({ ok: false, error });
+
+  router.get("/models", async (_req, res) => {
+    if (needsCall(res)) return;
+    try {
+      const { rows, at, cached } = await listModels();
+      res.json({ ok: true, models: rows, fetchedAt: at, cached });
+    } catch (err) { fail(res, err, "models"); }
+  });
+
+  router.get("/model", async (_req, res) => {
+    if (needsCall(res)) return;
+    try {
+      const [s, hist, models] = await Promise.all([
+        describeApp(),
+        invoke("sessions_history", { sessionKey: APP_SESSION_KEY, limit: 20 }).catch(() => null),
+        listModels().then((m) => m.rows).catch(() => null),
+      ]);
+      const id = modelRef(s.modelProvider, s.model);
+      const row = models?.find((m) => m.id === id) ?? null;
+      const msgs = Array.isArray(hist?.messages) ? hist.messages : [];
+      const reply = [...msgs].reverse().find((m) => m?.role === "assistant" && !isMirror(m)) ?? null;
+      const replyRun = reply?.__openclaw?.runId;
+      const mirror = replyRun ? msgs.find((m) => m?.openclawDeliveryMirror?.kind === "model-fallback" && m.openclawDeliveryMirror.runId === replyRun) : null;
+      const last = [...runs.values()].at(-1) ?? null;
+      res.json({
+        ok: true,
+        sessionKey: APP_SESSION_KEY,
+        model: { id, provider: safeStr(s.modelProvider, 100), model: safeStr(s.model, MAX_MODEL_REF),
+          source: s.modelOverrideSource ? "override" : "default" },
+        thinking: { level: safeStr(s.thinkingLevel, 40), default: safeStr(s.thinkingDefault, 40),
+          effective: safeStr(s.thinkingLevel, 40) ?? safeStr(s.thinkingDefault, 40), levels: levelIds(s.thinkingLevels) },
+        fast: { supported: row ? row.supportsFastMode : null, enabled: bool(s.effectiveFastMode), source: safeStr(s.effectiveFastModeSource, 40) },
+        usage: { inputTokens: num(s.inputTokens), outputTokens: num(s.outputTokens), contextTokens: num(s.totalTokens), contextWindow: num(s.contextTokens) },
+        lastReply: reply ? { ...assistantMeta(reply), at: Number(reply.timestamp) || 0 } : null,
+        fallback: mirror ? { ...assistantMeta(mirror).fallback, at: Number(mirror.timestamp) || 0 } : null,
+        lastRun: last ? { runId: last.id, status: last.status, startedAt: last.startedAt, ...latency(last) } : null,
+      });
+    } catch (err) { fail(res, err, "model"); }
+  });
+
+  router.post("/model", async (req, res) => {
+    if (needsCall(res)) return;
+    const want = typeof req.body?.model === "string" ? req.body.model.trim() : "";
+    if (!want || want.length > MAX_MODEL_REF) return bad(res, "bad_request");
+    try {
+      if (want !== "default") {
+        const row = (await listModels()).rows.find((m) => m.id === want);
+        if (!row) return bad(res, "unknown_model");
+        if (!row.available) return bad(res, "model_unavailable");
+        if (!row.selectable) return bad(res, "model_not_selectable");
+      }
+      // The sessions tool resolves and policy-checks the ref itself; "default" clears the session pin.
+      const d = await invoke("sessions", { action: "patch", sessionKey: APP_SESSION_KEY, model: want });
+      if (d?.status !== "updated" || d?.sessionKey !== APP_SESSION_KEY) return bad(res, "rejected");
+      const r = d.resolved ?? {};
+      // No override/default flag here: pinning the configured primary is stored as no override. GET /model reports it.
+      res.json({ ok: true, model: { id: modelRef(r.modelProvider, r.model), provider: safeStr(r.modelProvider, 100), model: safeStr(r.model, MAX_MODEL_REF) },
+        thinkingLevel: safeStr(r.thinkingLevel, 40) });
+    } catch (err) {
+      if (err?.toolError) return bad(res, "rejected");
+      fail(res, err, "model patch");
+    }
+  });
+
+  router.post("/thinking", async (req, res) => {
+    if (needsCall(res)) return;
+    const level = typeof req.body?.level === "string" ? req.body.level.trim() : "";
+    if (!level || level.length > 40) return bad(res, "bad_request");
+    try {
+      if (level !== "default" && !levelIds((await describeApp()).thinkingLevels).includes(level)) return bad(res, "unsupported_level");
+      await patchApp({ thinkingLevel: level === "default" ? null : level });
+      res.json({ ok: true, thinking: { level: level === "default" ? null : level } });
+    } catch (err) { fail(res, err, "thinking patch"); }
+  });
+
+  router.post("/fast", async (req, res) => {
+    if (needsCall(res)) return;
+    const mode = typeof req.body?.mode === "string" ? req.body.mode.trim() : "";
+    if (!Object.hasOwn(FAST_MODES, mode)) return bad(res, "bad_request");
+    try {
+      if (mode === "on") {
+        // The gateway itself accepts fastMode on any model, so the bridge checks the current model's capability first.
+        const [s, { rows }] = await Promise.all([describeApp(), listModels()]);
+        const row = rows.find((m) => m.id === modelRef(s.modelProvider, s.model));
+        if (!row?.supportsFastMode) return bad(res, "fast_mode_unsupported");
+      }
+      await patchApp({ fastMode: FAST_MODES[mode] });
+      res.json({ ok: true, fast: { mode } });
+    } catch (err) { fail(res, err, "fast patch"); }
   });
 
   return router;

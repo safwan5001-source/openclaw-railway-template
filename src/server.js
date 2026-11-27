@@ -645,6 +645,29 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, gateway: health.gateway });
 });
 
+// The only gateway RPCs the app bridge may make (model control). Run as `openclaw gateway call` against the local gateway;
+// the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
+const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch"]);
+function appBridgeGatewayCall(method, params) {
+  if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
+  const args = clawArgs(["gateway", "call", method, "--json", "--port", String(INTERNAL_GATEWAY_PORT),
+    "--timeout", "15000", "--params", JSON.stringify(params ?? {})]);
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(OPENCLAW_NODE, args, {
+      env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
+      timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+    }, (err, stdout) => {
+      let j = null;
+      try { j = JSON.parse(stdout); } catch { /* not JSON */ }
+      if (!j || typeof j !== "object" || j.ok === false) {
+        const type = typeof j?.error?.type === "string" ? j.error.type : err?.code ?? "no_json";
+        return reject(new Error(`gateway call ${method} failed (${type})`));
+      }
+      resolve(j);
+    });
+  });
+}
+
 // BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
 const appBridge = createAppBridge({
   token: process.env.BASHT_APP_TOKEN,
@@ -652,6 +675,7 @@ const appBridge = createAppBridge({
   gatewayToken: OPENCLAW_GATEWAY_TOKEN,
   configPath: configPath(),
   log,
+  gatewayCall: appBridgeGatewayCall,
 });
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
 if (appBridge) app.use("/app/v1", appBridge);
