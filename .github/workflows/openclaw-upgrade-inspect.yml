@@ -47,6 +47,9 @@ jobs:
           node patches/openclaw-memory-flush-owner.mjs "$root"
           node --check "$root/dist/agent-runner-memory-Bmk5_PZf.mjs"
           node patches/openclaw-memory-flush-owner.mjs "$root"
+          node patches/openclaw-audio-document-intake.mjs "$root"
+          node --check "$root/dist/attachments.normalize-H6KPb1Ga.mjs"
+          node patches/openclaw-audio-document-intake.mjs "$root"
       - name: Build production image without publishing
         run: docker build --tag basht-upgrade-test:2026.11.10 .
       - name: Verify installed version

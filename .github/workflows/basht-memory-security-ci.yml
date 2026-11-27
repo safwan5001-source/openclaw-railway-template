@@ -12,6 +12,7 @@ on:
       - 'patches/**'
       - 'Dockerfile'
       - 'docs/MEMORY_FLUSH_OWNER_FIX.md'
+      - 'docs/AUDIO_DOCUMENT_INTAKE.md'
       - '.github/workflows/basht-memory-security-ci.yml'
   workflow_dispatch:
 
@@ -42,6 +43,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/flush/parity" && cd "$RUNNER_TEMP/flush/parity"
           npm init -y >/dev/null
           npm install --no-audit --no-fund --ignore-scripts openclaw@2026.11.10 @openclaw/whatsapp@2026.11.10
+      - name: Apply the audio-document intake patch to the parity install (idempotent; fails on any upstream drift)
+        run: |
+          root="$RUNNER_TEMP/flush/parity/node_modules/openclaw"
+          node patches/openclaw-audio-document-intake.mjs "$root"
+          node patches/openclaw-audio-document-intake.mjs "$root"
+          node --check "$root/dist/attachments.normalize-H6KPb1Ga.mjs"
       - name: Patch unit + integration tests (real OpenClaw tool policy, real WhatsApp owner rule)
         env:
           OPENCLAW_PACKAGE_ROOT: ${{ runner.temp }}/flush/parity/node_modules/openclaw
