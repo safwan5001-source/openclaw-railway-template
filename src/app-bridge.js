@@ -11,6 +11,8 @@
 //   POST /app/v1/model { model }   -> pins a listed, available model on the app session ("default" clears the pin)
 //   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
 //   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
+//   POST /app/v1/speak { text }    -> the text spoken in BASHT's own voice (the agent's `tts` config), as audio bytes
+//   POST /app/v1/transcribe <audio>-> { text }: a voice note transcribed with the engine's own audio config (as on WhatsApp)
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -19,6 +21,9 @@
 // - Model control (M) adds, through an injected `gatewayCall` (the wrapper runs `openclaw gateway call`): `models.list`,
 //   `sessions.describe` and `sessions.patch` (thinkingLevel / fastMode), and the `sessions` tool `patch` (model). Every
 //   write targets APP_SESSION_KEY only, with values validated against what the engine itself listed. No config writes.
+// - Voice (V2/V3): the `tts` tool on the app session (so `agents.entries.main.tts` — provider, voice, model, instructions — applies;
+//   the caller never picks a voice, provider or session), and an injected `transcribe(filePath)` (the wrapper runs
+//   `openclaw infer audio transcribe --agent main`). Audio files live only in private temp/state paths and are deleted after use.
 // - The app is the owner's own client, so its turns are owner turns (same agent, same shared memory, same tool policy and
 //   approval rules as the Control UI). They run in their own session (`app:owner`), separate from the WhatsApp chat.
 // - Reads are limited to the owner's own conversations: the app session, the main session and the owner's direct WhatsApp
@@ -26,6 +31,8 @@
 // - A turn keeps running if the phone goes away: the bridge, not the phone, holds the upstream request.
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import { whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
 
@@ -43,6 +50,22 @@ const MODELS_CACHE_MS = 60_000;
 const MAX_MODEL_REF = 200;
 const FAST_MODES = { on: true, off: false, default: null };
 const RESET_RECHECK_MS = 1500;
+// ---- voice ----
+export const MAX_SPEAK_CHARS = 1500; // the app splits longer replies on sentence boundaries (engine hard cap: tts.maxTextLength 4096)
+export const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
+export const MIN_AUDIO_BYTES = 1024; // OpenClaw skips audio below 1 KB anyway
+export const MAX_TRANSCRIPT_CHARS = MAX_MESSAGE_CHARS; // a transcript is sent as the owner's message
+const MAX_SPEECH_BYTES = 8 * 1024 * 1024;
+const SPEAK_TIMEOUT_MS = 60_000;
+const TRANSCRIBE_TIMEOUT_MS = 95_000; // the wrapper kills its CLI at 90 s
+const SPEAK_PER_MINUTE = 30;
+const TRANSCRIBE_PER_MINUTE = 20;
+const TRANSCRIBES_IN_FLIGHT = 2; // each one spawns the OpenClaw CLI
+/** Recorded audio the app may upload: MIME (without parameters) -> the file extension the transcriber sees. */
+export const AUDIO_TYPES = { "audio/ogg": ".ogg", "audio/webm": ".webm", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+  "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav" };
+/** Synthesized speech the bridge may return: file extension -> content type. */
+const SPEECH_TYPES = { ".mp3": "audio/mpeg", ".opus": "audio/ogg", ".ogg": "audio/ogg", ".wav": "audio/wav" };
 
 /** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
 export function safeStr(v, max = 200) {
@@ -90,6 +113,15 @@ export function assistantMeta(m) {
     out.fallback = { from: safeStr(fb.fromModel, MAX_MODEL_REF), to: safeStr(fb.toModel, MAX_MODEL_REF), reason: safeStr(fb.reason, 60) };
   }
   return out;
+}
+
+/** The JSON document of `openclaw infer audio transcribe --json` (stdout; any log lines before it are skipped). Else null. */
+export function parseTranscribeOutput(stdout) {
+  const s = String(stdout ?? "");
+  for (const start of [0, ...[...s.matchAll(/^\{/gm)].map((m) => m.index)]) {
+    try { const j = JSON.parse(s.slice(start)); if (j && typeof j === "object" && !Array.isArray(j)) return j; } catch { /* next candidate */ }
+  }
+  return null;
 }
 
 const isMirror = (m) => m?.provider === "openclaw" || m?.openclawDeliveryMirror != null;
@@ -166,9 +198,12 @@ async function readCompletionStream(body, onText) {
  *           fetchImpl?: typeof fetch, now?: () => number,
  *           gatewayCall?: (method: "models.list" | "sessions.describe" | "sessions.patch", params: object) => Promise<any> }} opts
  *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
+ *   stateDir: OpenClaw's state dir; the `tts` tool writes its audio under <stateDir>/media/tool-speech-synthesis/. Without it /speak is 503.
+ *   transcribe: (filePath) => Promise<string>, the wrapper's `openclaw infer audio transcribe`; it rejects with `.refused` when the CLI
+ *     answered ok:false (no audio model, provider error), `.badAudio` when the recording cannot be read. Without it /transcribe is 503.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
-export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall }) {
+export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall, stateDir, transcribe }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const router = express.Router();
@@ -186,21 +221,23 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (failures.count > AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
     return res.status(401).json({ ok: false, error: "unauthorized" });
   });
-  router.use(express.json({ limit: "64kb" }));
+  const jsonBody = express.json({ limit: "64kb" });
+  router.use((req, res, next) => (req.path === "/transcribe" ? next() : jsonBody(req, res, next))); // /transcribe takes raw audio only
 
   const gatewayHeaders = { authorization: `Bearer ${gatewayToken}`, "content-type": "application/json" };
 
-  async function invoke(tool, args) {
+  async function invoke(tool, args, { sessionKey, timeoutMs = READ_TIMEOUT_MS } = {}) {
     const res = await fetchImpl(`${gatewayUrl}/tools/invoke`, {
       method: "POST",
       headers: gatewayHeaders,
-      body: JSON.stringify({ tool, args }),
-      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      body: JSON.stringify(sessionKey ? { tool, args, sessionKey } : { tool, args }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const j = await res.json().catch(() => null);
     if (!res.ok || j?.ok !== true) {
       const err = new Error(`gateway ${tool} failed (${res.status})`);
       err.toolError = j?.error?.type === "tool_error"; // the tool ran and refused (bad input), not an outage
+      err.answered = j?.ok === false; // the gateway answered with a refusal (tool failed, or not allowed: 404), as opposed to no answer
       throw err;
     }
     return j.result?.details ?? {};
@@ -472,6 +509,100 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       res.json({ ok: true, fast: { mode } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
   }));
+
+  // ---- Voice (V2/V3): BASHT's own voice and the engine's own transcription. The caller sends text or audio, nothing else. ----
+  const perMinute = (max) => {
+    let hits = [];
+    return () => { const t = now(); hits = hits.filter((h) => t - h < 60_000); if (hits.length >= max) return false; hits.push(t); return true; };
+  };
+  const speakLimit = perMinute(SPEAK_PER_MINUTE);
+  const transcribeLimit = perMinute(TRANSCRIBE_PER_MINUTE);
+  let transcribing = 0;
+  const voiceUnavailable = (res) => res.status(503).json({ ok: false, error: "voice_unavailable" });
+  const speechDir = stateDir ? path.join(stateDir, "media", "tool-speech-synthesis") : null;
+
+  /** The tool's audio file, only if it really is a regular file inside the speech directory (symlinks resolved). Else null. */
+  async function speechFile(p) {
+    if (typeof p !== "string" || !p || !speechDir) return null;
+    try {
+      const [real, base] = await Promise.all([fs.promises.realpath(p), fs.promises.realpath(speechDir)]);
+      if (!real.startsWith(base + path.sep) || !Object.hasOwn(SPEECH_TYPES, path.extname(real).toLowerCase())) return null;
+      const st = await fs.promises.lstat(real);
+      return st.isFile() ? { real, size: st.size } : null;
+    } catch { return null; }
+  }
+
+  router.post("/speak", async (req, res) => {
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request");
+    if (!speechDir) return voiceUnavailable(res);
+    if (!speakLimit()) return res.status(429).json({ ok: false, error: "rate_limited" });
+    let d;
+    try {
+      // the agent's tool on the app session: agents.entries.main.tts (voice, model, instructions) applies; markdown is stripped by the engine
+      d = await invoke("tts", { text }, { sessionKey: APP_SESSION_KEY, timeoutMs: SPEAK_TIMEOUT_MS });
+    } catch (err) {
+      if (err?.answered) { log?.warn?.("app-bridge", `speak refused: ${err.message}`); return voiceUnavailable(res); }
+      return fail(res, err, "speak");
+    }
+    const file = await speechFile(d?.audioPath);
+    if (!file) {
+      // never read (or delete) anything outside the speech directory
+      log?.warn?.("app-bridge", "speak: the tool returned no usable audio file");
+      return voiceUnavailable(res);
+    }
+    try {
+      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return voiceUnavailable(res);
+      const audio = await fs.promises.readFile(file.real);
+      res.set({ "Content-Type": SPEECH_TYPES[path.extname(file.real).toLowerCase()], "Content-Length": String(audio.length),
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+      res.status(200).end(audio);
+    } catch (err) {
+      fail(res, err, "speak read");
+    } finally {
+      fs.promises.unlink(file.real).catch(() => {}); // one-shot: the app plays it, the engine keeps no copy
+    }
+  });
+
+  const rawAudio = express.raw({ type: () => true, limit: MAX_AUDIO_BYTES });
+  router.post("/transcribe", (req, res, next) => {
+    if (!transcribe) return voiceUnavailable(res);
+    const type = String(req.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    if (!Object.hasOwn(AUDIO_TYPES, type)) return res.status(415).json({ ok: false, error: "unsupported_audio" });
+    const declared = Number(req.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_AUDIO_BYTES) return res.status(413).json({ ok: false, error: "too_large" });
+    if (!transcribeLimit()) return res.status(429).json({ ok: false, error: "rate_limited" });
+    if (transcribing >= TRANSCRIBES_IN_FLIGHT) return res.status(429).json({ ok: false, error: "rate_limited" });
+    req.audioExt = AUDIO_TYPES[type];
+    rawAudio(req, res, (err) => {
+      if (err) return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? "too_large" : "bad_request" });
+      next();
+    });
+  }, async (req, res) => {
+    const audio = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!audio || audio.length < MIN_AUDIO_BYTES) return res.status(422).json({ ok: false, error: "no_speech" });
+    transcribing++;
+    let dir = null;
+    try {
+      dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "basht-voice-")); // 0700, unpredictable name
+      const file = path.join(dir, `note${req.audioExt}`); // the only argv the CLI gets from here: a path the bridge chose
+      await fs.promises.writeFile(file, audio, { mode: 0o600, flag: "wx" });
+      const raw = await Promise.race([
+        transcribe(file),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("transcribe timed out")), TRANSCRIBE_TIMEOUT_MS).unref()),
+      ]);
+      const text = (typeof raw === "string" ? raw : "").trim().slice(0, MAX_TRANSCRIPT_CHARS);
+      if (!text) return res.status(422).json({ ok: false, error: "no_speech" });
+      res.json({ ok: true, text });
+    } catch (err) {
+      if (err?.refused) { log?.warn?.("app-bridge", `transcribe refused: ${err.message}`); return voiceUnavailable(res); }
+      if (err?.badAudio) return res.status(415).json({ ok: false, error: "unsupported_audio" }); // the recording could not be read
+      fail(res, err, "transcribe");
+    } finally {
+      transcribing--;
+      if (dir) fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));

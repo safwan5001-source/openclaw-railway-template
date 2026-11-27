@@ -1,4 +1,4 @@
-# BASHT app bridge (C2 + C4 + M)
+# BASHT app bridge (C2 + C4 + M + voice)
 
 How the BASHT app (`safwan-smart-assistant`) reads the owner's conversations and chats with BASHT live. The code is in
 `src/app-bridge.js` and the tests are in `src/app-bridge.test.mjs`.
@@ -26,6 +26,8 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `POST /app/v1/model {model}` | Pins a listed model on the app session; `"default"` clears the pin | `sessions` tool `patch` (app session) |
 | `POST /app/v1/thinking {level}` | Sets a thinking level the **current** model offers; `"default"` clears it | RPC `sessions.patch {thinkingLevel}` (app session) |
 | `POST /app/v1/fast {mode}` | `"on"`, `"off"` or `"default"`; `"on"` only if the current model supports fast mode | RPC `sessions.patch {fastMode}` (app session) |
+| `POST /app/v1/speak {text}` | The text spoken in BASHT's own voice; returns the audio bytes (`audio/mpeg`) | `tts` tool via `/tools/invoke`, session `agent:main:app:owner` |
+| `POST /app/v1/transcribe` (raw audio body) | A voice note transcribed with the engine's own audio config; returns `{ok, text}` | CLI `openclaw infer audio transcribe --agent main --file <temp> --json` |
 
 `/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Assistant messages in
 `/history` carry `provider` and `model`. The notice OpenClaw writes when it switches models carries
@@ -94,6 +96,55 @@ body is ignored.
 - **No parsing of `session_status` text.** Its `↪️ Fallback` line appears only while a fallback is still active.
   `sessions.describe` and the transcript record give the same facts in structured form.
 
+## Voice (V2 speak · V3 voice notes)
+
+The app gets BASHT's voice and the engine's transcription **from the engine's own configuration**. It holds no provider key and
+cannot choose a voice, provider, model or session.
+
+- **Speak.** `POST /speak {text}` runs the agent's `tts` tool through `/tools/invoke` with the fixed session key
+  `agent:main:app:owner`. Only that path applies the agent block `agents.entries.main.tts` (provider, voice, model and
+  `instructions`: the owner's tuned pronunciation, dialect and style). The RPCs `tts.convert` / `tts.speak` ignore the agent block
+  and are not used. Anything else in the request body (`sessionKey`, `voice`, `provider`, …) is ignored.
+  - `text`: string, trimmed, 1–1500 characters. The app splits longer replies on sentence boundaries (the engine's own hard cap,
+    `tts.maxTextLength`, defaults to 4096 and this path does no chunking). The engine strips markdown before speaking.
+  - The tool writes `<STATE_DIR>/media/tool-speech-synthesis/voice---<uuid>.mp3` and returns that local path. The bridge resolves it
+    (`realpath`) and reads it only if it is a regular file **inside** that directory with an audio extension (`.mp3`, `.opus`,
+    `.ogg`, `.wav`, ≤ 8 MB). It returns the bytes with `Content-Length` and `Cache-Control: no-store`, then deletes the file. A path
+    anywhere else (traversal, symlink out, wrong type) is never read or deleted: the answer is 503 `voice_unavailable`.
+  - 30 requests a minute.
+- **Transcribe.** `POST /transcribe` takes the raw recording as the body (no JSON, no multipart).
+  - `Content-Type` must be one of `audio/ogg`, `audio/webm`, `audio/mp4`, `audio/x-m4a`, `audio/mpeg`, `audio/wav` (`audio/x-wav`,
+    `audio/wave`); parameters such as `;codecs=opus` are ignored. Anything else is 415 `unsupported_audio`, before the body is read.
+  - At most 10 MB (413 `too_large`). Under 1 KB is 422 `no_speech` (OpenClaw skips such files anyway). The app also stops
+    recording at 3 minutes.
+  - The bridge writes the body to a private temp file (`mkdtemp` 0700, file 0600, name `note.<ext>` chosen by the bridge from the
+    MIME type) and calls the wrapper's injected `transcribe(path)`. The wrapper runs
+    `openclaw infer audio transcribe --agent main --file <path> --json` with `execFile` (no shell; the temp path is the only
+    argument that varies), timeout 90 s. A WebM note (Chrome/Android) is first remuxed to Ogg/Opus with `ffmpeg -c:a copy` (no
+    re-encode) in the same private directory: OpenClaw sniffs WebM as `video/webm` and its audio step skips it ("No transcript
+    returned"); an unreadable recording is 415 `unsupported_audio`. That is the same audio configuration (`tools.media`) as WhatsApp voice notes. There is no
+    transcription RPC, and `/v1/chat/completions` silently drops audio parts. The temp directory is removed in every case.
+  - The answer is `{ok: true, text}`: `outputs[].text`, trimmed, capped at 8000 characters (one sendable message). An empty
+    transcript is 422 `no_speech`.
+  - 20 requests a minute and at most two at once (each one spawns the CLI, about 5 s cold start).
+- **Errors.** The tool refusing (not configured, provider error: HTTP 500 `tool_error`), the tool not allowed by policy (404), or
+  the CLI answering `ok: false` are all 503 `voice_unavailable`, so the app can hide the control or explain it. An engine that does
+  not answer (still starting, crashed, CLI missing) is 502 `engine_unavailable`. Without `stateDir` / `transcribe` (an older
+  wrapper) the routes are 503 `voice_unavailable`.
+- **Not offered (future option).** Live Talk (`talk.client.create`, WebRTC realtime). The production realtime provider does not
+  support browser sessions and would speak with a different voice than `agents.entries.main.tts`. The app's live voice
+  conversation is a turn loop over `/transcribe` → `/send` → `/speak` in the same `app:owner` conversation.
+
+### Production prerequisites
+
+- `agents.entries.main.tts` (or the global `tts`) must name a configured provider. For OpenAI the key comes from
+  `tts.providers.openai.apiKey` or `OPENAI_API_KEY`; `models.providers.openai` alone does not configure TTS. Without it the
+  tool fails (`openai: not configured`) and `/speak` is 503.
+- The `tts` tool must be reachable on `/tools/invoke` for the shared-secret caller. It is **not** on the gateway's default HTTP
+  deny list, but a `tools.profile` / `tools.allow` / `tools.deny` or `gateway.tools.deny` that excludes it makes `/speak` 503.
+- Transcription uses `tools.media` (explicit `tools.media.models` with an `audio` capability, or auto-detection). If WhatsApp
+  voice notes are transcribed today, `/transcribe` works with the same settings. `ffmpeg` is already in the image.
+
 ## Rules
 
 - **Off by default.** The bridge is enabled only when `BASHT_APP_TOKEN` is at least 32 characters long. Without it, `/app/v1/*` returns 404 and nothing else changes.
@@ -137,6 +188,20 @@ Model control (lab-m):
 - With the primary forced to return HTTP 500, the turn was answered by `mock/echo2` after OpenClaw's retries (about 90 s).
   `/history` and `/model` showed `model: echo2` and `fallback {from: mock/echo, to: mock/echo2, reason: server_error}`.
   `/runs/:id` reported `firstTokenMs` and `totalMs` (about 1 s on a healthy turn, about 86 s with the fallback).
+
+Voice (lab-m, mock OpenAI-compatible `/v1/audio/speech` and `/v1/audio/transcriptions` on 127.0.0.1:4111):
+- Config: `agents.entries.main.tts = {provider: "openai", providers: {openai: {apiKey, baseUrl: <mock>, model: "gpt-4o-mini-tts",
+  speakerVoice: "cedar", instructions: "<Arabic dialect/pronunciation text>"}}}`, `models.providers.openai` (mock `baseUrl`,
+  `request.allowPrivateNetwork: true`) and `tools.media.models = [{provider: "openai", model: "gpt-4o-mini-transcribe",
+  capabilities: ["audio"]}]`. With no `tts` block the tool fails and `/speak` is 503; with the provider key only under
+  `models.providers.openai`, TTS reports `openai: not configured`.
+- `/speak` with `**markdown**` text and a caller-sent `voice: "alloy"` and `sessionKey: "agent:main:main"`: the mock received
+  `{model: "gpt-4o-mini-tts", voice: "cedar", instructions: "<the configured text>", input: <markdown stripped>}` and the app got
+  `audio/mpeg` bytes identical to what the mock returned. The speech file was deleted afterwards.
+- WebM/Opus recorded by Chromium's MediaRecorder: transcribed after the remux (without it the CLI answered "No transcript returned";
+  `.m4a`, `.mp3`, `.wav` and `.ogg` are accepted as they are).
+- `/transcribe` with an Ogg/Opus voice note: the mock received `model: gpt-4o-mini-transcribe` and a file named `note.ogg`; the
+  bridge returned the mock's transcript. While the gateway was still starting, `/speak` answered 502 `engine_unavailable`.
 
 Chat and conversations (C2 + C4):
 
