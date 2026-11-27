@@ -762,11 +762,21 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     }
   });
   // ---- B1/B2 routes: «محادثة جديدة», search, media ----
-  const readableKey = (key) => isReadable({ key }, ownersFromConfig(configPath));
+  // Readability follows the security policy (readPolicyFromConfig: main only while it is owner-only), for search and media too.
+  const readableKey = (key) => { const { owners, mainReadable } = readPolicyFromConfig(configPath); return isReadable({ key }, owners, mainReadable); };
   const convoCtx = { gatewayCall, invoke, appKey: APP_SESSION_KEY, ledger, resetState, log, now, fail, turnRunning, readable: readableKey,
     labelOf: (key) => sessionLabel({ key }),
-    readableKeys: async () => { const owners = ownersFromConfig(configPath); const keys = (await allSessions()).filter((r) => isReadable(r, owners)).map((r) => r.key);
-      return [...new Set([APP_SESSION_KEY, MAIN_SESSION_KEY, ...keys])]; } };
+    readableKeys: async () => {
+      const { owners, mainReadable } = readPolicyFromConfig(configPath);
+      const keys = (await allSessions()).filter((r) => isReadable(r, owners, mainReadable)).map((r) => r.key);
+      return [...new Set([APP_SESSION_KEY, ...(mainReadable ? [MAIN_SESSION_KEY] : []), ...keys])];
+    } };
+  // «محادثة جديدة» joins the settings queue (serial): a reset never interleaves with a model/thinking/fast write, and the
+  // describe cache is forgotten once it is done (serial's finally), so GET /model never shows pre-reset usage.
+  router.post("/new", (req, res, next) => serial(() => new Promise((resolve) => {
+    res.once("finish", resolve); res.once("close", resolve);
+    next();
+  })));
   registerConvoRoutes(router, convoCtx);
   registerMediaRoute(router, { ...mediaCtx, readable: readableKey, gatewayCall, cache: refs, log,
     findMessage: async (key, messageId) => {

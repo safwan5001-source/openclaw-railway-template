@@ -179,14 +179,16 @@ buffer. Every call is built by the bridge with the app session key or a key that
   - Responses carry `Content-Disposition: attachment`, `nosniff` and `CSP: sandbox`. SVG is never inline.
 - **Steps.** While the app polls `/runs/:id`, the bridge reads the app session's last 12 rows (`sessions_history`,
   `includeTools`) at most every 1.5 s, and returns `steps: [{tool, done}]`: tool names only.
-- **New conversation.** Refused while a turn runs (409); while a reset is under way `/send` answers 409 `busy` too (one shared
+- **New conversation.** Runs in the same one-at-a-time queue as model/thinking/fast writes (so a reset never interleaves with a
+  settings write, and the next `GET /model` reads afresh). Refused while a turn runs (409); while a reset is under way `/send` answers 409 `busy` too (one shared
   exclusion), and the reset re-checks for a running turn right before `sessions.reset`. OpenClaw keeps the same session id and transcript. Its default
   projection then starts at the reset row, while older rows stay reachable by an anchored read. That read stays inside one
   reset segment, and a forged `cursor` gets `windowReset`. So the bridge records, per reset it makes, `{resetId, anchorId}` (ids
   only) in `<stateDir>/app-bridge/resets.json` (0600, last 50). `/history` returns `earlier: <resetId>` when the first row is such a
   reset. `before=<cursor>` pages back and chains across earlier resets the bridge made. Resets made elsewhere (for example `/new`
   in the Control UI) have no anchor, so their earlier rows are not offered to the app; they stay in the engine.
-- **Search.** `sessionKeys` is always the readable keys (app, main and the owner's WhatsApp direct chats). Results are filtered
+- **Search.** `sessionKeys` is always the readable keys (app, the owner's WhatsApp direct chats, and main only while it is
+  owner-only — the same `readPolicyFromConfig` rule as `/sessions` and `/history`; `/media` uses it too). Results are filtered
   again, toolResult hits are dropped, and snippets lose `MEDIA:` lines, markers and absolute paths.
 - **Not offered.** Documents/PDFs to BASHT (they need `chat.send` attachments: over the CLI argv cap; waits for a WebSocket
   client). No edit or rewind (admin, branches). No parallel app sessions.

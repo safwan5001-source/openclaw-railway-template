@@ -30,13 +30,15 @@ let archive = []; // every row ever (chat.history anchored reads)
 let hasActiveRun = false;
 let describeDelay = 0; // ms a sessions.describe takes (holds a reset in flight)
 let resets = 0;
+let describing = 0, maxDescribing = 0; // concurrent sessions.describe calls (integration: /new joins the settings queue)
 
 const row = (id, role, content, ts, extra = {}) => ({ role, content, timestamp: ts, __openclaw: { id, ...(extra.kind ? { kind: extra.kind } : {}) }, ...extra.fields });
 
 async function fakeGatewayCall(method, params) {
   rpc.push({ method, params });
   if (method === "sessions.describe") {
-    if (describeDelay) await new Promise((r) => setTimeout(r, describeDelay));
+    describing++; maxDescribing = Math.max(maxDescribing, describing);
+    try { if (describeDelay) await new Promise((r) => setTimeout(r, describeDelay)); } finally { describing--; }
     return { session: { key: params.key, hasActiveRun } };
   }
   if (method === "sessions.reset") {
@@ -338,6 +340,21 @@ test("search: only readable conversations are searched and returned; snippets ar
   assert.equal((await call(`/search?q=${"x".repeat(201)}`)).status, 400);
 });
 
+test("search (integration with security L9): main is searched only while it is owner-only", async () => {
+  const cfgPath = path.join(dir, "openclaw.json");
+  const original = fs.readFileSync(cfgPath, "utf8");
+  const keysSearched = async () => {
+    assert.equal((await call(`/search?q=${encodeURIComponent("x")}`)).status, 200);
+    return rpc.findLast((c) => c.method === "sessions.search").params.sessionKeys;
+  };
+  try {
+    assert.ok((await keysSearched()).includes("agent:main:main"), "no DM channel: main holds only the owner's messages");
+    fs.writeFileSync(cfgPath, JSON.stringify({ commands: { ownerAllowFrom: [`whatsapp:${OWNER}`] }, channels: { whatsapp: { dmPolicy: "pairing" } } }));
+    const keys = await keysSearched();
+    assert.ok(!keys.includes("agent:main:main") && keys.includes(APP_SESSION_KEY), "other senders may land in main: not searched");
+  } finally { fs.writeFileSync(cfgPath, original); }
+});
+
 test("new conversation: resets ONLY the app session, keeps every row readable, refuses while a turn runs", async () => {
   hasActiveRun = true;
   assert.equal((await call("/new", { method: "POST", body: { key: "agent:main:main" } })).status, 409);
@@ -408,6 +425,18 @@ test("send during a reset is refused (409); the reset completes and sending work
 });
 
 // Review (Codex #2): <stateDir>/media (or the workspace) may not exist when the wrapper starts; files that appear later are served.
+test("new conversation (integration with model control): waits for a settings write in flight, never runs beside it", async () => {
+  describeDelay = 120; maxDescribing = 0;
+  try {
+    const write = call("/thinking", { method: "POST", body: { level: "high" } }); // holds the settings queue while it describes
+    await new Promise((r) => setTimeout(r, 30));
+    const reset = call("/new", { method: "POST" });
+    assert.equal((await write).status, 400, "the fake session offers no thinking levels");
+    assert.equal((await reset).status, 200);
+    assert.equal(maxDescribing, 1, "the reset's describe started only after the settings write had finished");
+  } finally { describeDelay = 0; }
+});
+
 test("media roots are resolved lazily: a root created after start is honoured", async () => {
   const late = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-late-"));
   const lateState = path.join(late, "state"); const lateWs = path.join(late, "workspace");
