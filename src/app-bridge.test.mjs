@@ -876,6 +876,36 @@ test("transcribe: rate limited, and at most two at once", async () => {
   } finally { m.close(); }
 });
 
+test("transcribe: uploads still arriving hold a slot — never more than two transcribers; aborted uploads free theirs (Codex review on #56)", async () => {
+  let active = 0, peak = 0;
+  const m = await mount({ transcribe: async () => { active++; peak = Math.max(peak, active); await new Promise((r) => setTimeout(r, 30)); active--; return "ok"; } });
+  const u = new URL(`${m.b}/transcribe`);
+  // an upload whose body is still arriving: headers sent, half the bytes written, the rest later
+  const slow = () => {
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname, method: "POST",
+      headers: { authorization: `Bearer ${APP_TOKEN}`, "content-type": "audio/ogg", "content-length": AUDIO.length } });
+    const done = new Promise((resolve) => { req.on("response", (r) => { r.resume(); r.on("end", () => resolve(r.statusCode)); }); req.on("error", () => resolve("aborted")); });
+    req.write(AUDIO.subarray(0, 1000));
+    return { finish: () => req.end(AUDIO.subarray(1000)), abort: () => req.destroy(), done };
+  };
+  try {
+    const a = slow(), b = slow();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 429, "two uploads in progress already hold both slots");
+    b.abort();
+    await b.done;
+    await new Promise((r) => setTimeout(r, 50));
+    const c = upload(AUDIO, "audio/ogg", { b: m.b }); // the aborted upload's slot is free again
+    a.finish();
+    assert.equal(await a.done, 200);
+    assert.equal((await c).status, 200);
+    assert.ok(peak <= 2, `at most two transcribers at once (peak ${peak})`);
+    assert.equal((await upload(Buffer.from("OggS"), "audio/ogg", { b: m.b })).status, 422); // a tiny body releases its slot too
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 200);
+    assert.equal((await upload(AUDIO, "audio/ogg", { b: m.b })).status, 200);
+  } finally { m.close(); }
+});
+
 test("transcribe output parser: the CLI's JSON document, log lines before it skipped", () => {
   const doc = { ok: true, outputs: [{ text: "مرحبا" }] };
   assert.deepEqual(parseTranscribeOutput(JSON.stringify(doc, null, 2)), doc);
