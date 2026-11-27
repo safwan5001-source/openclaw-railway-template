@@ -1,0 +1,20 @@
+# Voice guide — v0.1
+## Delivery profile (original design, not extracted training data)
+Speak like a colleague in a private voice note, not a presenter. Natural conversational Arabic, lightly Yemeni/Sanaani when it fits the audience and meaning. Use a steady medium pace, brief pauses at clause boundaries, subtle varied intonation, relaxed endings and restrained emphasis. Do not perform exaggerated dialect, sing, shout, add sound effects, or imitate a specific person. Avoid repetitive fillers. For urgent matters be clear and calm; for finance keep precision. Do not read markup or stage directions. If the voice provider cannot control an accent reliably, prefer intelligibility.
+
+## Language and pronunciation
+Examples here are original illustrative drafts, not claims of universal Sanaani usage or corpus extracts. Prefer expressions confirmed by the owner or native reviewer; natural variation is expected.
+- Neutral casual: "أيوه، شفت الموضوع. باقي نتأكد من نقطة واحدة." 
+- Natural question: "طيب، متى تحتاجه؟"
+- Work: "راجعت الفاتورة. المبلغ واضح، لكن التحويل ما تأكد إلى الآن."
+- Selective diacritics only for genuine ambiguity: "مُسَوَّدة" (draft), "مُستَحَقّ" (due), "عُهْدة" (custody/advance), where context warrants. Never apply automatic full vocalization or phonetic rewriting of every ق/ج.
+- Convert numerals to unambiguous spoken Arabic when useful, preserving units, decimals and currency. Example: 1.81 SAR/L → "ريال وواحد وثمانين هللة للتر". Do not confuse 1.81 with 1.18. For a critical code or identifier, read as digits when appropriate; preserve leading zeros. Expand abbreviations only if the meaning is known.
+- Keep brand names, English technical identifiers, legal names and quotations intact. Use owner-confirmed pronunciation when available. Do not invent how to pronounce a customer's name.
+- Avoid canned openings such as "يسرني أن أحيطكم علمًا" in ordinary voice replies; formal letters can still use formal register.
+
+## Evidence and limitations (checked 2026-11-27)
+- AYDID: https://huggingface.co/datasets/mansoorSaleh/AYDID — metadata viewer lists 17,500 records, 350 speaker IDs, seven dialect classes; CC BY-NC-SA 4.0. The metadata does not grant access to actual audio or commercial rights.
+- Whisper Yemeni: https://huggingface.co/mansoorSaleh/whisper-yemeni — developer reports normalized WER+ of 19.34% for Sanaani vs 51.69% for zero-shot Large V3; 19.14% overall vs 43.92%. These are author-reported in-domain ASR results, not BASHT results; not a TTS model. CC BY-NC-SA 4.0. Model card claims Large V2 base while displayed parameter count differs from expected large architecture; inspect config and weights before any separately authorized research.
+- Lisan: https://arxiv.org/abs/2212.06468 and https://sina.birzeit.edu/currasat/about-en.html — approximately 1.05M Yemeni tokens, from Twitter, with morphological annotation; publisher lists CC BY 4.0. Text is not speech audio or a Sanaani-only conversation corpus. Use as a linguistic reference with attribution; do not ingest raw posts here or assume rights over identifiable user content.
+- YSED: https://pubmed.ncbi.nlm.nih.gov/41323760/ and https://zenodo.org/records/15227219 — emotion-recognition study reports 1,432 validated short clips, 71 participants, five emotion categories and simulated/induced recordings. Not spontaneous conversational speech; not a TTS training recipe. Full PMC page was blocked by CAPTCHA during review; abstract verified via PubMed. No dataset files used; check actual license, consent and intended use before any reuse of recordings.
+- OpenAI docs: https://developers.openai.com/api/docs/guides/text-to-speech and https://developers.openai.com/api/docs/deprecations — legacy Speech API models including gpt-4o-mini-tts have a published retirement date of 2027-01-06; recommended replacement gpt-realtime-2.1-mini. Verify live voice availability, input/output contract, billing and performance before migration; no automatic switch. The skill does not hardcode an endpoint, API key or model.

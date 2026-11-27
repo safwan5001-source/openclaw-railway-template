@@ -1,6 +1,6 @@
 #!/bin/bash
 # Idempotently install a supported BASHT skill into the persistent OpenClaw workspace.
-#   skill-sync.sh <skills-source-dir> <workspace-dir> <owner user:group | -> [basht-daftra|basht-accounting|basht-transport-sales]
+#   skill-sync.sh <skills-source-dir> <workspace-dir> <owner user:group | -> [basht-daftra|basht-accounting|basht-transport-sales|basht-yemeni-voice]
 # Copies the selected skill into <workspace-dir>/skills/<name>:
 #   - everything else in the workspace is left untouched; unchanged content is not rewritten;
 #   - symlinks are never followed or copied (a symlink anywhere on the path or in the source => refuse);
@@ -15,7 +15,7 @@ OWNER="${3:--}"
 NAME="${4:-basht-daftra}"
 say() { echo "[skill-sync] $*" >&2; }
 die() { say "refusing: $*"; exit 1; }
-case "$NAME" in basht-daftra|basht-accounting|basht-transport-sales) ;; *) die "unsupported skill name" ;; esac
+case "$NAME" in basht-daftra|basht-accounting|basht-transport-sales|basht-yemeni-voice) ;; *) die "unsupported skill name" ;; esac
 
 [ -d "$SRC_ROOT" ] || { say "no skills directory at $SRC_ROOT; nothing to do"; exit 0; }
 SRC="$SRC_ROOT/$NAME"

@@ -67,6 +67,21 @@ mkdir -p "$TMP/bin"; printf '#!/bin/bash\necho "$@" >> "%s/chown.log"\n' "$TMP" 
 PATH="$TMP/bin:$PATH" "$SYNC" "$S" "$TMP/ws8" openclaw:openclaw >/dev/null 2>&1
 check "owner applied with chown -R -h (never following symlinks)" 'grep -q -- "-R -h openclaw:openclaw" "$TMP/chown.log"'
 
+# ---------------- Yemeni voice skill (actual repository files; offline) ----------------
+WV="$TMP/ws-voice"; mkdir -p "$WV/skills/other-skill" "$WV/notes"
+echo keep > "$WV/skills/other-skill/SKILL.md"; echo mem > "$WV/notes/memory.md"
+"$SYNC" "$ROOT/skills" "$WV" - basht-yemeni-voice >/dev/null 2>&1; rc=$?
+check "voice skill sync succeeds and copies all source files" '[ $rc -eq 0 ] && diff -qr "$ROOT/skills/basht-yemeni-voice" "$WV/skills/basht-yemeni-voice"'
+check "voice skill has required references and valid name" 'grep -qx "name: basht-yemeni-voice" "$WV/skills/basht-yemeni-voice/SKILL.md" && [ -f "$WV/skills/basht-yemeni-voice/references/VOICE-GUIDE.md" ] && [ -f "$WV/skills/basht-yemeni-voice/references/ACCEPTANCE.md" ]'
+check "voice sync preserves other skill and memory" '[ "$(cat "$WV/skills/other-skill/SKILL.md")" = keep ] && [ "$(cat "$WV/notes/memory.md")" = mem ]'
+out="$("$SYNC" "$ROOT/skills" "$WV" - basht-yemeni-voice 2>&1)"; rc=$?
+check "voice sync is idempotent" '[ $rc -eq 0 ] && echo "$out" | grep -q "up to date"'
+check "voice skill has no staging leftovers" '[ -z "$(find "$WV/skills" -maxdepth 1 -name ".basht-yemeni-voice.*" -print -quit)" ]'
+WVL="$TMP/ws-voice-link"; mkdir -p "$WVL/skills" "$TMP/voice-victim"; echo keep > "$TMP/voice-victim/f"
+ln -s "$TMP/voice-victim" "$WVL/skills/basht-yemeni-voice"
+"$SYNC" "$ROOT/skills" "$WVL" - basht-yemeni-voice >/dev/null 2>&1; rc=$?
+check "voice sync refuses symlink target and preserves contents" '[ $rc -ne 0 ] && [ "$(cat "$TMP/voice-victim/f")" = keep ] && [ "$(ls "$TMP/voice-victim")" = f ]'
+
 # ---------------- broker-entrypoint ----------------
 cat > "$TMP/bin/id" <<'EOS'
 #!/bin/bash
