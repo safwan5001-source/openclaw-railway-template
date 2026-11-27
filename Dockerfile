@@ -75,6 +75,12 @@ COPY patches/openclaw-memory-flush-owner.mjs patches/memory-flush-doctor.mjs pat
 RUN node patches/openclaw-memory-flush-owner.mjs /usr/local/lib/node_modules/openclaw \
   && grep -q 'basht-patch:memory-flush-owner-identity' /usr/local/lib/node_modules/openclaw/dist/agent-runner-memory-Bmk5_PZf.mjs \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.11\.10( |$)'
+# BASHT audio-document intake patch (docs/AUDIO_DOCUMENT_INTAKE.md): audio sent as a WhatsApp *document* (mp3/m4a/wav...)
+# is classified as audio so it reaches speech-to-text, like a voice note. Exact-match and hash-checked like the patch above.
+COPY patches/openclaw-audio-document-intake.mjs ./patches/
+RUN node patches/openclaw-audio-document-intake.mjs /usr/local/lib/node_modules/openclaw \
+  && grep -q 'basht-patch:audio-document-intake' /usr/local/lib/node_modules/openclaw/dist/attachments.normalize-H6KPb1Ga.mjs \
+  && openclaw --version | grep -Eq '^OpenClaw 2026\.11\.10( |$)'
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 skill-sync.sh ./skill-sync.sh
 COPY --chmod=755 scripts/install-marketing-skills.sh ./install-marketing-skills.sh
