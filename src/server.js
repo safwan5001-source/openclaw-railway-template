@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { createAppBridge } from "./app-bridge.js";
+import { createGatewayLink } from "./gateway-link.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
@@ -607,7 +608,9 @@ async function restartGateway() {
   gatewayRestartCount = 0;
   // Also after first-time onboarding / a raw config save: the app bridge needs the gateway's chat endpoint (no-op without the bridge).
   await ensureAppChatEndpoint();
-  return ensureGatewayRunning();
+  const started = await ensureGatewayRunning();
+  gatewayLink?.kick();
+  return started;
 }
 
 // Failed-login throttling (per client and global); successful requests are never counted. See src/setup-auth.js.
@@ -648,8 +651,21 @@ app.get("/healthz", async (_req, res) => {
 // The only gateway RPCs the app bridge may make (model control). Run as `openclaw gateway call` against the local gateway;
 // the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
 const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch"]);
+// B0: reads go over the persistent gateway link when it is up (no process spawn); the CLI stays the fallback and the only path
+// for writes (sessions.patch).
+const APP_BRIDGE_LINK_READS = new Set(["models.list", "sessions.describe"]);
+let gatewayLink = null;
 function appBridgeGatewayCall(method, params) {
   if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
+  if (gatewayLink?.isUp() && APP_BRIDGE_LINK_READS.has(method)) {
+    return gatewayLink.request(method, params ?? {}).catch((err) => {
+      if (err?.code === "link_down" || err?.code === "timeout") return appBridgeCliCall(method, params);
+      throw err; // a refusal from the gateway (err.refused) is an answer, not an outage
+    });
+  }
+  return appBridgeCliCall(method, params);
+}
+function appBridgeCliCall(method, params) {
   const args = clawArgs(["gateway", "call", method, "--json", "--port", String(INTERNAL_GATEWAY_PORT),
     "--timeout", "15000", "--params", JSON.stringify(params ?? {})]);
   return new Promise((resolve, reject) => {
@@ -671,6 +687,8 @@ function appBridgeGatewayCall(method, params) {
 }
 
 // BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
+// B0: with the bridge on, one persistent loopback operator link to the gateway (src/gateway-link.js); it reconnects on its own.
+const pendingLink = createGatewayLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log });
 const appBridge = createAppBridge({
   token: process.env.BASHT_APP_TOKEN,
   gatewayUrl: GATEWAY_TARGET,
@@ -678,7 +696,9 @@ const appBridge = createAppBridge({
   configPath: configPath(),
   log,
   gatewayCall: appBridgeGatewayCall,
+  link: pendingLink,
 });
+if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
 if (appBridge) app.use("/app/v1", appBridge);
 else app.use("/app/v1", (_req, res) => res.status(404).json({ ok: false, error: "not_enabled" }));
@@ -2033,6 +2053,7 @@ const server = app.listen(PORT, () => {
       }
       await ensureAppChatEndpoint();
       await ensureGatewayRunning();
+      gatewayLink?.kick();
     })().catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     }).finally(() => {
@@ -2075,6 +2096,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
 
   clearInterval(setupLimiterSweep);
+  gatewayLink?.stop();
 
   server.close();
 

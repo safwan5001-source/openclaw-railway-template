@@ -1,4 +1,4 @@
-# BASHT app bridge (C2 + C4 + M)
+# BASHT app bridge (C2 + C4 + M + B0/B3)
 
 How the BASHT app (`safwan-smart-assistant`) reads the owner's conversations and chats with BASHT live. The code is in
 `src/app-bridge.js` and the tests are in `src/app-bridge.test.mjs`.
@@ -26,6 +26,10 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `POST /app/v1/model {model}` | Pins a listed model on the app session; `"default"` clears the pin | `sessions` tool `patch` (app session) |
 | `POST /app/v1/thinking {level}` | Sets a thinking level the **current** model offers; `"default"` clears it | RPC `sessions.patch {thinkingLevel}` (app session) |
 | `POST /app/v1/fast {mode}` | `"on"`, `"off"` or `"default"`; `"on"` only if the current model supports fast mode | RPC `sessions.patch {fastMode}` (app session) |
+| `GET /app/v1/events?after=<id>&wait=<s>` | B0 event feed: ring records newer than `after` (≤100, oldest first); `wait` ≤ 25 s long-polls | persistent link (events) |
+| `GET /app/v1/approvals` | B3: pending exec, plugin and system-agent approvals, fixed shape | link: `exec.approval.list`, `plugin.approval.list`, `openclaw.approval.list` |
+| `GET /app/v1/approvals/history?limit=N` | B3: last decided approvals (≤50) | link: `approval.history` |
+| `POST /app/v1/approvals/:id {decision}` | B3: `"allow-once"` or `"deny"` only | link: `approval.get` (kind), `approval.resolve` |
 
 `/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Assistant messages in
 `/history` carry `provider` and `model`. The notice OpenClaw writes when it switches models carries
@@ -165,3 +169,60 @@ Chat and conversations (C2 + C4):
 - Sessions and history follow the allowlist.
 - Anonymous public `/tools/invoke` and `/v1/chat/completions` still return 401.
 - No token appears in the logs.
+
+## B0: the persistent gateway link (`src/gateway-link.js`)
+
+One loopback WebSocket from the wrapper to its own gateway, opened only when the bridge is on. It replaces CLI spawns for reads
+(`models.list` and `sessions.describe` now take ~0.5 s instead of ~1.6 s, with the CLI as fallback when the link is down) and carries
+the events the app needs. `sessions.patch` (a write) stays on the CLI.
+
+- **Protocol:** gateway protocol v4 as documented (`connect.challenge` → `connect` → `hello-ok`), Node's built-in WebSocket. No new
+  dependency: `@openclaw/gateway-client@2026.11.10` (MIT, ~290 KB, but pulls `@openclaw/gateway-protocol` ~10 MB with `typebox`, plus
+  `ws`) is not needed for a device-less backend client.
+- **Identity and scopes:** `client {id: "gateway-client", mode: "backend"}` on direct loopback with the shared gateway token. This is the
+  documented trusted local backend path (`docs/gateway/protocol/handshake.md`): no device identity, no pairing record, no device token,
+  and the gateway grants exactly the requested scopes. **Verified in the lab:** `hello-ok.auth.scopes` = the requested set, no
+  `PAIRING_REQUIRED`. If a gateway ever grants fewer scopes than requested, the link closes itself and reports `scopes_not_granted`.
+- **Scopes requested:** `operator.read`, `operator.approvals`, `operator.admin`, cap `approvals`. **Admin is required:** the gateway
+  shows gateway-owned approvals (turns from the app's HTTP endpoint, WhatsApp, cron) only to admin connections
+  (`isApprovalRecordVisibleToClient`); a non-admin `operator.approvals` client saw an empty list and the approval was denied at once as
+  `no-approval-route` (lab). The wrapper already holds the gateway token (full authority through its CLI), so the link adds no
+  authority; `request()` refuses every method outside a fixed list (`LINK_METHODS`: the reads above, the approval lists/get/history and
+  `approval.resolve`). Everything else is refused locally, before anything is sent.
+- **Behaviour change:** while the link is up it is an approval client (cap `approvals`). An exec that needs approval now **waits** for
+  an answer (up to the approval's expiry, 30 min by default) instead of being denied at once by `askFallback`. Without any connected
+  approval client the gateway answers "Headless runs cannot wait for interactive exec approval" (lab, before B0).
+- **Reconnect:** backoff 1, 2, 4, 8, 15, 30 s (±20 %); a socket with no frame for 2.5 tick intervals is replaced; requests in flight
+  fail fast with `link_down`. After every (re)connect the pending approvals are read again, and any that arrived while the link was down
+  enter the ring once. Health is in `GET /app/v1/status` → `link {state, since, lastUpAt, reconnects, lastError, pendingApprovals}`.
+- **Event ring:** 500 records in memory, ids increasing (seeded with the boot time, so they keep increasing across restarts) plus an
+  `epoch`. Only fixed fields:
+  - `approval.requested {approval: {id, kind, summary ≤300, title, host, agentId, session, isApp, warning, createdAt, expiresAt, decisions}}`
+  - `approval.resolved {approvalId, kind, decision, session}`
+  - `chat.final` / `chat.error {session: "app", runId, seen}`: the app session only; `seen` = the app polled the bridge in the last 20 s
+  - `cron.finished` / `cron.failed {jobId, name, status}`
+  - `gateway.up {downForMs}` / `gateway.down`
+
+  `session` is a label (`app`, `main`, `whatsapp`, `cron`, `other`), never a raw key (WhatsApp keys carry phone numbers). No cwd, env,
+  resolved paths, reply text or error text.
+
+## B3: approvals
+
+- `POST /app/v1/approvals/:id` accepts `{"decision": "allow-once" | "deny"}` only; `allow-always` (a standing grant) is refused with
+  `bad_decision`. The id must match `^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$`. The kind comes from the gateway's own record (live event or
+  `approval.get`), never from the caller. `approval.resolve` is first-answer-wins: an approval answered elsewhere (Control UI, WhatsApp)
+  returns `applied: false` with the recorded decision. Refusals: 404 `not_found` (unknown/expired), 400 `rejected`, 503 `link_down`.
+- **Turn timeout:** a turn whose app-session approval is pending is not stopped at 15 minutes; its timer is re-armed until that approval
+  expires, plus 60 s.
+- **Verified (lab-la, real 2026.11.10 gateway, `tools.exec.mode: "ask"` in the lab config only, mock model calling `exec`):** the
+  request appeared in `/approvals` and as an event; `allow-once` ran the command and the same turn continued with its output; `deny`
+  returned "user-denied" to the agent and the command did not run; a second answer returned `applied: false`; `allow-always` → 400.
+
+## Production prerequisites (B0/B3)
+
+- Nothing new to configure: the link uses the existing `OPENCLAW_GATEWAY_TOKEN` and `INTERNAL_GATEWAY_PORT` (loopback) and starts only
+  with `BASHT_APP_TOKEN`.
+- Whether approvals happen at all depends on the production exec policy (`tools.exec.mode` / host approvals). OpenClaw's default for a
+  gateway host is `full` with ask `off`: then there are no exec approvals and the inbox stays empty. Check with
+  `openclaw approvals get --gateway` (read-only) before relying on the inbox.
+- With the link up, `ask` turns wait for an answer instead of failing at once; answer them from the app (or Control UI / `/approve`).
