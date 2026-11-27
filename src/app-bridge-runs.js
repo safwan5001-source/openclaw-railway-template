@@ -4,7 +4,8 @@
 // this bridge's own app turns. Sources, all read-only, over the existing persistent gateway link, counts only:
 //   active            the app turns this bridge holds right now (in memory, always known)
 //   engine            sessions.list {activeOnly: true} -> `totalCount`: every session with a queued or running turn, across ALL sessions
-//                     (WhatsApp chats, the app, cron-run sessions, subagents: the gateway's live-run projection, before pagination)
+//                     (WhatsApp chats, the app, subagents: the gateway's live-run projection, before pagination). Isolated cron-run sessions are NOT
+//                     in this list (the gateway filters them out): they are covered only by `cron` below.
 //   cron              cron.list (compact) -> jobs whose `runningAtMs` is set; a truncated list (hasMore) is unknown, never a guess
 //   approvalsPending  the approvals this link is tracking (events + resync); unknown while the link is down OR until every approval list
 //                     was read on the current connection (`link.approvalsSynced()`): an empty, not-yet-synced map is never reported as zero
@@ -54,7 +55,9 @@ export function createRunsProbe({ link, now = Date.now, ttlMs = RUNS_CACHE_MS } 
 
   async function sources() {
     if (cached && now() - cached.at < ttlMs) return cached;
-    pending ??= readSources().then((r) => { cached = { at: now(), ...r }; return cached; }).finally(() => { pending = null; });
+    // stamped when the reads START: the answer is never presented as fresher than the moment it was asked for
+    const at = now();
+    pending ??= readSources().then((r) => { cached = { at, ...r }; return cached; }).finally(() => { pending = null; });
     return pending;
   }
 

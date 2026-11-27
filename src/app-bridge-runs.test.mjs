@@ -101,6 +101,16 @@ test("probe: approvals not yet synced on this connection are unknown (null, comp
   assert.equal(r2.complete, true);
 });
 
+test("probe: the cache is stamped when the reads START (a slow read is not presented as fresher than it is)", async () => {
+  let t = 0;
+  const link = fakeLink({ answers: { "sessions.list": () => { t += 4_000; return sessionsAnswer(1); }, "cron.list": cronAnswer(0) } });
+  const probe = createRunsProbe({ link, now: () => t, ttlMs: 3_000 });
+  await probe.read(0);              // reads began at t=0 and ended at t=4000
+  const n = link.requests.length;
+  await probe.read(0);              // t=4000: the answer is already older than the 3 s ttl => it is read again
+  assert.ok(link.requests.length > n, "a stale answer is never served");
+});
+
 test("probe: no link, or a link that is down => engine, cron and approvals are null, complete:false, and no request is made", async () => {
   for (const link of [undefined, null, fakeLink({ up: false, pending: 3, answers: { "sessions.list": sessionsAnswer(1), "cron.list": cronAnswer(1) } })]) {
     const r = await createRunsProbe({ link }).read(2);

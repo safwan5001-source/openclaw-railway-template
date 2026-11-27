@@ -83,7 +83,7 @@ removed with the same rules as history rows, and while the reply is still stream
   | Field | Source | Meaning |
   |---|---|---|
   | `active` | this bridge, in memory | app turns running right now (always known) |
-  | `engine` | link `sessions.list {activeOnly: true, limit: 1, includeGlobal, includeUnknown}`, read as `totalCount` | sessions with a queued or running turn across **all** sessions: WhatsApp chats, the app, cron-run sessions, subagents (the gateway's live-run projection, before pagination; closed params, one row returned and dropped) |
+  | `engine` | link `sessions.list {activeOnly: true, limit: 1, includeGlobal, includeUnknown}`, read as `totalCount` | sessions with a queued or running turn across the gateway's session index: WhatsApp chats, the app, subagents (the live-run projection, counted before pagination; closed params, one row returned and dropped). **Isolated cron-run sessions, phantom and archived sessions are filtered out by the gateway's own listing**: cron work is covered only through the `cron` source below |
   | `cron` | link `cron.list {includeDisabled, limit: 200, compact, includeDeliveryPreviews: false}` | cron jobs with a running state; a list longer than one page is unknown, not guessed |
   | `approvalsPending` | the approvals this link tracks (events and resync) | pending exec, plugin and system-agent approvals; **unknown (`null`) while the link is down and until all three approval lists were read on the current connection** (an empty map right after (re)connecting, or after a failed list read, is never reported as zero) |
   | `total` | `active + engine + cron` (the known parts) | **only meaningful as "is it zero"**: the parts overlap (the app's own turn is also an active session, a running cron job also has a session). Approvals are not in it |
@@ -471,6 +471,10 @@ tests verify every one byte for byte and so should the app's.
 would not share it (**a single replica is assumed**). What limits a replay is the timestamp window (<= 60 s) plus the boot fence above
 (`signing.replayProtection: "memory+boot_fence"`). The bearer token remains the primary credential: signing is a second factor, not an
 anti-replay guarantee across restarts or replicas.
+The fence is **wall-clock based** (the process's boot time, taken when the bridge is created, slightly after process start): a signer whose clock
+is more than 2 s behind this server is refused (`before_boot`) for that many seconds after each boot, and a backwards clock step after boot does the same
+until wall time catches up; keep both services on NTP. Those refusals count in the failed-auth limiter (`required` mode). A deploy overlap (old
+and new instance up together) also defeats the in-memory nonces; with a single volume-backed service Railway does not overlap them.
 
 **Environment** (read once at boot, then deleted from `process.env`):
 
@@ -531,8 +535,15 @@ Restart or redeploy the engine **only when** `GET /app/v1/status` reports `runs.
 `runs.approvalsPending === 0`, **re-checked immediately before the restart**. `complete: false` (a source could not be read: `engine`,
 `cron` or `approvalsPending` is `null`) is **not** safe: treat it like running work, wait and re-check; a pending approval is work that
 resumes when answered, so it blocks too. Stop an app turn from the app if it must go. `runs` does not cover everything (work that
-starts right after the check, sessionless runs, memory-flush / compaction internals unless they run in a session, and other services
-such as the broker): see the list under `runs` above, and check those by other means.
+starts right after the check, an inbound WhatsApp message still in its debounce before a turn is queued, sessionless runs, memory-flush /
+compaction internals unless they run in a session, and other services such as the broker): see the list under `runs` above, and check those
+by other means. A stale `runningAtMs` left by a crash over-counts (the safe direction).
+
+**Cache:** `runs` reads are shared for 3 s (stamped when the reads start), so a second check within 3 s returns the same answer: the
+"re-check immediately before the restart" must be taken **more than 3 s after** the first one. **Before relying on `runs` for the first time
+in production**, confirm it on the real gateway: with a harmless running turn (e.g. a long app turn), a subagent and an isolated cron job in turn,
+`total` must become non-zero. The two reads were validated against the pinned gateway's schemas and a fake link, not yet against a live gateway;
+if the link's scope refuses `sessions.list`/`cron.list` the result is `null` and `complete:false` (safe: it blocks releases, never allows one).
 
 ## Enable and roll back
 

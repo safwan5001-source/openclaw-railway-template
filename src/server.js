@@ -743,7 +743,7 @@ const appBridge = createAppBridge({
   stateDir: STATE_DIR,
   workspaceDir: WORKSPACE_DIR,
   transcribe: appBridgeTranscribe,
-  // Optional request signing ("basht-bridge-v1"): everything unset = off, exactly as before. See docs/BASHT_APP_BRIDGE.md ("Signing").
+  // Optional request signing ("basht-bridge-v1"): unset mode = `optional` (a signed request is verified, an unsigned one still passes; no secret = nothing to verify). See docs/BASHT_APP_BRIDGE.md ("Signing").
   signing: signingConfigFromEnv(process.env, (msg) => log.warn("app-bridge", msg)),
 });
 if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }

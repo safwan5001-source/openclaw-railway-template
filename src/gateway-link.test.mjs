@@ -228,6 +228,40 @@ test("approvalsSynced: false until every approval list was read on the current c
   link.stop();
 });
 
+test("a failed approval list is retried with backoff until every list was read (no permanent unknown)", async () => {
+  let failPlugin = true; let pluginCalls = 0;
+  const gw = fakeGateway({
+    lists: { "exec.approval.list": [], "openclaw.approval.list": [] },
+    onReq: (f, reply) => {
+      if (f.method !== "plugin.approval.list") return undefined;
+      pluginCalls += 1;
+      if (failPlugin) { reply(false, undefined, { code: "UNAVAILABLE", message: "x" }); return true; }
+      reply(true, []); return true;
+    },
+  });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp() && pluginCalls >= 1);
+  await tick();
+  assert.equal(link.approvalsSynced(), false);
+  failPlugin = false;
+  await until(() => link.approvalsSynced(), 6_000); // the first retry comes after 2 s
+  assert.ok(pluginCalls >= 2);
+  link.stop();
+});
+
+test("list params are validated on own data properties (an accessor cannot show one value and send another)", async () => {
+  const gw = fakeGateway({ lists: { "cron.list": { jobs: [] } } });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp());
+  let n = 0;
+  const sneaky = { ...CRON_RUNNING_PARAMS };
+  Object.defineProperty(sneaky, "limit", { enumerable: true, configurable: true, get() { n += 1; return n === 1 ? 200 : 9999; } });
+  await assert.rejects(link.request("cron.list", sneaky), { code: "bad_params" });
+  link.stop();
+});
+
 test("resync never forgets an approval that arrived as a live event while the lists were being read", async () => {
   let releasePlugin;
   const gw = fakeGateway({

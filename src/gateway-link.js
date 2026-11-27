@@ -42,7 +42,14 @@ export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
 /** The ONLY params the link sends for the two counting reads (exact match, nothing else): active sessions (one row, we read `totalCount`) and compact cron jobs. */
 export const SESSIONS_ACTIVE_PARAMS = Object.freeze({ activeOnly: true, limit: 1, includeGlobal: true, includeUnknown: true });
 export const CRON_RUNNING_PARAMS = Object.freeze({ includeDisabled: true, limit: 200, compact: true, includeDeliveryPreviews: false });
-const sameParams = (expected) => (p) => isPlainObject(p) && Object.keys(p).length === Object.keys(expected).length && Object.entries(expected).every(([k, v]) => p[k] === v);
+// Own data properties only (an accessor could answer one value to this check and another to the serializer).
+const sameParams = (expected) => {
+  const want = Object.entries(expected);
+  return (p) => isPlainObject(p) && Object.keys(p).length === want.length && want.every(([k, v]) => {
+    const d = Object.getOwnPropertyDescriptor(p, k);
+    return d !== undefined && "value" in d && d.value === v;
+  });
+};
 const PARAM_VALIDATORS = Object.freeze({
   "sessions.list": sameParams(SESSIONS_ACTIVE_PARAMS),
   "cron.list": sameParams(CRON_RUNNING_PARAMS),
@@ -53,6 +60,7 @@ export const APPROVAL_KINDS = Object.freeze({ exec: "exec", plugin: "plugin", op
 const LIST_METHOD = { exec: "exec.approval.list", plugin: "plugin.approval.list", "system-agent": "openclaw.approval.list" };
 export const RING_SIZE = 500;
 export const MAX_SUMMARY = 300;
+const SYNC_RETRY_MS = [2_000, 5_000, 15_000, 30_000];
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 const CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_TICK_MS = 15_000;
@@ -158,7 +166,9 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   let retryTimer = null;
   let watchdog = null;
   let tickMs = DEFAULT_TICK_MS;
+  let syncAttempt = 0;
   let approvalsSynced = false; // true only once EVERY approval list was read on the CURRENT connection (an empty map before that is "unknown", not zero)
+  let syncRetry = null; // retry timer for a resync that could not read every approval list (backoff; cleared on drop/stop)
   let syncGen = 0; // bumps on every (re)connect and drop: a resync that finishes after its connection ended must not mark the next one synced
   let serverVersion = null; // hello-ok `server.version` of the current connection (an engine version label, nothing else)
   let stopped = true;
@@ -248,13 +258,19 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       }
     }
     for (const [id, kind] of before) if (!seen.has(id) && read.has(kind) && pending.get(id)?.kind === kind) pending.delete(id);
-    if (gen === syncGen && state === "up" && read.size === Object.keys(LIST_METHOD).length) approvalsSynced = true;
+    if (gen !== syncGen || state !== "up") return;
+    if (read.size === Object.keys(LIST_METHOD).length) { approvalsSynced = true; syncAttempt = 0; return; }
+    // A list could not be read: stay "unknown" but try again (backoff), so a transient failure does not block releases until the next reconnect.
+    clearTimer(syncRetry);
+    const delay = SYNC_RETRY_MS[Math.min(syncAttempt, SYNC_RETRY_MS.length - 1)]; syncAttempt += 1;
+    syncRetry = setTimeout(() => { if (gen === syncGen && state === "up") resync().catch(() => {}); }, delay);
+    syncRetry.unref?.();
   }
 
   function dropped(reason) {
     clearTimer(watchdog);
     ws = null;
-    syncGen += 1; approvalsSynced = false;
+    syncGen += 1; approvalsSynced = false; syncAttempt = 0; clearTimer(syncRetry);
     failInflight("link_down");
     if (stopped) { setState("off"); return; }
     if (state === "up") { downSince = now(); push({ type: "gateway.down" }); }
@@ -326,7 +342,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
           lastUpAt = now(); downSince = null; lastError = null;
           reconnects += 1;
           push({ type: "gateway.up", downForMs: downFor });
-          syncGen += 1; approvalsSynced = false;
+          syncGen += 1; approvalsSynced = false; syncAttempt = 0; clearTimer(syncRetry);
           setState("up");
           armWatchdog();
           resync().catch(() => {});
