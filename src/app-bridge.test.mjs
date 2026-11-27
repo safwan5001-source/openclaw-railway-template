@@ -505,3 +505,13 @@ test("no setting changes while a turn is running (it would be overwritten when t
   appSession.hasActiveRun = false;
   assert.equal((await post("/thinking", { level: "high" })).status, 200);
 });
+
+test("a delayed reset re-check never undoes a newer write made meanwhile", async () => {
+  appSession = { ...freshSession(), modelProvider: "xai", model: "grok-3", thinkingLevels: LEVELS["xai/grok-3"], thinkingLevel: "high" };
+  const first = post("/model", { model: "mock/echo2" }); // echo2 has no "high": cleared, then re-checked ~1.5 s later
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal((await post("/model", { model: "mock/echo" })).status, 200);
+  assert.equal((await post("/thinking", { level: "high" })).status, 200); // valid for echo
+  assert.equal((await first).status, 200);
+  assert.equal(appSession.thinkingLevel, "high", "the newer level survives the first request's re-check");
+});

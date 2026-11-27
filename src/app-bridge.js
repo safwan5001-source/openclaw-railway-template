@@ -335,7 +335,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     return s;
   }
 
-  const patchApp = (fields) => gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields });
+  let writes = 0; // every settings write bumps this; a delayed re-check only acts if nothing was written since
+  const patchApp = (fields) => { writes++; return gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields }); };
   // A change made while a turn is running is overwritten when that turn saves the session: refuse it (409 busy) instead.
   const busy = (res, s) => {
     if (s?.hasActiveRun !== true) return false;
@@ -403,6 +404,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         if (!row.selectable) return bad(res, "model_not_selectable");
       }
       // The sessions tool resolves and policy-checks the ref itself; "default" clears the session pin.
+      writes++;
       const d = await invoke("sessions", { action: "patch", sessionKey: APP_SESSION_KEY, model: want });
       if (d?.status !== "updated" || d?.sessionKey !== APP_SESSION_KEY) return bad(res, "rejected");
       const r = d.resolved ?? {};
@@ -415,11 +417,15 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (s.thinkingLevel && row && !row.thinkingLevels.includes(s.thinkingLevel)) { await patchApp({ thinkingLevel: null }); reset.thinking = true; }
       if (s.effectiveFastModeSource === "session" && s.effectiveFastMode === true && row && !row.supportsFastMode) { await patchApp({ fastMode: null }); reset.fast = true; }
       if (reset.thinking || reset.fast) {
-        // OpenClaw can save the session a moment later from work that started earlier: check once and clear again if it came back
+        // OpenClaw can save the session a moment later from work that started earlier: check once and clear again if it came back.
+        // Only if no other settings write happened meanwhile (a newer model or level must never be undone by this re-check).
+        const mine = writes;
         await new Promise((r) => setTimeout(r, RESET_RECHECK_MS));
-        const again = await describeApp();
-        if (reset.thinking && again.thinkingLevel && row && !row.thinkingLevels.includes(again.thinkingLevel)) await patchApp({ thinkingLevel: null });
-        if (reset.fast && again.effectiveFastModeSource === "session" && again.effectiveFastMode === true) await patchApp({ fastMode: null });
+        const again = writes === mine ? await describeApp() : null;
+        if (again && writes === mine && modelRef(again.modelProvider, again.model) === id) {
+          if (reset.thinking && again.thinkingLevel && row && !row.thinkingLevels.includes(again.thinkingLevel)) await patchApp({ thinkingLevel: null });
+          if (reset.fast && again.effectiveFastModeSource === "session" && again.effectiveFastMode === true) await patchApp({ fastMode: null });
+        }
       }
       // No override/default flag here: pinning the configured primary is stored as no override. GET /model reports it.
       res.json({ ok: true, model: { id, provider: safeStr(r.modelProvider, 100), model: safeStr(r.model, MAX_MODEL_REF) },
