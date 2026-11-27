@@ -53,7 +53,7 @@ const otherPatched = []; // any write that named a session other than the app's
 async function fakeGatewayCall(method, params) {
   rpc.push({ method, params });
   if (method === "models.list") return { models: MODELS, decisionModels: [{ id: "x" }], accountSelection: { kind: "automatic" } };
-  if (method === "sessions.describe") return { session: params.key === APP_SESSION_KEY ? appSession : null };
+  if (method === "sessions.describe") return { session: params.key === APP_SESSION_KEY ? { ...appSession } : null }; // a snapshot, as the real CLI returns
   if (method === "sessions.patch") {
     if (patchDelay) await new Promise((r) => setTimeout(r, patchDelay));
     timeline.push(`patch:${Object.keys(params).filter((k) => k !== "key").join(",")}`);
@@ -458,9 +458,9 @@ test("a 'restored' notice (primary back) is never reported as a fallback", () =>
 test("model source: the owner's pin vs OpenClaw's automatic fallback pin", async () => {
   appSession = { ...freshSession(), modelProvider: "mock", model: "echo2", modelOverrideSource: "auto" };
   assert.equal((await call("/model")).json.model.source, "fallback");
-  appSession.modelOverrideSource = "user";
+  appSession.modelOverrideSource = "user"; clockOffset += 3_000; // the engine changed it on its own: seen once the short read cache expires
   assert.equal((await call("/model")).json.model.source, "override");
-  appSession.modelOverrideSource = "inherited";
+  appSession.modelOverrideSource = "inherited"; clockOffset += 3_000;
   assert.equal((await call("/model")).json.model.source, "default");
 });
 
@@ -636,6 +636,19 @@ test("L6: GET /model shares one sessions.describe for a few seconds; a write mak
   clockOffset += 3_000;
   await call("/model");
   assert.equal(describes(), before + 2, "expires after the short window");
+});
+
+test("L6: a read taken while a settings write is in flight is not served from the cache after the write", async () => {
+  appSession = freshSession();
+  clockOffset += 3_000; // start past any earlier cached read
+  patchDelay = 300;
+  try {
+    const write = post("/thinking", { level: "high" });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal((await call("/model")).json.thinking.level ?? null, appSession.thinkingLevel ?? null);
+    assert.equal((await write).status, 200);
+    assert.equal((await call("/model")).json.thinking.level, "high", "the first read after the write is fresh");
+  } finally { patchDelay = 0; }
 });
 
 test("L6: gateway CLI calls are capped (2 at once, a bounded queue, the rest fail fast)", async () => {

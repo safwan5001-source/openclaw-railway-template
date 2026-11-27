@@ -406,7 +406,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   // Settings writes (model / thinking / fast) run one at a time — two devices changing settings together never interleave
   // (e.g. a level validated against the old model landing on the new one). A new turn waits for the queue to drain.
   let queue = Promise.resolve();
-  const serial = (fn) => { const p = queue.then(fn, fn); queue = p.catch(() => {}); return p; };
+  // A GET /model taken while a write was in flight may hold the old value under the new write count: forget it once the
+  // write has finished, so the first read after a successful change is always fresh.
+  const serial = (fn) => { const p = queue.then(fn, fn).finally(forgetDescribe); queue = p.catch(() => {}); return p; };
   const turnRunning = () => [...runs.values()].some((r) => r.status === "running");
   let writes = 0; // every settings write bumps this; a delayed re-check only acts if nothing was written since
   const patchApp = (fields) => { writes++; return gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields }); };
