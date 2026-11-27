@@ -30,6 +30,7 @@ const MAX_RUNS_KEPT = 20;
 const RUN_TIMEOUT_MS = 15 * 60_000;
 const READ_TIMEOUT_MS = 15_000;
 const AUTH_FAILURES_PER_MINUTE = 20;
+const MAX_LIST_PAGES = 20; // up to 2000 sessions
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
@@ -137,6 +138,20 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     return j.result?.details ?? {};
   }
 
+  /** Every session row, paged (the gateway caps one page at 100): an allowed conversation must never fall off a truncated page. */
+  async function allSessions() {
+    const rows = [];
+    let offset = 0;
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const d = await invoke("sessions_list", { limit: 100, offset, excludeSubagents: true });
+      const batch = Array.isArray(d.sessions) ? d.sessions : [];
+      rows.push(...batch);
+      if (d.hasMore !== true || !batch.length) break;
+      offset = Number.isInteger(d.nextOffset) && d.nextOffset > offset ? d.nextOffset : offset + batch.length;
+    }
+    return rows;
+  }
+
   const fail = (res, err, what) => {
     log?.warn?.("app-bridge", `${what}: ${err?.message ?? err}`);
     res.status(502).json({ ok: false, error: "engine_unavailable" });
@@ -147,8 +162,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   router.get("/sessions", async (_req, res) => {
     try {
       const owners = ownersFromConfig(configPath);
-      const d = await invoke("sessions_list", { limit: 100 });
-      const rows = (Array.isArray(d.sessions) ? d.sessions : []).filter((r) => isReadable(r, owners));
+      const rows = (await allSessions()).filter((r) => isReadable(r, owners));
       const sessions = rows
         .map((r) => ({ key: r.key, label: sessionLabel(r), channel: String(r.channel ?? ""), updatedAt: Number(r.updatedAt) || 0,
           status: String(r.status ?? ""), writable: r.key === APP_SESSION_KEY }))
@@ -163,13 +177,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit ?? "50"), 10) || 50, 1), 200);
     const offsetRaw = req.query.offset;
     try {
-      // Re-check against the live list: a key is readable only if it is the app session or listed AND allowed.
-      if (key !== APP_SESSION_KEY) {
-        const owners = ownersFromConfig(configPath);
-        const d = await invoke("sessions_list", { limit: 100 });
-        const row = (Array.isArray(d.sessions) ? d.sessions : []).find((r) => r.key === key);
-        if (!row || !isReadable(row, owners)) return res.status(404).json({ ok: false, error: "not_found" });
-      }
+      // The allowlist is decided by the key alone (app, main, the owner's direct WhatsApp chat), never by a listing.
+      if (!isReadable({ key }, ownersFromConfig(configPath))) return res.status(404).json({ ok: false, error: "not_found" });
       const args = { sessionKey: key, limit };
       if (offsetRaw !== undefined) args.offset = Math.max(Number.parseInt(String(offsetRaw), 10) || 0, 0);
       const h = await invoke("sessions_history", args);

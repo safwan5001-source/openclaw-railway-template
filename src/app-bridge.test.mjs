@@ -24,6 +24,8 @@ const ROWS = [
   { key: "agent:main:subagent:abc", channel: "unknown", updatedAt: 7 },
 ];
 
+const FILLER = Array.from({ length: 120 }, (_, i) => ({ key: `agent:main:whatsapp:group:${i}@g.us`, channel: "whatsapp", updatedAt: 1 }));
+
 let gateway, gwUrl, server, base, dir;
 
 before(async () => {
@@ -38,7 +40,12 @@ before(async () => {
       if (req.url === "/tools/invoke") {
         const { tool, args } = JSON.parse(body);
         res.writeHead(200, { "content-type": "application/json" });
-        if (tool === "sessions_list") return res.end(JSON.stringify({ ok: true, result: { details: { sessions: ROWS } } }));
+        if (tool === "sessions_list") {
+          // paged like the real gateway: the owner's WhatsApp chat sits on the SECOND page, behind unrelated sessions
+          const all = [...ROWS.filter((r) => !r.key.includes(OWNER)), ...FILLER, ...ROWS.filter((r) => r.key.includes(OWNER))];
+          const off = args.offset ?? 0, page = all.slice(off, off + (args.limit ?? 100));
+          return res.end(JSON.stringify({ ok: true, result: { details: { sessions: page, hasMore: off + page.length < all.length, nextOffset: off + page.length } } }));
+        }
         if (tool === "sessions_history") {
           return res.end(JSON.stringify({ ok: true, result: { details: { sessionKey: args.sessionKey, hasMore: false, messages: [
             { role: "user", content: "مرحبا", timestamp: 1 },
