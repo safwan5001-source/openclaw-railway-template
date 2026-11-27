@@ -84,7 +84,9 @@ export function signingConfigFromEnv(env, warn = () => {}) {
  *   now: milliseconds (the bridge's own clock). Without a valid secret the verifier is off whatever the mode says.
  */
 export function createSigningVerifier({ secret, previousSecret, mode = "off", now = Date.now } = {}) {
-  const secrets = [secret, previousSecret].filter((s) => typeof s === "string" && s.length >= MIN_SECRET_LENGTH);
+  const valid = (x) => typeof x === "string" && x.length >= MIN_SECRET_LENGTH;
+  // the previous secret only exists next to a current one (a rotation window); alone it would enforce signing with a retired key
+  const secrets = valid(secret) ? [secret, ...(valid(previousSecret) ? [previousSecret] : [])] : [];
   const effective = secrets.length && SIGNING_MODES.includes(mode) ? mode : "off";
   const nonces = new Map(); // nonce -> expiry (ms); insertion order = expiry order, because the TTL is constant
 

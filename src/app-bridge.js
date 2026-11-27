@@ -729,39 +729,94 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } catch { return null; }
   }
 
-  router.post("/speak", async (req, res) => {
-    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request");
-    if (!speechDir) return voiceUnavailable(res);
-    if (!speakLimit()) return res.status(429).json({ ok: false, error: "rate_limited" });
+  /**
+   * A refused speak. `{ok:false, error:<code the app already knows>, reason}`: a client that ignores `reason` keeps working.
+   * One log line with the reason only: never the text, never what the engine said.
+   */
+  const refuseSpeak = (res, status, error, reason) => {
+    log?.warn?.("app-bridge", `speak refused: ${error} (${reason})`);
+    return res.status(status).json({ ok: false, error, reason });
+  };
+  let speaking = 0;
+
+  /**
+   * Speak over the persistent link: the RPC `tts.speak` ({text} only). It uses the GLOBAL `tts` block, which the guard has just
+   * confirmed carries the agent's voice identity. NEVER retried here: a timed-out call may still be running at the provider, and a
+   * second one would be billed twice. No fallback to the CLI/admin path either (owner decision): a down link is an answer.
+   */
+  async function speakViaLink(res, text) {
+    if (!link?.isUp?.()) return refuseSpeak(res, 502, "engine_unavailable", "link_down");
+    let d;
+    try {
+      d = await link.request("tts.speak", { text }, { timeoutMs: SPEAK_TIMEOUT_MS });
+    } catch (err) {
+      if (err?.code === "link_down") return refuseSpeak(res, 502, "engine_unavailable", "link_down");
+      if (err?.code === "timeout") return refuseSpeak(res, 502, "engine_unavailable", "timeout"); // existing status vocabulary: no 504
+      if (err?.refused) return refuseSpeak(res, 503, "voice_unavailable", "provider_error"); // the gateway answered ok:false (e.g. UNAVAILABLE)
+      return refuseSpeak(res, 502, "engine_unavailable", "engine_error");
+    }
+    const b64 = typeof d?.audioBase64 === "string" ? d.audioBase64 : "";
+    const mime = String(d?.mimeType ?? "").split(";")[0].trim().toLowerCase();
+    const ext = d?.fileExtension === undefined || d?.fileExtension === null ? null : String(d.fileExtension).toLowerCase();
+    // check the encoded size first: a huge answer must not be decoded into memory just to be refused
+    if (!b64 || b64.length > Math.ceil((MAX_SPEECH_BYTES * 4) / 3) + 4 || !Object.hasOwn(SPEECH_MIMES, mime) || (ext !== null && !Object.hasOwn(SPEECH_TYPES, ext))) {
+      return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+    }
+    const audio = Buffer.from(b64, "base64");
+    if (audio.length < 1 || audio.length > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
+    res.set({ "Content-Type": SPEECH_MIMES[mime], "Content-Length": String(audio.length), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    return res.status(200).end(audio);
+  }
+
+  /** Speak through the agent's `tts` tool on the app session (the original path; needs the tool to be allowed by the tool policy). */
+  async function speakViaTool(res, text) {
     let d;
     try {
       // the agent's tool on the app session: agents.entries.main.tts (voice, model, instructions) applies; markdown is stripped by the engine
       d = await invoke("tts", { text }, { sessionKey: APP_SESSION_KEY, timeoutMs: SPEAK_TIMEOUT_MS });
     } catch (err) {
-      if (err?.answered) { log?.warn?.("app-bridge", `speak refused: ${err.message}`); return voiceUnavailable(res); }
-      return fail(res, err, "speak");
+      if (err?.answered) {
+        // 404/403: the tool policy does not allow `tts` for this caller; a tool_error: the tool ran and refused (no provider configured…)
+        const reason = err.status === 404 || err.status === 403 ? "tool_denied" : err.toolError ? "unconfigured" : "provider_error";
+        return refuseSpeak(res, 503, "voice_unavailable", reason);
+      }
+      return refuseSpeak(res, 502, "engine_unavailable", "engine_error");
     }
     const file = await speechFile(d?.audioPath);
-    if (!file) {
-      // never read (or delete) anything outside the speech directory
-      log?.warn?.("app-bridge", "speak: the tool returned no usable audio file");
-      return voiceUnavailable(res);
-    }
+    // never read (or delete) anything outside the speech directory
+    if (!file) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
     try {
-      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return voiceUnavailable(res);
+      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", "bad_audio");
       const audio = await fs.promises.readFile(file.real);
       res.set({ "Content-Type": SPEECH_TYPES[path.extname(file.real).toLowerCase()], "Content-Length": String(audio.length),
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
       res.status(200).end(audio);
-    } catch (err) {
-      fail(res, err, "speak read");
+    } catch {
+      refuseSpeak(res, 502, "engine_unavailable", "engine_error");
     } finally {
       fs.promises.unlink(file.real).catch(() => {}); // one-shot: the app plays it, the engine keeps no copy
     }
+  }
+
+  router.post("/speak", async (req, res) => {
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request");
+    if (!speakLimit()) return refuseSpeak(res, 429, "rate_limited", "per_minute");
+    // BASHT's voice is the agent block's. Decide which engine path can speak it, from the config as it is right now.
+    const guard = readVoiceGuard(configPath);
+    if (guard.state === "mismatch") return refuseSpeak(res, 503, "voice_unavailable", "identity_mismatch"); // no provider is called
+    if (guard.state === "no_agent_block") return refuseSpeak(res, 503, "voice_unavailable", "unconfigured");
+    const viaLink = guard.state === "match" || guard.state === "global_only";
+    // no_global / unknown: the tool path, as before the RPC existed (it works wherever the `tts` tool is allowed)
+    if (!viaLink && !speechDir) return refuseSpeak(res, 503, "voice_unavailable", "unconfigured");
+    if (speaking >= SPEAKS_IN_FLIGHT) return refuseSpeak(res, 429, "rate_limited", "in_flight");
+    speaking++;
+    try {
+      await (viaLink ? speakViaLink(res, text) : speakViaTool(res, text));
+    } finally { speaking--; }
   });
 
-  const rawAudio = express.raw({ type: () => true, limit: MAX_AUDIO_BYTES });
+  const rawAudio = express.raw({ type: () => true, limit: MAX_AUDIO_BYTES, verify: keepRaw });
   router.post("/transcribe", (req, res, next) => {
     if (!transcribe) return voiceUnavailable(res);
     const type = String(req.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
@@ -782,6 +837,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     req.audioExt = AUDIO_TYPES[type];
     rawAudio(req, res, (err) => {
       if (err) return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? "too_large" : "bad_request" });
+      if (!bodyMatchesSignature(req, res)) return signatureRejected(res, "body"); // the slot is released when this response closes
       next();
     });
   }, async (req, res) => {

@@ -2,7 +2,7 @@
 // stands in for the OpenClaw gateway; shapes are the ones the real 2026.11.10 gateway sent in the lab (docs/BASHT_APP_BRIDGE.md).
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { APP_SESSION_KEY, LINK_CAPS, LINK_METHODS, LINK_SCOPES, approvalView, createGatewayLink, normalizeEvent, sessionKind } from "./gateway-link.js";
+import { APP_SESSION_KEY, LINK_CAPS, LINK_METHODS, LINK_SCOPES, TTS_SPEAK_MAX_CHARS, approvalView, createGatewayLink, normalizeEvent, sessionKind } from "./gateway-link.js";
 
 const TOKEN = "synthetic-gateway-token-0123456789abcdef";
 // The link's own timers are unref'd by design (they must never keep the wrapper alive), so a test awaiting one of them needs
@@ -13,7 +13,7 @@ const tick = () => new Promise((r) => setImmediate(r));
 const until = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error("timeout"); await new Promise((r) => setTimeout(r, 5)); } };
 
 /** A scripted gateway: answers connect (hello-ok with `scopes`), list methods from `lists`, and records every frame. */
-function fakeGateway({ scopes = [...LINK_SCOPES], lists = {}, tickIntervalMs = 15000, onReq } = {}) {
+function fakeGateway({ scopes = [...LINK_SCOPES], lists = {}, tickIntervalMs = 15000, onReq, server } = {}) {
   const sockets = [];
   class FakeWS {
     constructor(url) {
@@ -27,7 +27,7 @@ function fakeGateway({ scopes = [...LINK_SCOPES], lists = {}, tickIntervalMs = 1
       const f = JSON.parse(raw);
       this.sent.push(f);
       const reply = (ok, payload, error) => setImmediate(() => this.emit({ type: "res", id: f.id, ok, payload, error }));
-      if (f.method === "connect") return reply(true, { type: "hello-ok", protocol: 4, auth: { role: "operator", scopes }, policy: { tickIntervalMs } });
+      if (f.method === "connect") return reply(true, { type: "hello-ok", protocol: 4, ...(server ? { server } : {}), auth: { role: "operator", scopes }, policy: { tickIntervalMs } });
       if (onReq) { const r = onReq(f, reply); if (r !== undefined) return; }
       if (f.method in lists) return reply(true, lists[f.method]);
       reply(false, undefined, { code: "INVALID_REQUEST", message: "unknown" });
@@ -262,4 +262,105 @@ test("decorator adds bridge-only facts to records", async () => {
   await tick();
   assert.equal(link.events(0).events.at(-1).seen, false);
   link.stop();
+});
+
+// ---------------------------------------------------------------- tts.speak on the link ----------------------------------------------
+
+test("the allowlist is exactly the reads, the approval write and tts.speak: everything else stays refused", async () => {
+  assert.deepEqual([...LINK_METHODS].sort(), ["approval.get", "approval.history", "approval.resolve", "exec.approval.list", "models.list",
+    "openclaw.approval.list", "plugin.approval.list", "sessions.describe", "tts.speak"]);
+  const gw = fakeGateway({ lists: { "tts.speak": { audioBase64: "AA==", mimeType: "audio/mpeg" } } });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp());
+  const before = gw.last().sent.length;
+  for (const m of ["chat.send", "tts.convert", "tts.status", "tts.setProvider", "tts.enable", "config.get", "config.set", "TTS.speak", "tts.speak ", " tts.speak", "tts", "tts.speak.stream", "talk.speak", "sessions.send", ""]) {
+    await assert.rejects(link.request(m, { text: "x" }), { code: "not_allowed" }, JSON.stringify(m));
+  }
+  assert.equal(gw.last().sent.length, before, "nothing refused locally reached the gateway");
+  link.stop();
+});
+
+test("tts.speak: params are closed to {text: 1..1500 chars}; anything else is refused locally with bad_params", async () => {
+  const gw = fakeGateway({ lists: { "tts.speak": { audioBase64: "AA==", mimeType: "audio/mpeg" } } });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  // a bad shape is bad_params even before the link is up; a good one then needs the link
+  await assert.rejects(link.request("tts.speak", { text: "" }), { code: "bad_params" });
+  await assert.rejects(link.request("tts.speak", { text: "مرحبا" }), { code: "link_down" });
+  link.start();
+  await until(() => link.isUp());
+  const sentBefore = gw.last().sent.length;
+  const bad = [undefined, null, "مرحبا", ["x"], 5, {}, { text: "" }, { text: 5 }, { text: null }, { text: ["x"] }, { text: "ا".repeat(TTS_SPEAK_MAX_CHARS + 1) },
+    { text: "x", voice: "alloy" }, { text: "x", provider: "elevenlabs" }, { text: "x", model: "m" }, { text: "x", sessionKey: APP_SESSION_KEY }, { text: "x", agentId: "main" },
+    { text: "x", instructions: "speak fast" }, { text: "x", channel: "whatsapp" }, { Text: "x" }, { txt: "x" }, Object.assign(Object.create({ text: "x" }), {}),
+    Object.assign(Object.create(null), { text: "x" })];
+  for (const p of bad) await assert.rejects(link.request("tts.speak", p), { code: "bad_params" }, JSON.stringify(p)?.slice(0, 40));
+  assert.equal(gw.last().sent.length, sentBefore, "nothing reached the gateway");
+  assert.equal(TTS_SPEAK_MAX_CHARS, 1500);
+  const ok = await link.request("tts.speak", { text: "ا".repeat(1500) });
+  assert.equal(ok.mimeType, "audio/mpeg");
+  const frame = gw.last().sent.at(-1);
+  assert.equal(frame.method, "tts.speak");
+  assert.deepEqual(frame.params, { text: "ا".repeat(1500) }, "{text} and nothing else goes out");
+  link.stop();
+});
+
+test("request() honours the timeout it is given (tts.speak: 60 s), caps it, and never retries on its own", async () => {
+  const delays = [];
+  const timers = [];
+  const setTimer = (fn, ms) => { delays.push(ms); const t = setTimeout(fn, ms); timers.push({ fn, ms, t }); return t; };
+  const gw = fakeGateway({ onReq: (f) => (f.method === "tts.speak" ? true : undefined) }); // the gateway never answers tts.speak
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS, setTimer });
+  link.start();
+  await until(() => link.isUp());
+  const mark = delays.length;
+  const p = link.request("tts.speak", { text: "x" }, { timeoutMs: 60_000 });
+  const timer = timers.slice(mark).find((t) => t.ms === 60_000);
+  assert.ok(timer, `a 60 s timer was armed (${delays.slice(mark)})`);
+  timer.fn(); // the 60 s pass
+  await assert.rejects(p, { code: "timeout" });
+  assert.equal(gw.last().sent.filter((f) => f.method === "tts.speak").length, 1, "one request, no retry");
+  // default and cap
+  const m2 = delays.length;
+  const q1 = link.request("tts.speak", { text: "x" }); q1.catch(() => {});
+  const q2 = link.request("tts.speak", { text: "x" }, { timeoutMs: 10 * 60_000 }); q2.catch(() => {});
+  const q3 = link.request("tts.speak", { text: "x" }, { timeoutMs: -5 }); q3.catch(() => {});
+  assert.deepEqual(delays.slice(m2).filter((d) => d >= 15_000 && d <= 120_000), [15_000, 120_000, 15_000]);
+  link.stop();
+  await Promise.allSettled([q1, q2, q3]);
+});
+
+test("tts.speak: a gateway refusal is an answer (refused, with its code); a drop mid-request is link_down", async () => {
+  const gw = fakeGateway({ onReq: (f, reply) => (f.method === "tts.speak" ? (reply(false, undefined, { code: "UNAVAILABLE", message: "provider failed" }), true) : undefined) });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp());
+  await assert.rejects(link.request("tts.speak", { text: "x" }), (e) => e.refused === true && e.code === "UNAVAILABLE");
+  link.stop();
+  const gw2 = fakeGateway({ onReq: (f) => (f.method === "tts.speak" ? true : undefined) });
+  const link2 = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw2.FakeWS });
+  link2.start();
+  await until(() => link2.isUp());
+  const p = link2.request("tts.speak", { text: "x" });
+  await tick();
+  gw2.last().close();
+  await assert.rejects(p, { code: "link_down" });
+  link2.stop();
+});
+
+test("the engine version is the hello-ok server.version (label shape only), else null", async () => {
+  const withVersion = fakeGateway({ server: { version: "2026.11.10", connId: "c1" } });
+  const a = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: withVersion.FakeWS });
+  assert.equal(a.serverVersion(), null, "unknown before the link was ever up");
+  a.start(); await until(() => a.isUp());
+  assert.equal(a.serverVersion(), "2026.11.10");
+  assert.ok(!JSON.stringify(a.status()).includes("connId"));
+  a.stop();
+  for (const server of [undefined, { version: "x".repeat(60) }, { version: "<script>" }, { version: 5 }, { version: "a b" }]) {
+    const gw = fakeGateway({ server });
+    const l = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+    l.start(); await until(() => l.isUp());
+    assert.equal(l.serverVersion(), null, JSON.stringify(server)?.slice(0, 30));
+    l.stop();
+  }
 });

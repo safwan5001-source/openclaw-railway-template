@@ -151,7 +151,7 @@ export function dropPartialMarker(text) {
       const f = FENCE.exec(line);
       if (f) fence = fence === null ? f[1] : fence === f[1] ? null : fence;
     }
-    if (fence === null) return t.slice(0, nl + 1);
+    if (fence === null) return t.slice(0, Math.max(nl, 0)); // the newline before the fragment goes with it
   }
   return t;
 }

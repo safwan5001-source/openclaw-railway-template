@@ -108,7 +108,9 @@ before(async () => {
   stateDir = path.join(dir, "state");
   speechDir = path.join(stateDir, "media", "tool-speech-synthesis");
   fs.mkdirSync(speechDir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "openclaw.json"), JSON.stringify({ commands: { ownerAllowFrom: [`whatsapp:${OWNER}`] } }));
+  // the agent's own voice block (no global `tts`): the voice guard says "no_global", so /speak uses the `tts` tool path, as in production today
+  fs.writeFileSync(path.join(dir, "openclaw.json"), JSON.stringify({ commands: { ownerAllowFrom: [`whatsapp:${OWNER}`] },
+    agents: { entries: { main: { tts: { provider: "openai", providers: { openai: { model: "synthetic-model", speakerVoice: "synthetic-voice", instructions: "synthetic" } } } } } } }));
   gateway = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -117,7 +119,8 @@ before(async () => {
       if (req.headers.authorization !== `Bearer ${GW_TOKEN}`) { res.writeHead(401); return res.end(); }
       if (req.url === "/tools/invoke") {
         const { tool, args } = JSON.parse(body);
-        res.writeHead(200, { "content-type": "application/json" });
+        // the real gateway answers a refused tool with HTTP 500 (tool_error) and a tool the policy does not allow with 404
+        res.writeHead(tool === "tts" && ttsMode === "refuse" ? 500 : tool === "tts" && ttsMode === "not_allowed" ? 404 : 200, { "content-type": "application/json" });
         if (tool === "sessions_list") {
           // paged like the real gateway: the owner's WhatsApp chat sits on the SECOND page, behind unrelated sessions
           const all = [...ROWS.filter((r) => !r.key.includes(OWNER)), ...FILLER, ...ROWS.filter((r) => r.key.includes(OWNER))];
@@ -126,8 +129,8 @@ before(async () => {
         }
         if (tool === "tts") {
           ttsCalls.push({ args, sessionKey: JSON.parse(body).sessionKey ?? null });
-          if (ttsMode === "refuse") { res.statusCode = 500; return res.end(JSON.stringify({ ok: false, error: { type: "tool_error", message: "tool execution failed" } })); }
-          if (ttsMode === "not_allowed") { res.statusCode = 404; return res.end(JSON.stringify({ ok: false, error: { type: "not_found", message: "Tool not available: tts" } })); }
+          if (ttsMode === "refuse") { return res.end(JSON.stringify({ ok: false, error: { type: "tool_error", message: "tool execution failed" } })); }
+          if (ttsMode === "not_allowed") { return res.end(JSON.stringify({ ok: false, error: { type: "not_found", message: "Tool not available: tts" } })); }
           const audioPath = ttsMode === "ok" ? path.join(speechDir, `voice---${crypto.randomUUID()}.mp3`) : ttsTarget;
           if (ttsMode === "ok") fs.writeFileSync(audioPath, SPEECH);
           return res.end(JSON.stringify({ ok: true, result: { content: [{ type: "text", text: "(spoken)" }], details: { audioPath, provider: "openai", media: { mediaUrl: audioPath } } } }));
@@ -750,7 +753,7 @@ test("speak: never reads or deletes a file outside the speech directory (travers
       const r = await speak({ text: "مرحبا" });
       assert.equal(r.status, 503, String(target));
       const body = await r.text();
-      assert.deepEqual(JSON.parse(body), { ok: false, error: "voice_unavailable" });
+      assert.deepEqual(JSON.parse(body), { ok: false, error: "voice_unavailable", reason: "bad_audio" });
       assert.ok(!body.includes("do not read"));
     }
     assert.equal(fs.readFileSync(outside, "utf8"), "do not read", "the outside file is untouched");
@@ -761,18 +764,18 @@ test("speak: never reads or deletes a file outside the speech directory (travers
 });
 
 test("speak: a tool refusal or a tool the policy does not allow is voice_unavailable (503); no engine is 502", async () => {
-  for (const mode of ["refuse", "not_allowed"]) {
+  for (const [mode, reason] of [["refuse", "unconfigured"], ["not_allowed", "tool_denied"]]) {
     ttsMode = mode;
     const r = await speak({ text: "مرحبا" });
     assert.equal(r.status, 503, mode);
-    assert.deepEqual(await r.json(), { ok: false, error: "voice_unavailable" });
+    assert.deepEqual(await r.json(), { ok: false, error: "voice_unavailable", reason });
   }
   ttsMode = "ok";
   const down = await mount({ gatewayUrl: "http://127.0.0.1:9", stateDir });
   try {
     const r = await speak({ text: "مرحبا" }, { b: down.b });
     assert.equal(r.status, 502);
-    assert.deepEqual(await r.json(), { ok: false, error: "engine_unavailable" });
+    assert.deepEqual(await r.json(), { ok: false, error: "engine_unavailable", reason: "engine_error" });
   } finally { down.close(); }
 });
 
@@ -780,7 +783,7 @@ test("voice routes answer 503 voice_unavailable when the wrapper gives no state 
   const b = base.replace("/app/v1", "/nocall/v1");
   const s = await speak({ text: "مرحبا" }, { b });
   assert.equal(s.status, 503);
-  assert.deepEqual(await s.json(), { ok: false, error: "voice_unavailable" });
+  assert.deepEqual(await s.json(), { ok: false, error: "voice_unavailable", reason: "unconfigured" });
   const t = await upload(AUDIO, "audio/webm", { b });
   assert.equal(t.status, 503);
   assert.deepEqual(await t.json(), { ok: false, error: "voice_unavailable" });

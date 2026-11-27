@@ -25,6 +25,7 @@ import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { createAppBridge, parseTranscribeOutput } from "./app-bridge.js";
 import { CONTROL_READ_RPC, CONTROL_WRITE_RPC, validateControlRpc } from "./app-control.js";
 import { createGatewayLink } from "./gateway-link.js";
+import { signingConfigFromEnv } from "./app-bridge-signing.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
@@ -742,9 +743,13 @@ const appBridge = createAppBridge({
   stateDir: STATE_DIR,
   workspaceDir: WORKSPACE_DIR,
   transcribe: appBridgeTranscribe,
+  // Optional request signing ("basht-bridge-v1"): everything unset = off, exactly as before. See docs/BASHT_APP_BRIDGE.md ("Signing").
+  signing: signingConfigFromEnv(process.env, (msg) => log.warn("app-bridge", msg)),
 });
 if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
+delete process.env.BASHT_BRIDGE_SIGNING_SECRET; // same for the signing secrets
+delete process.env.BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS;
 if (appBridge) app.use("/app/v1", appBridge);
 else app.use("/app/v1", (_req, res) => res.status(404).json({ ok: false, error: "not_enabled" }));
 
