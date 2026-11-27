@@ -605,6 +605,8 @@ function isGatewayReady() {
 async function restartGateway() {
   await stopGatewayProcess();
   gatewayRestartCount = 0;
+  // Also after first-time onboarding / a raw config save: the app bridge needs the gateway's chat endpoint (no-op without the bridge).
+  await ensureAppChatEndpoint();
   return ensureGatewayRunning();
 }
 

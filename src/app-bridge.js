@@ -112,15 +112,14 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store");
+    const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
+    // A valid token always passes: anonymous failures must never lock the owner's app out (they only slow down guessing).
+    if (m && safeEqual(m[1].trim(), appToken)) return next();
     const t = now();
     if (t - failures.windowStart > 60_000) failures = { windowStart: t, count: 0 };
-    if (failures.count >= AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
-    const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
-    if (!m || !safeEqual(m[1].trim(), appToken)) {
-      failures.count += 1;
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    next();
+    failures.count += 1;
+    if (failures.count > AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
+    return res.status(401).json({ ok: false, error: "unauthorized" });
   });
   router.use(express.json({ limit: "64kb" }));
 

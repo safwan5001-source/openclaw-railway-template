@@ -102,6 +102,12 @@ test("requires the app token; the gateway token is not accepted from outside", a
   assert.equal(ok.json.appSession, APP_SESSION_KEY);
 });
 
+test("failed attempts are throttled, but never lock out the valid token", async () => {
+  for (let i = 0; i < 25; i++) await call("/status", { token: "wrong-token-" + i });
+  assert.equal((await call("/status", { token: "wrong-token-x" })).status, 429);
+  assert.equal((await call("/status")).status, 200, "the owner's app keeps working during an anonymous flood");
+});
+
 test("lists only the owner's own conversations; never groups, other people or subagents", async () => {
   const r = await call("/sessions");
   assert.equal(r.status, 200);
