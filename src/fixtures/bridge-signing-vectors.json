@@ -1,0 +1,68 @@
+{
+  "spec": "basht-bridge-v1",
+  "note": "Test-only secrets. canonical = basht-bridge-v1 \\n METHOD \\n request-target \\n timestamp \\n nonce \\n sha256-hex(body). signature = v1= + hex(HMAC-SHA256(secret, canonical)).",
+  "currentSecret": "test-only-signing-secret-0123456789abcdef",
+  "previousSecret": "test-only-previous-secret-fedcba9876543210",
+  "cases": [
+    {
+      "name": "get-with-query",
+      "method": "GET",
+      "target": "/app/v1/history?key=agent%3Amain%3Aapp%3Aowner&limit=50",
+      "timestamp": 1795800000,
+      "nonce": "n-get-0000000001",
+      "bodyBase64": "",
+      "contentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signedWith": "current",
+      "canonical": "basht-bridge-v1\nGET\n/app/v1/history?key=agent%3Amain%3Aapp%3Aowner&limit=50\n1795800000\nn-get-0000000001\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "v1=dc29e73f5f4e8897ffb98cb7fa249146d33c2c41350f7c9659e4ad78b0464fca"
+    },
+    {
+      "name": "post-json",
+      "method": "POST",
+      "target": "/app/v1/send",
+      "timestamp": 1795800001,
+      "nonce": "n-post-000000002",
+      "bodyBase64": "eyJtZXNzYWdlIjoi2YXYsdit2KjYpyJ9",
+      "contentSha256": "57aa3803970634c1bb45e4f9ee98c29a757833261b47ef38d834d331a74b3039",
+      "signedWith": "current",
+      "canonical": "basht-bridge-v1\nPOST\n/app/v1/send\n1795800001\nn-post-000000002\n57aa3803970634c1bb45e4f9ee98c29a757833261b47ef38d834d331a74b3039",
+      "signature": "v1=67d4672e41ea13edfd0061b9d6d1bdac27e8a7b9715346d9f11e111c95f1fec2"
+    },
+    {
+      "name": "post-empty-body",
+      "method": "POST",
+      "target": "/app/v1/new",
+      "timestamp": 1795800002,
+      "nonce": "n-empty-000000003",
+      "bodyBase64": "",
+      "contentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signedWith": "current",
+      "canonical": "basht-bridge-v1\nPOST\n/app/v1/new\n1795800002\nn-empty-000000003\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "v1=6672d3863c60aecb5d787028a51ead2c115cd07c0b650690871355cdad4678c4"
+    },
+    {
+      "name": "post-binary-audio",
+      "method": "POST",
+      "target": "/app/v1/transcribe",
+      "timestamp": 1795800003,
+      "nonce": "n-audio-000000004",
+      "bodyBase64": "AAECA/r7/P3+/w==",
+      "contentSha256": "623bf06d7016a00a36589e7cb02a6aaea6339e3fb9040a9252eb59485a65b1f7",
+      "signedWith": "current",
+      "canonical": "basht-bridge-v1\nPOST\n/app/v1/transcribe\n1795800003\nn-audio-000000004\n623bf06d7016a00a36589e7cb02a6aaea6339e3fb9040a9252eb59485a65b1f7",
+      "signature": "v1=5eea2aa787b86713e6fd1add726cd8f39299cc59d59313bad58cc361a45bd7da"
+    },
+    {
+      "name": "previous-secret",
+      "method": "POST",
+      "target": "/app/v1/speak",
+      "timestamp": 1795800004,
+      "nonce": "n-prev-0000000005",
+      "bodyBase64": "eyJ0ZXh0Ijoi2KfYrtiq2KjYp9ixIn0=",
+      "contentSha256": "867e8e22ff7a614022aef2853e6751261e207ca3e4187ba244b8f61a53f32c49",
+      "signedWith": "previous",
+      "canonical": "basht-bridge-v1\nPOST\n/app/v1/speak\n1795800004\nn-prev-0000000005\n867e8e22ff7a614022aef2853e6751261e207ca3e4187ba244b8f61a53f32c49",
+      "signature": "v1=8bdc10c986822796c7dfaca27c0b6d06b93141bfec5a6e36ede9720289d9a1c5"
+    }
+  ]
+}
