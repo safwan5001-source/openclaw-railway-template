@@ -89,6 +89,9 @@ export function registerConvoRoutes(router, ctx) {
   const lock = ctx.resetState;
 
   router.post("/new", async (_req, res) => {
+    try { await reset(res); } finally { res.locals?.resetSettled?.(); } // app-bridge holds the settings queue until here
+  });
+  async function reset(res) {
     if (needsCall(res)) return;
     if (lock.active || ctx.turnRunning()) return res.status(409).json({ ok: false, error: "busy" });
     lock.active = true;
@@ -116,7 +119,7 @@ export function registerConvoRoutes(router, ctx) {
       if (err?.refused) return res.status(400).json({ ok: false, error: "rejected" });
       ctx.fail(res, err, "new");
     } finally { lock.active = false; }
-  });
+  }
 
   let searches = [];
   router.get("/search", async (req, res) => {

@@ -781,15 +781,15 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } };
   // «محادثة جديدة» joins the settings queue (serial): a reset never interleaves with a model/thinking/fast write, and the
   // describe cache is forgotten once it is done (serial's finally), so GET /model never shows pre-reset usage.
-  // The response is watched from the start: a client that gives up while the reset waits in the queue (its close already
-  // fired) is skipped when its turn comes, so the queue never waits for events that will not fire again.
+  // The queue slot is held until the reset HANDLER has finished (it signals through res.locals.resetSettled, in its finally),
+  // not until the response closes: a client that leaves mid-reset must not let a settings write run beside the reset.
+  // A client that gave up while the reset still waited in the queue (its close already fired) is skipped when its turn comes.
   router.post("/new", (req, res, next) => {
     let gone = false;
-    const done = new Promise((resolve) => { res.once("finish", resolve); res.once("close", () => { gone = true; resolve(); }); });
+    res.once("close", () => { gone = true; });
     return serial(() => {
       if (gone || res.destroyed || res.writableEnded) return undefined; // abandoned while queued: nothing to reset for
-      next();
-      return done;
+      return new Promise((resolve) => { res.locals.resetSettled = resolve; next(); });
     });
   });
   registerConvoRoutes(router, convoCtx);

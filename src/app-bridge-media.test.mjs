@@ -463,6 +463,27 @@ test("new conversation abandoned while queued: the settings queue is released (l
   await waitRun(send.json.runId);
 });
 
+// Review (Codex, integration PR, round 2): a reset that had already STARTED released the queue when its client went away,
+// so a model/thinking/fast write ran beside the reset. The queue slot is held until the reset handler itself finishes.
+test("new conversation started, then abandoned: a settings write waits for the reset to finish", async () => {
+  describeDelay = 150;
+  const from = rpc.length;
+  try {
+    const ac = new AbortController();
+    const reset = fetch(base + "/new", { method: "POST", headers: { authorization: `Bearer ${APP_TOKEN}` }, signal: ac.signal }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 40)); // the reset is under way (its describe is in flight)
+    ac.abort();
+    await reset;
+    await new Promise((r) => setTimeout(r, 10));
+    const write = await call("/thinking", { method: "POST", body: { level: "high" } });
+    assert.equal(write.status, 400, "the fake session offers no thinking levels");
+  } finally { describeDelay = 0; }
+  const calls = rpc.slice(from).map((c) => c.method);
+  const resetAt = calls.indexOf("sessions.reset");
+  assert.ok(resetAt > 0, `the started reset completed (${calls.join(", ")})`);
+  assert.ok(calls.slice(1, resetAt).every((m) => m !== "sessions.describe"), `no settings describe before the reset: ${calls.join(", ")}`);
+});
+
 test("media roots are resolved lazily: a root created after start is honoured", async () => {
   const late = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-late-"));
   const lateState = path.join(late, "state"); const lateWs = path.join(late, "workspace");
