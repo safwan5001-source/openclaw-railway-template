@@ -205,10 +205,15 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
 
   /** After (re)connecting: the pending approvals are read again, and any that arrived while the link was down enter the ring. */
   async function resync() {
+    // Only approvals known BEFORE this resync can be forgotten, and only for kinds whose list was actually read: one that
+    // arrives as a live event while the lists are being read stays pending (it is simply not in an earlier list answer).
+    const before = new Map([...pending].map(([id, p]) => [id, p.kind]));
     const seen = new Set();
+    const read = new Set();
     for (const [kind, method] of Object.entries(LIST_METHOD)) {
       let rows;
       try { rows = await rpc(method, {}); } catch { continue; }
+      read.add(kind);
       for (const r of Array.isArray(rows) ? rows : []) {
         const v = approvalView(r, kind);
         if (!v) continue;
@@ -216,7 +221,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
         trackApproval(v, r.request?.sessionKey);
       }
     }
-    for (const id of [...pending.keys()]) if (!seen.has(id)) pending.delete(id);
+    for (const [id, kind] of before) if (!seen.has(id) && read.has(kind) && pending.get(id)?.kind === kind) pending.delete(id);
   }
 
   function dropped(reason) {

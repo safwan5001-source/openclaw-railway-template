@@ -1,10 +1,14 @@
 // BASHT gateway link (B0): handshake, scopes, event ring, approvals tracking, reconnection. A FAKE WebSocket (in this file)
 // stands in for the OpenClaw gateway; shapes are the ones the real 2026.11.10 gateway sent in the lab (docs/BASHT_APP_BRIDGE.md).
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { APP_SESSION_KEY, LINK_CAPS, LINK_METHODS, LINK_SCOPES, approvalView, createGatewayLink, normalizeEvent, sessionKind } from "./gateway-link.js";
 
 const TOKEN = "synthetic-gateway-token-0123456789abcdef";
+// The link's own timers are unref'd by design (they must never keep the wrapper alive), so a test awaiting one of them needs
+// something else holding the event loop open — otherwise it passes or is cancelled depending on what ran before it.
+const keepAlive = setInterval(() => {}, 1000);
+after(() => clearInterval(keepAlive));
 const tick = () => new Promise((r) => setImmediate(r));
 const until = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error("timeout"); await new Promise((r) => setTimeout(r, 5)); } };
 
@@ -189,6 +193,25 @@ test("approvals: tracked from events, deduplicated, resynced after a reconnect, 
   link.kick();
   await until(() => link.isUp());
   await until(() => link.status().pendingApprovals === 0);
+  link.stop();
+});
+
+test("resync never forgets an approval that arrived as a live event while the lists were being read", async () => {
+  let releasePlugin;
+  const gw = fakeGateway({
+    lists: { "exec.approval.list": [], "openclaw.approval.list": [] },
+    onReq: (f, reply) => { if (f.method === "plugin.approval.list") { releasePlugin = () => reply(true, []); return true; } },
+  });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp() && typeof releasePlugin === "function");
+  const live = execRequested("appr-live-1");
+  gw.last().event("exec.approval.requested", live); // exec.approval.list has already answered (empty)
+  await tick();
+  releasePlugin();
+  await tick(); await tick();
+  assert.equal(link.pendingKind("appr-live-1"), "exec", "still pending after the resync finished");
+  assert.equal(link.approvalDeadline(APP_SESSION_KEY), live.expiresAtMs);
   link.stop();
 });
 
