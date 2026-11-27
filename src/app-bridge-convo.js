@@ -170,7 +170,10 @@ export async function anchoredPage(ctx, key, cursor, mode) {
   const messages = mode === "around" ? rows : rows.slice(0, include ? at + 1 : at);
   let earlier = null;
   const oldest = messages.map(rowId).find(Boolean);
-  if (at >= PAGE && oldest) earlier = seg ? `${oldest}.${seg}` : oldest; // more rows in this segment
+  // more rows in this segment? OpenClaw says so itself (anchor.hasOlder: the window does not start at the transcript's first
+  // message); counting raw rows instead offered an empty extra page when tool rows filled the window. Older engines: the count.
+  const hasOlder = typeof r?.anchor?.hasOlder === "boolean" ? r.anchor.hasOlder : at >= PAGE;
+  if (hasOlder && oldest) earlier = seg ? `${oldest}.${seg}` : oldest;
   else if (seg && key === ctx.appKey) { // this segment is done: the conversation before the previous reset, if the bridge made it
     const list = ctx.ledger.list(); const i = list.findIndex((x) => x.resetId === seg);
     const done = i >= 0 ? list[i].anchorId : null;
