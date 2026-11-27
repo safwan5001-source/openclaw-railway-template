@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { createAppBridge } from "./app-bridge.js";
+import { CONTROL_READ_RPC, CONTROL_WRITE_RPC, validateControlRpc } from "./app-control.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
@@ -645,11 +646,13 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, gateway: health.gateway });
 });
 
-// The only gateway RPCs the app bridge may make (model control). Run as `openclaw gateway call` against the local gateway;
+// The only gateway RPCs the app bridge may make: model control, plus app control (B5–B7: read methods and the two cron
+// switches, whose params are re-checked here). Run as `openclaw gateway call` against the local gateway;
 // the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
-const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch"]);
+const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch", ...CONTROL_READ_RPC, ...CONTROL_WRITE_RPC]);
 function appBridgeGatewayCall(method, params) {
   if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
+  if (!validateControlRpc(method, params)) return Promise.reject(new Error(`gateway call ${method}: params not allowed`));
   const args = clawArgs(["gateway", "call", method, "--json", "--port", String(INTERNAL_GATEWAY_PORT),
     "--timeout", "15000", "--params", JSON.stringify(params ?? {})]);
   return new Promise((resolve, reject) => {

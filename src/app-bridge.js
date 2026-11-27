@@ -11,6 +11,7 @@
 //   POST /app/v1/model { model }   -> pins a listed, available model on the app session ("default" clears the pin)
 //   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
 //   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
+//   /app/v1/automations*, /usage, /memory/*, /capabilities -> src/app-control.js (B5–B7: read-mostly views, two cron switches)
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -28,6 +29,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import express from "express";
 import { whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
+import { createAppControl } from "./app-control.js";
 
 export const APP_SESSION = "app:owner";
 export const APP_SESSION_KEY = "agent:main:app:owner";
@@ -472,6 +474,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       res.json({ ok: true, fast: { mode } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
   }));
+
+  // B5–B7: automations, usage, memory (read-only) and capabilities — same token gate, own fixed shapes (src/app-control.js)
+  router.use(createAppControl({ gatewayCall, appSessionKey: APP_SESSION_KEY, now, log }));
 
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));

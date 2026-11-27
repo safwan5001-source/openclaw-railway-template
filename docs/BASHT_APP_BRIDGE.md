@@ -1,4 +1,4 @@
-# BASHT app bridge (C2 + C4 + M)
+# BASHT app bridge (C2 + C4 + M + B5–B7)
 
 How the BASHT app (`safwan-smart-assistant`) reads the owner's conversations and chats with BASHT live. The code is in
 `src/app-bridge.js` and the tests are in `src/app-bridge.test.mjs`.
@@ -26,6 +26,17 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `POST /app/v1/model {model}` | Pins a listed model on the app session; `"default"` clears the pin | `sessions` tool `patch` (app session) |
 | `POST /app/v1/thinking {level}` | Sets a thinking level the **current** model offers; `"default"` clears it | RPC `sessions.patch {thinkingLevel}` (app session) |
 | `POST /app/v1/fast {mode}` | `"on"`, `"off"` or `"default"`; `"on"` only if the current model supports fast mode | RPC `sessions.patch {fastMode}` (app session) |
+
+| `GET /app/v1/automations` | BASHT's scheduled jobs, fixed shape; cached 20 s | RPC `cron.list {includeDisabled, limit: 200}` |
+| `GET /app/v1/automations/:id/runs` | That job's recent finished runs (≤ 20), short summaries | RPC `cron.runs {scope: "job", id}` |
+| `POST /app/v1/automations/:id/run` | Runs an owner-created job now | RPC `cron.run {id, mode: "force"}` (admin, CLI) |
+| `POST /app/v1/automations/:id/enabled {enabled}` | Enables or disables an owner-created job | RPC `cron.update {id, patch: {enabled}}` (admin, CLI) |
+| `GET /app/v1/usage` | App-session tokens/cost (30 days, today) and all-agent 30-day totals; cached 60 s | RPC `sessions.usage {key: app, range: "30d"}` + `usage.cost` |
+| `GET /app/v1/memory/status` | Index state and memory-file counts, MEMORY.md / USER.md presence; cached 30 s | RPC `memory.status` + `agents.files.list` |
+| `GET /app/v1/memory/search?q=&page=` | Search over memory files only (never transcripts), ≤ 10 per page, 3 pages | RPC `memory.search {sources: ["memory"]}` |
+| `GET /app/v1/memory/item?ref=&part=` | One hit's file text, by an opaque ref this bridge issued (30 min) | RPC `memory.get {reference}` |
+| `GET /app/v1/memory/file?name=&part=` | `MEMORY.md` or `USER.md` only, read-only | RPC `agents.files.get` |
+| `GET /app/v1/capabilities` | Channels, skills ready/missing, effective tools of the app session, plugins; cached 60 s | RPC `channels.status`, `skills.status`, `tools.effective`, `tools.catalog` (10 min), `plugins.list` |
 
 `/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Assistant messages in
 `/history` carry `provider` and `model`. The notice OpenClaw writes when it switches models carries
@@ -94,6 +105,35 @@ body is ignored.
 - **No parsing of `session_status` text.** Its `↪️ Fallback` line appears only while a fallback is still active.
   `sessions.describe` and the transcript record give the same facts in structured form.
 
+## App control (B5–B7): `src/app-control.js`
+
+Mounted by the bridge after its token check (same gate, same JSON 404 for unknown paths). Every gateway call goes through the
+wrapper's `gatewayCall`, whose allowlist (`APP_BRIDGE_RPC` in `server.js`) now holds exactly the read methods above plus
+`cron.run` and `cron.update`.
+
+- **Fixed shapes.** Each route rebuilds its rows. Never passed on: server paths (`storePath`, `sessionFile`, `filePath`,
+  `baseDir`, `workspace`, `dbPath`), session keys, run ids, delivery targets, account ids or phone numbers, payload commands and
+  working directories, managed-job prompts, `config.get`, raw engine error text. Free text that does reach the app (run summaries,
+  last errors, skill descriptions) has absolute paths and secret-shaped tokens replaced by `…`.
+- **Two writes only, built by the bridge.** `cron.run {id, mode: "force"}` and `cron.update {id, patch: {enabled}}`. The id must
+  be one `cron.list` returned; engine-managed jobs (`declarationKey`, e.g. memory "dreaming") answer 400 `system_job`; a job
+  already running answers 409 `busy`. The wrapper re-checks the exact params (`validateControlRpc`) before it spawns the CLI. The
+  answer to enable/disable is the engine's state re-read after the write, never the requested one. Writes run one at a time.
+  Not offered: create, edit, delete, schedule changes.
+- **Memory is read-only.** Search requests `sources: ["memory"]` (session transcripts can hold other people's messages). A hit's
+  engine reference stays in the bridge; the app receives an opaque 24-hex `ref`, valid 30 minutes. The engine re-checks that
+  the path is an allowed memory file. Text is paged in parts of 20,000 characters (at most 10). Only `MEMORY.md` and `USER.md`
+  can be opened directly.
+- **Capabilities are read-only.** Channels report `configured / linked / running / connected / lastConnectedAt` and an issue
+  *kind* only. Skills: `ready`, `missing` (missing tool and environment-variable names, config count; never values), and
+  `unavailable` (disabled, blocked, other platform). Tools: the app session's effective tools grouped by the engine's own
+  catalog groups. Plugins: enabled, needs-setup and failed names. No toggles.
+- **Cost control.** Each `gateway call` spawns the CLI (~1.6 s, ~1.5 s CPU), so reads are cached (20–60 s, catalog 10 min),
+  parallel reads of one view share a call, and this module never runs more than two engine calls at once. A cold
+  `/capabilities` takes ~12 s in the lab; warm reads are instant.
+- **Errors.** No `gatewayCall`: 503 `not_available`. Engine unreachable: 502 `engine_unavailable`. A gateway refusal on a write:
+  400 `rejected`. One failing section of `/capabilities` or `/usage` is `null`; the others still answer.
+
 ## Rules
 
 - **Off by default.** The bridge is enabled only when `BASHT_APP_TOKEN` is at least 32 characters long. Without it, `/app/v1/*` returns 404 and nothing else changes.
@@ -146,3 +186,16 @@ Chat and conversations (C2 + C4):
 - Sessions and history follow the allowlist.
 - Anonymous public `/tools/invoke` and `/v1/chat/completions` still return 401.
 - No token appears in the logs.
+
+App control (B5–B7, lab-cc: its own state, wrapper 8499 / gateway 19190, the real OpenClaw 2026.11.10, mock model; then the app
+over BFF → API → HTTPS bridge, 22/22 checks):
+- Three owner jobs created with `openclaw automations add` plus the managed "Memory Dreaming Promotion" job: `/automations`
+  listed all four in the fixed shape; no paths or session keys in the response.
+- Disable → enable from the Tasks screen reached the engine (`cron.list` showed the change); "run now" produced a new finished
+  run in `cron.runs` (status, duration, summary); running the managed job answered `system_job`.
+- `/usage`: app session 11,352 tokens; the unpriced `xai/grok-3-fast` made the cost "unknown", not $0.
+- Memory (`memory.search.provider: "none"`, keyword index): status `ok` with 6 memory files; a search for «النخبة» returned
+  `MEMORY.md` and `2026-11-26.md`; the opaque ref opened the daily file; `AGENTS.md` and a traversal path were refused.
+- `/capabilities`: 25 of 58 skills ready, 24 with missing requirements, 66 effective tools in 17 groups, 47 enabled plugins;
+  no channel in the lab (WhatsApp shows "not linked"). No `/tmp/` path or redaction marker in any response.
+
