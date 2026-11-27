@@ -661,7 +661,9 @@ function appBridgeGatewayCall(method, params) {
       try { j = JSON.parse(stdout); } catch { /* not JSON */ }
       if (!j || typeof j !== "object" || j.ok === false) {
         const type = typeof j?.error?.type === "string" ? j.error.type : err?.code ?? "no_json";
-        return reject(new Error(`gateway call ${method} failed (${type})`));
+        const e = new Error(`gateway call ${method} failed (${type})`);
+        e.refused = !!j && j.ok === false; // the gateway answered and said no (a refusal), as opposed to not answering
+        return reject(e);
       }
       resolve(j);
     });

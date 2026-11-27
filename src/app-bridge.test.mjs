@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
-import { APP_SESSION, APP_SESSION_KEY, createAppBridge, isReadable, mapModel, messageText, modelRef, safeStr } from "./app-bridge.js";
+import { APP_SESSION, APP_SESSION_KEY, assistantMeta, createAppBridge, isReadable, mapModel, messageText, modelRef, safeStr } from "./app-bridge.js";
 
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
 const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
@@ -432,4 +432,63 @@ test("model helpers", () => {
   assert.equal(safeStr({ x: 1 }), null);
   assert.equal(mapModel({ provider: "p" }), null);
   assert.deepEqual(mapModel({ id: "m", provider: "p", available: true, thinkingLevels: ["off", { id: "low" }, 7] }).thinkingLevels, ["off", "low"]);
+});
+
+// ── review fixes (M) ──────────────────────────────────────────────────────
+test("a 'restored' notice (primary back) is never reported as a fallback", () => {
+  const restored = { openclawDeliveryMirror: { kind: "model-fallback", phase: "restored", fromModel: "mock/echo2", toModel: "mock/echo", reason: null } };
+  assert.equal(assistantMeta(restored).fallback, undefined);
+  const fell = { openclawDeliveryMirror: { kind: "model-fallback", fromModel: "mock/echo", toModel: "mock/echo2", reason: "server_error" } };
+  assert.deepEqual(assistantMeta(fell).fallback, { from: "mock/echo", to: "mock/echo2", reason: "server_error" });
+});
+
+test("model source: the owner's pin vs OpenClaw's automatic fallback pin", async () => {
+  appSession = { ...freshSession(), modelProvider: "mock", model: "echo2", modelOverrideSource: "auto" };
+  assert.equal((await call("/model")).json.model.source, "fallback");
+  appSession.modelOverrideSource = "user";
+  assert.equal((await call("/model")).json.model.source, "override");
+  appSession.modelOverrideSource = "inherited";
+  assert.equal((await call("/model")).json.model.source, "default");
+});
+
+test("switching model clears a thinking level / fast mode the new model does not offer, and says so", async () => {
+  appSession = { ...freshSession(), modelProvider: "xai", model: "grok-3", thinkingLevels: LEVELS["xai/grok-3"], thinkingLevel: "high",
+    effectiveFastMode: true, effectiveFastModeSource: "session" };
+  let r = await post("/model", { model: "mock/echo2" }); // echo2: levels ["off"], no fast mode
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json.reset, { thinking: true, fast: true });
+  assert.equal(appSession.thinkingLevel, undefined);
+  assert.equal(appSession.effectiveFastMode, false);
+  appSession.thinkingLevel = "off";
+  r = await post("/model", { model: "mock/echo" }); // echo offers "off": kept
+  assert.deepEqual(r.json.reset, { thinking: false, fast: false });
+  assert.equal(appSession.thinkingLevel, "off");
+  assert.deepEqual(otherPatched, []);
+});
+
+test("unknown /app/v1 paths end in the bridge (JSON 404), never at the gateway proxy", async () => {
+  const before = seen.length;
+  const r = await call("/no-such-route");
+  assert.equal(r.status, 404);
+  assert.deepEqual(r.json, { ok: false, error: "not_found" });
+  assert.equal(seen.length, before, "nothing forwarded");
+  assert.equal((await call("/no-such-route", { token: "wrong" })).status, 401, "auth still comes first");
+});
+
+test("a gateway refusal of a patch is 'rejected' (400), not an engine outage", async () => {
+  const refusing = express();
+  refusing.use(express.json());
+  refusing.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: gwUrl, gatewayToken: GW_TOKEN, configPath: "/nonexistent",
+    gatewayCall: async (method, params) => {
+      if (method === "sessions.patch") { const e = new Error("gateway call sessions.patch failed (invalid_request)"); e.refused = true; throw e; }
+      return fakeGatewayCall(method, params);
+    } }));
+  const srv = refusing.listen(0);
+  try {
+    appSession = freshSession();
+    const r = await fetch(`http://127.0.0.1:${srv.address().port}/app/v1/thinking`, { method: "POST",
+      headers: { authorization: `Bearer ${APP_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ level: "high" }) });
+    assert.equal(r.status, 400);
+    assert.deepEqual(await r.json(), { ok: false, error: "rejected" });
+  } finally { srv.close(); }
 });

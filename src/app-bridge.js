@@ -84,7 +84,8 @@ export function mapModel(r) {
 export function assistantMeta(m) {
   const out = { provider: safeStr(m?.provider, 100), model: safeStr(m?.model, MAX_MODEL_REF) };
   const fb = m?.openclawDeliveryMirror;
-  if (fb && fb.kind === "model-fallback") {
+  // OpenClaw writes the same kind with phase "restored" when the selected model is back: that is not a fallback
+  if (fb && fb.kind === "model-fallback" && fb.phase !== "restored") {
     out.fallback = { from: safeStr(fb.fromModel, MAX_MODEL_REF), to: safeStr(fb.toModel, MAX_MODEL_REF), reason: safeStr(fb.reason, 60) };
   }
   return out;
@@ -362,13 +363,15 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const msgs = Array.isArray(hist?.messages) ? hist.messages : [];
       const reply = [...msgs].reverse().find((m) => m?.role === "assistant" && !isMirror(m)) ?? null;
       const replyRun = reply?.__openclaw?.runId;
-      const mirror = replyRun ? msgs.find((m) => m?.openclawDeliveryMirror?.kind === "model-fallback" && m.openclawDeliveryMirror.runId === replyRun) : null;
+      const mirror = replyRun ? msgs.findLast((m) => m?.openclawDeliveryMirror?.kind === "model-fallback" && m.openclawDeliveryMirror.phase !== "restored"
+        && m.openclawDeliveryMirror.runId === replyRun) : null;
       const last = [...runs.values()].at(-1) ?? null;
       res.json({
         ok: true,
         sessionKey: APP_SESSION_KEY,
         model: { id, provider: safeStr(s.modelProvider, 100), model: safeStr(s.model, MAX_MODEL_REF),
-          source: s.modelOverrideSource ? "override" : "default" },
+          // "user" = the owner pinned it; "auto" = OpenClaw's temporary runtime-fallback pin (never shown as the owner's choice)
+          source: s.modelOverrideSource === "user" ? "override" : s.modelOverrideSource === "auto" ? "fallback" : "default" },
         thinking: { level: safeStr(s.thinkingLevel, 40), default: safeStr(s.thinkingDefault, 40),
           effective: safeStr(s.thinkingLevel, 40) ?? safeStr(s.thinkingDefault, 40), levels: levelIds(s.thinkingLevels) },
         fast: { supported: row ? row.supportsFastMode : null, enabled: bool(s.effectiveFastMode), source: safeStr(s.effectiveFastModeSource, 40) },
@@ -395,11 +398,19 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const d = await invoke("sessions", { action: "patch", sessionKey: APP_SESSION_KEY, model: want });
       if (d?.status !== "updated" || d?.sessionKey !== APP_SESSION_KEY) return bad(res, "rejected");
       const r = d.resolved ?? {};
+      // A thinking level or fast mode the NEW model does not offer would stay stored (the gateway keeps it) and be shown while
+      // the provider ignores it: clear it, and say so.
+      const id = modelRef(r.modelProvider, r.model);
+      const [s, { rows }] = await Promise.all([describeApp(), listModels()]);
+      const row = rows.find((m) => m.id === id);
+      const reset = { thinking: false, fast: false };
+      if (s.thinkingLevel && row && !row.thinkingLevels.includes(s.thinkingLevel)) { await patchApp({ thinkingLevel: null }); reset.thinking = true; }
+      if (s.effectiveFastModeSource === "session" && s.effectiveFastMode === true && row && !row.supportsFastMode) { await patchApp({ fastMode: null }); reset.fast = true; }
       // No override/default flag here: pinning the configured primary is stored as no override. GET /model reports it.
-      res.json({ ok: true, model: { id: modelRef(r.modelProvider, r.model), provider: safeStr(r.modelProvider, 100), model: safeStr(r.model, MAX_MODEL_REF) },
-        thinkingLevel: safeStr(r.thinkingLevel, 40) });
+      res.json({ ok: true, model: { id, provider: safeStr(r.modelProvider, 100), model: safeStr(r.model, MAX_MODEL_REF) },
+        thinkingLevel: reset.thinking ? null : safeStr(r.thinkingLevel, 40), reset });
     } catch (err) {
-      if (err?.toolError) return bad(res, "rejected");
+      if (err?.toolError || err?.refused) return bad(res, "rejected");
       fail(res, err, "model patch");
     }
   });
@@ -412,7 +423,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (level !== "default" && !levelIds((await describeApp()).thinkingLevels).includes(level)) return bad(res, "unsupported_level");
       await patchApp({ thinkingLevel: level === "default" ? null : level });
       res.json({ ok: true, thinking: { level: level === "default" ? null : level } });
-    } catch (err) { fail(res, err, "thinking patch"); }
+    } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "thinking patch"); }
   });
 
   router.post("/fast", async (req, res) => {
@@ -428,8 +439,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       }
       await patchApp({ fastMode: FAST_MODES[mode] });
       res.json({ ok: true, fast: { mode } });
-    } catch (err) { fail(res, err, "fast patch"); }
+    } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
   });
 
+  // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
+  router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));
   return router;
 }

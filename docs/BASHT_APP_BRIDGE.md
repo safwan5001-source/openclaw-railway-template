@@ -59,15 +59,20 @@ body is ignored.
     model's catalog row has `supportsFastMode: true`. `"off"` and `"default"` are always allowed, so an old override can be
     cleared after a model change.
 - **State.** `GET /model` returns:
-  - `model {id, provider, model, source: "override" | "default"}`. The source comes from `modelOverrideSource`. Pinning the
-    configured primary counts as `default`.
+  - `model {id, provider, model, source: "override" | "fallback" | "default"}`, from `modelOverrideSource`: `"user"` is the
+    owner's pin (`override`); `"auto"` is OpenClaw's temporary runtime-fallback pin (`fallback`, never shown as the owner's
+    choice). Pinning the configured primary counts as `default`.
   - `thinking {level, default, effective, levels}`.
   - `fast {supported, enabled, source}`.
   - `usage {inputTokens, outputTokens, contextTokens, contextWindow}`, from the last run.
   - `lastReply {provider, model}`: who actually answered last.
-  - `fallback {from, to, reason}`: the structured model-switch record for that reply's run, or `null`.
+  - `fallback {from, to, reason}`: the last model-switch record for that reply's run, or `null`. OpenClaw's
+    `phase: "restored"` notice (the selected model is back) is not a fallback and is never reported as one.
   - `lastRun {runId, status, firstTokenMs, totalMs}`.
-- **Errors.** If the engine is unreachable or still starting, the bridge returns 502 `engine_unavailable` and the caller retries.
+- **Switching model** clears a thinking level or fast mode the NEW model does not offer (the gateway would keep it stored and
+  silently ignore it); `POST /model` reports this as `reset {thinking, fast}`.
+- **Errors.** A gateway that answers a patch with an error is a refusal: 400 `rejected`. Unknown `/app/v1/*` paths end in the
+  bridge (JSON 404) and never reach the gateway proxy. If the engine is unreachable or still starting, the bridge returns 502 `engine_unavailable` and the caller retries.
   Right after a gateway start the `sessions` tool briefly returns 400 (`agent-database-inspection-pending`); the bridge reports
   that as 502 too. Without `gatewayCall` the model routes return 503.
 
