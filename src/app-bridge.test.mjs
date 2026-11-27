@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
-import { APP_SESSION, APP_SESSION_KEY, assistantMeta, createAppBridge, isReadable, mapModel, messageText, modelRef, safeStr } from "./app-bridge.js";
+import { APP_SESSION, APP_SESSION_KEY, assistantMeta, capConcurrency, createAppBridge, isReadable, mainIsOwnerOnly, mapModel, messageText, modelRef, readPolicyFromConfig, safeStr } from "./app-bridge.js";
 
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
 const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
@@ -53,7 +53,7 @@ const otherPatched = []; // any write that named a session other than the app's
 async function fakeGatewayCall(method, params) {
   rpc.push({ method, params });
   if (method === "models.list") return { models: MODELS, decisionModels: [{ id: "x" }], accountSelection: { kind: "automatic" } };
-  if (method === "sessions.describe") return { session: params.key === APP_SESSION_KEY ? appSession : null };
+  if (method === "sessions.describe") return { session: params.key === APP_SESSION_KEY ? { ...appSession } : null }; // a snapshot, as the real CLI returns
   if (method === "sessions.patch") {
     if (patchDelay) await new Promise((r) => setTimeout(r, patchDelay));
     timeline.push(`patch:${Object.keys(params).filter((k) => k !== "key").join(",")}`);
@@ -246,6 +246,13 @@ test("send: rejects empty and oversized messages; stop ends a running turn", asy
 
 test("allowlist and text helpers", () => {
   assert.equal(isReadable({ key: `agent:main:whatsapp:default:direct:${OWNER}` }, [OWNER]), true);
+  // review L9: the key is parsed exactly — extra segments or a group marker never pass on a trailing owner number
+  for (const key of [`agent:main:whatsapp:direct:+966511111111:${OWNER}`, `agent:main:whatsapp:group:direct:${OWNER}`,
+    `agent:main:whatsapp:default:x:direct:${OWNER}`, `agent:main:whatsapp:direct:${OWNER}:x`, `agent:main:whatsappx:direct:${OWNER}`]) {
+    assert.equal(isReadable({ key }, [OWNER]), false, key);
+  }
+  assert.equal(isReadable({ key: "agent:main:main" }, [OWNER]), false, "main is not readable unless proven owner-only");
+  assert.equal(isReadable({ key: "agent:main:main" }, [OWNER], true), true);
   assert.equal(isReadable({ key: `agent:main:whatsapp:direct:${OWNER}` }, []), false, "no configured owner: no WhatsApp chat is readable");
   assert.equal(isReadable({ key: "agent:other:main" }, [OWNER]), false);
   assert.equal(messageText({ content: [{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }] }), "a\nb");
@@ -451,9 +458,9 @@ test("a 'restored' notice (primary back) is never reported as a fallback", () =>
 test("model source: the owner's pin vs OpenClaw's automatic fallback pin", async () => {
   appSession = { ...freshSession(), modelProvider: "mock", model: "echo2", modelOverrideSource: "auto" };
   assert.equal((await call("/model")).json.model.source, "fallback");
-  appSession.modelOverrideSource = "user";
+  appSession.modelOverrideSource = "user"; clockOffset += 3_000; // the engine changed it on its own: seen once the short read cache expires
   assert.equal((await call("/model")).json.model.source, "override");
-  appSession.modelOverrideSource = "inherited";
+  appSession.modelOverrideSource = "inherited"; clockOffset += 3_000;
   assert.equal((await call("/model")).json.model.source, "default");
 });
 
@@ -582,4 +589,76 @@ test("a change while this bridge's own turn is starting is refused (even before 
   await waitRun(sent.json.runId);
   assert.equal(appSession.model, "echo", "nothing changed mid-turn");
   assert.equal((await post("/model", { model: "mock/echo2" })).status, 200, "allowed once the turn is over");
+});
+
+// ---------------------------------------------------------------- security review fixes (L6, L9) ----------------------------------------------------------------
+
+test("L9: the main session is readable only while it can hold nobody else's messages", () => {
+  const owners = [OWNER];
+  assert.equal(mainIsOwnerOnly({}, owners), true, "no channel at all: only the Control UI writes there");
+  assert.equal(mainIsOwnerOnly({ session: { dmScope: "per-channel-peer" }, channels: { whatsapp: { dmPolicy: "open" } } }, owners), true, "DMs split per peer");
+  assert.equal(mainIsOwnerOnly({ channels: { whatsapp: { dmPolicy: "pairing" } } }, owners), false, "default dmScope + pairing: other senders merge into main");
+  assert.equal(mainIsOwnerOnly({ session: { dmScope: "main" }, channels: { whatsapp: { dmPolicy: "allowlist", allowFrom: [OWNER, "+966511111111"] } } }, owners), false);
+  assert.equal(mainIsOwnerOnly({ channels: { whatsapp: { dmPolicy: "allowlist", allowFrom: ["whatsapp:966500000001"] } } }, owners), true, "owner-only allowlist");
+  assert.equal(mainIsOwnerOnly({ channels: { whatsapp: { dmPolicy: "allowlist", allowFrom: [OWNER] }, telegram: { dmPolicy: "allowlist", allowFrom: ["123"] } } }, owners), false,
+    "a second DM channel cannot be proven owner-only");
+  assert.equal(mainIsOwnerOnly({ channels: { whatsapp: { dmPolicy: "allowlist", allowFrom: [OWNER] }, discord: { enabled: false, dmPolicy: "open" } } }, owners), true);
+  assert.equal(mainIsOwnerOnly({ channels: { whatsapp: { dmPolicy: "allowlist", allowFrom: [] } } }, owners), false);
+  assert.equal(mainIsOwnerOnly(null, owners), true);
+  const f = path.join(os.tmpdir(), `bridge-policy-${process.pid}.json`);
+  fs.writeFileSync(f, JSON.stringify({ commands: { ownerAllowFrom: [`whatsapp:${OWNER}`] }, channels: { whatsapp: { dmPolicy: "pairing" } } }));
+  try { assert.deepEqual(readPolicyFromConfig(f), { owners: [OWNER], mainReadable: false }); } finally { fs.rmSync(f, { force: true }); }
+  assert.deepEqual(readPolicyFromConfig("/nonexistent/openclaw.json"), { owners: [], mainReadable: false }, "unreadable config fails closed");
+});
+
+test("L9: with other senders admitted, main is neither listed nor readable", async () => {
+  const cfgPath = path.join(dir, "openclaw.json");
+  const original = fs.readFileSync(cfgPath, "utf8");
+  fs.writeFileSync(cfgPath, JSON.stringify({ commands: { ownerAllowFrom: [`whatsapp:${OWNER}`] }, channels: { whatsapp: { dmPolicy: "pairing" } } }));
+  try {
+    assert.deepEqual((await call("/sessions")).json.sessions.map((s) => s.key), [`agent:main:whatsapp:direct:${OWNER}`, APP_SESSION_KEY]);
+    assert.equal((await call(`/history?key=${encodeURIComponent("agent:main:main")}`)).status, 404);
+  } finally { fs.writeFileSync(cfgPath, original); }
+});
+
+test("L6: GET /model shares one sessions.describe for a few seconds; a write makes the next read fresh", async () => {
+  appSession = freshSession();
+  rpc.length = 0;
+  const describes = () => rpc.filter((c) => c.method === "sessions.describe").length;
+  await Promise.all(Array.from({ length: 10 }, () => call("/model")));
+  assert.equal(describes(), 1, "ten concurrent reads, one CLI call");
+  await call("/model");
+  assert.equal(describes(), 1, "a read right after is served from the short cache");
+  assert.equal((await post("/thinking", { level: "high" })).status, 200);
+  const before = describes();
+  assert.equal((await call("/model")).json.thinking.level, "high", "the read after a write is fresh");
+  assert.equal(describes(), before + 1);
+  clockOffset += 3_000;
+  await call("/model");
+  assert.equal(describes(), before + 2, "expires after the short window");
+});
+
+test("L6: a read taken while a settings write is in flight is not served from the cache after the write", async () => {
+  appSession = freshSession();
+  clockOffset += 3_000; // start past any earlier cached read
+  patchDelay = 300;
+  try {
+    const write = post("/thinking", { level: "high" });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal((await call("/model")).json.thinking.level ?? null, appSession.thinkingLevel ?? null);
+    assert.equal((await write).status, 200);
+    assert.equal((await call("/model")).json.thinking.level, "high", "the first read after the write is fresh");
+  } finally { patchDelay = 0; }
+});
+
+test("L6: gateway CLI calls are capped (2 at once, a bounded queue, the rest fail fast)", async () => {
+  let active = 0, peak = 0;
+  const release = [];
+  const slow = capConcurrency(async () => { active++; peak = Math.max(peak, active); await new Promise((r) => release.push(r)); active--; return "ok"; }, 2, 3);
+  const calls = Array.from({ length: 5 }, () => slow());
+  await assert.rejects(slow(), /queue full/);
+  for (let i = 0; i < 5; i++) { await new Promise((r) => setTimeout(r, 5)); release.shift()?.(); }
+  for (let i = 0; i < 5 && release.length; i++) { await new Promise((r) => setTimeout(r, 5)); release.shift()?.(); }
+  assert.deepEqual(await Promise.all(calls), ["ok", "ok", "ok", "ok", "ok"]);
+  assert.equal(peak, 2);
 });

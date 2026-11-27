@@ -104,8 +104,19 @@ body is ignored.
   - Turns always run in `agent:main:app:owner`, whatever the caller sends, never in the WhatsApp chat.
 - **Reads are limited to the owner's own conversations.** Readable sessions are:
   - the app session;
-  - the main session;
-  - the owner's direct WhatsApp chat or chats (owners come from `commands.ownerAllowFrom`).
+  - the owner's direct WhatsApp chat or chats (owners come from `commands.ownerAllowFrom`). The key is parsed exactly:
+    `agent:main:whatsapp:[<account>:]direct:<peer>`, nothing after the peer, and the account segment is never `direct`, `group`,
+    `channel` or `thread`;
+  - the main session (`agent:main:main`), **only while it can hold nobody else's messages** (security review L9). With OpenClaw's
+    default `session.dmScope` (`main`), every admitted direct-message sender (pairing, or an `allowFrom` beyond the owner) lands in
+    the main session, so the bridge reads `openclaw.json` on each call and allows main only when one of these holds:
+    - `session.dmScope` is `per-peer`, `per-channel-peer` or `per-account-channel-peer` (DMs get their own sessions), or
+    - every enabled channel has `dmPolicy: "disabled"`, or is WhatsApp with `dmPolicy: "allowlist"` and an `allowFrom` made only of
+      owners. Any other channel (Telegram, Discord…) or `pairing` / `open` counts as "not owner-only".
+
+    Otherwise main is neither listed nor readable (404). To show it in the app, set `session.dmScope` to a per-peer value (the
+    owner's WhatsApp chat then appears as its own `…:direct:<owner>` conversation) or make WhatsApp an owner-only allowlist.
+    An unreadable config fails closed.
 
   Groups, other people's chats, subagents and cron jobs are never listed or read. History returns text parts only: no tool payloads and no thinking. OpenClaw caps each message at 4,000 characters in `sessions_history`.
 - **Turns are robust.**
@@ -113,10 +124,18 @@ body is ignored.
   - Only one turn runs at a time; a second request gets 409.
   - A turn times out after 15 minutes.
   - The wrapper keeps the last 20 runs in memory.
+- **Engine load (review L6).** Model control spawns the `openclaw gateway call` CLI. At most 2 run at once and 16 wait; more fail at
+  once (502). `GET /model` shares one `sessions.describe` for 2.5 s; any settings write, and the end of a turn, makes the next read
+  fresh. `GET /models` is cached 60 s.
 - **Secrets.**
   - `BASHT_APP_TOKEN` is removed from `process.env` after startup, like `SETUP_PASSWORD`.
   - Comparison is timing-safe.
   - After 20 failed authentications per minute the bridge returns 429.
+
+- **Residual (review L4).** The app's API reaches the bridge over the public domain with one static bearer token (no timestamp,
+  nonce or source restriction). Recommended next step: allow `http://<service>.railway.internal` for `BASHT_CORE_URL` in the API
+  (it currently requires https) so the token never crosses the internet, or sign bridge calls like the app's BFF → API hop.
+  Until then, treat `BASHT_APP_TOKEN` as an owner credential: rotate it if it may have leaked.
 
 ## Enable and roll back
 
