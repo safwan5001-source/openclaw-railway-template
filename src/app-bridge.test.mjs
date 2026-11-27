@@ -492,3 +492,16 @@ test("a gateway refusal of a patch is 'rejected' (400), not an engine outage", a
     assert.deepEqual(await r.json(), { ok: false, error: "rejected" });
   } finally { srv.close(); }
 });
+
+test("no setting changes while a turn is running (it would be overwritten when the turn saves the session)", async () => {
+  appSession = { ...freshSession(), hasActiveRun: true };
+  for (const [p, body] of [["/model", { model: "mock/echo2" }], ["/thinking", { level: "high" }], ["/fast", { mode: "off" }]]) {
+    const r = await post(p, body);
+    assert.equal(r.status, 409, p);
+    assert.deepEqual(r.json, { ok: false, error: "busy" });
+  }
+  assert.equal(appSession.thinkingLevel, undefined);
+  assert.equal(appSession.model, "echo");
+  appSession.hasActiveRun = false;
+  assert.equal((await post("/thinking", { level: "high" })).status, 200);
+});

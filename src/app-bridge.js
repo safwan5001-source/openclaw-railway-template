@@ -42,6 +42,7 @@ const MAX_LIST_PAGES = 20; // up to 2000 sessions
 const MODELS_CACHE_MS = 60_000;
 const MAX_MODEL_REF = 200;
 const FAST_MODES = { on: true, off: false, default: null };
+const RESET_RECHECK_MS = 1500;
 
 /** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
 export function safeStr(v, max = 200) {
@@ -335,6 +336,12 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   }
 
   const patchApp = (fields) => gatewayCall("sessions.patch", { key: APP_SESSION_KEY, ...fields });
+  // A change made while a turn is running is overwritten when that turn saves the session: refuse it (409 busy) instead.
+  const busy = (res, s) => {
+    if (s?.hasActiveRun !== true) return false;
+    res.status(409).json({ ok: false, error: "busy" });
+    return true;
+  };
   const needsCall = (res) => {
     if (gatewayCall) return false;
     res.status(503).json({ ok: false, error: "not_available" });
@@ -388,6 +395,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const want = typeof req.body?.model === "string" ? req.body.model.trim() : "";
     if (!want || want.length > MAX_MODEL_REF) return bad(res, "bad_request");
     try {
+      if (busy(res, await describeApp())) return;
       if (want !== "default") {
         const row = (await listModels()).rows.find((m) => m.id === want);
         if (!row) return bad(res, "unknown_model");
@@ -406,6 +414,13 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const reset = { thinking: false, fast: false };
       if (s.thinkingLevel && row && !row.thinkingLevels.includes(s.thinkingLevel)) { await patchApp({ thinkingLevel: null }); reset.thinking = true; }
       if (s.effectiveFastModeSource === "session" && s.effectiveFastMode === true && row && !row.supportsFastMode) { await patchApp({ fastMode: null }); reset.fast = true; }
+      if (reset.thinking || reset.fast) {
+        // OpenClaw can save the session a moment later from work that started earlier: check once and clear again if it came back
+        await new Promise((r) => setTimeout(r, RESET_RECHECK_MS));
+        const again = await describeApp();
+        if (reset.thinking && again.thinkingLevel && row && !row.thinkingLevels.includes(again.thinkingLevel)) await patchApp({ thinkingLevel: null });
+        if (reset.fast && again.effectiveFastModeSource === "session" && again.effectiveFastMode === true) await patchApp({ fastMode: null });
+      }
       // No override/default flag here: pinning the configured primary is stored as no override. GET /model reports it.
       res.json({ ok: true, model: { id, provider: safeStr(r.modelProvider, 100), model: safeStr(r.model, MAX_MODEL_REF) },
         thinkingLevel: reset.thinking ? null : safeStr(r.thinkingLevel, 40), reset });
@@ -420,7 +435,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const level = typeof req.body?.level === "string" ? req.body.level.trim() : "";
     if (!level || level.length > 40) return bad(res, "bad_request");
     try {
-      if (level !== "default" && !levelIds((await describeApp()).thinkingLevels).includes(level)) return bad(res, "unsupported_level");
+      const s = await describeApp();
+      if (busy(res, s)) return;
+      if (level !== "default" && !levelIds(s.thinkingLevels).includes(level)) return bad(res, "unsupported_level");
       await patchApp({ thinkingLevel: level === "default" ? null : level });
       res.json({ ok: true, thinking: { level: level === "default" ? null : level } });
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "thinking patch"); }
@@ -431,10 +448,11 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const mode = typeof req.body?.mode === "string" ? req.body.mode.trim() : "";
     if (!Object.hasOwn(FAST_MODES, mode)) return bad(res, "bad_request");
     try {
+      const s = await describeApp();
+      if (busy(res, s)) return;
       if (mode === "on") {
         // The gateway itself accepts fastMode on any model, so the bridge checks the current model's capability first.
-        const [s, { rows }] = await Promise.all([describeApp(), listModels()]);
-        const row = rows.find((m) => m.id === modelRef(s.modelProvider, s.model));
+        const row = (await listModels()).rows.find((m) => m.id === modelRef(s.modelProvider, s.model));
         if (!row?.supportsFastMode) return bad(res, "fast_mode_unsupported");
       }
       await patchApp({ fastMode: FAST_MODES[mode] });

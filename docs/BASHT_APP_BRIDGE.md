@@ -69,8 +69,11 @@ body is ignored.
   - `fallback {from, to, reason}`: the last model-switch record for that reply's run, or `null`. OpenClaw's
     `phase: "restored"` notice (the selected model is back) is not a fallback and is never reported as one.
   - `lastRun {runId, status, firstTokenMs, totalMs}`.
+- **Busy:** while a turn is running on the app session (`hasActiveRun`), `POST /model|thinking|fast` answer 409 `busy` —
+  the turn would overwrite the change when it saves the session.
 - **Switching model** clears a thinking level or fast mode the NEW model does not offer (the gateway would keep it stored and
-  silently ignore it); `POST /model` reports this as `reset {thinking, fast}`.
+  silently ignore it); `POST /model` reports this as `reset {thinking, fast}` and re-checks once ~1.5 s later, because
+  OpenClaw can save the session again from work that started earlier.
 - **Errors.** A gateway that answers a patch with an error is a refusal: 400 `rejected`. Unknown `/app/v1/*` paths end in the
   bridge (JSON 404) and never reach the gateway proxy. If the engine is unreachable or still starting, the bridge returns 502 `engine_unavailable` and the caller retries.
   Right after a gateway start the `sessions` tool briefly returns 400 (`agent-database-inspection-pending`); the bridge reports
