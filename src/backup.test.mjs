@@ -44,6 +44,18 @@ const freePort = () =>
   });
 const post = (url, headers = {}) =>
   fetch(`http://127.0.0.1:${port}${url}`, { method: "POST", headers: { authorization: BASIC, origin: `http://127.0.0.1:${port}`, ...headers } });
+// The route keeps `busy` until its own cleanup after the last byte is sent, so a client that has already read the whole
+// body can still be answered 409 "already running" for a few milliseconds. Back-to-back backups retry only that answer.
+const postWhenIdle = async (url) => {
+  for (let t0 = Date.now(); ; ) {
+    const r = await post(url);
+    if (r.status !== 409 || Date.now() - t0 > 2000) return r;
+    const body = await r.clone().json().catch(() => ({}));
+    if (!/already running/.test(body.error ?? "")) return r;
+    await r.arrayBuffer().catch(() => {});
+    await new Promise((res) => setTimeout(res, 5));
+  }
+};
 
 before(async () => {
   T = fs.mkdtempSync(path.join(os.tmpdir(), "basht-backup-test-"));
@@ -278,7 +290,7 @@ test("route: a backup started while the gateway is still booting does not leave 
   const first = await post("/setup/api/backup");
   assert.equal(first.status, 200);
   await first.arrayBuffer();
-  const second = await post("/setup/api/backup");
+  const second = await postWhenIdle("/setup/api/backup");
   assert.equal(second.status, 200);
   await second.arrayBuffer();
   let reachable = false;
