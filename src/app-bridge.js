@@ -80,7 +80,8 @@ export const MIN_AUDIO_BYTES = 1024; // OpenClaw skips audio below 1 KB anyway
 export const MAX_TRANSCRIPT_CHARS = MAX_MESSAGE_CHARS; // a transcript is sent as the owner's message
 const MAX_SPEECH_BYTES = 8 * 1024 * 1024;
 const SPEAK_TIMEOUT_MS = 60_000;
-const TRANSCRIBE_TIMEOUT_MS = 95_000; // the wrapper kills its CLI at 90 s
+// The wrapper bounds both stages itself (WebM remux 30 s, then the CLI 90 s): the bridge answers after both plus a margin.
+const TRANSCRIBE_TIMEOUT_MS = 125_000;
 const SPEAK_PER_MINUTE = 30;
 const TRANSCRIBE_PER_MINUTE = 20;
 const TRANSCRIBES_IN_FLIGHT = 2; // each one spawns the OpenClaw CLI
@@ -275,7 +276,7 @@ async function readCompletionStream(body, onText) {
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
 export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall, link,
-  stateDir, workspaceDir, transcribe }) {
+  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
@@ -743,13 +744,15 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const audio = Buffer.isBuffer(req.body) ? req.body : null;
     if (!audio || audio.length < MIN_AUDIO_BYTES) { slot.release(); return res.status(422).json({ ok: false, error: "no_speech" }); }
     let dir = null;
+    let job = null;
     try {
       dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "basht-voice-")); // 0700, unpredictable name
       const file = path.join(dir, `note${req.audioExt}`); // the only argv the CLI gets from here: a path the bridge chose
       await fs.promises.writeFile(file, audio, { mode: 0o600, flag: "wx" });
+      job = Promise.resolve().then(() => transcribe(file));
       const raw = await Promise.race([
-        transcribe(file),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("transcribe timed out")), TRANSCRIBE_TIMEOUT_MS).unref()),
+        job,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("transcribe timed out")), transcribeTimeoutMs).unref()),
       ]);
       const text = (typeof raw === "string" ? raw : "").trim().slice(0, MAX_TRANSCRIPT_CHARS);
       if (!text) return res.status(422).json({ ok: false, error: "no_speech" });
@@ -759,6 +762,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (err?.badAudio) return res.status(415).json({ ok: false, error: "unsupported_audio" }); // the recording could not be read
       fail(res, err, "transcribe");
     } finally {
+      // A late answer does not end the work: the slot and the temp files stay until the subprocess itself has finished
+      // (it is bounded by the wrapper's own timeouts), so the two-process cap holds and its input is never deleted under it.
+      if (job) await job.catch(() => {});
       slot.release();
       if (dir) fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
