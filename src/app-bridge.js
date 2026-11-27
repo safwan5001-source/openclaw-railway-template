@@ -21,6 +21,7 @@
 //   POST /app/v1/new               -> «محادثة جديدة»: sessions.reset on the app session (nothing deleted; earlier rows stay readable)
 //   GET  /app/v1/search?q=         -> sessions.search over the readable conversations only
 //   GET  /app/v1/media?key&msg&ref -> one image/file of one message of a readable conversation (engine-owned files only)
+//   /app/v1/automations*, /usage, /memory/*, /capabilities -> src/app-control.js (B5–B7: read-mostly views, two cron switches)
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -46,6 +47,7 @@ import path from "node:path";
 import express from "express";
 import { normalizeWhatsAppSender, whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
 import { createLiveRoutes } from "./app-bridge-live.js";
+import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
 
@@ -786,6 +788,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } });
 
   router.use(createLiveRoutes({ link, log }));
+  // B5–B7: automations, usage, memory (read-only) and capabilities — same token gate, own fixed shapes (src/app-control.js)
+  router.use(createAppControl({ gatewayCall, appSessionKey: APP_SESSION_KEY, now, log }));
 
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));

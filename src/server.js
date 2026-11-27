@@ -23,6 +23,7 @@ import {
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { createAppBridge, parseTranscribeOutput } from "./app-bridge.js";
+import { CONTROL_READ_RPC, CONTROL_WRITE_RPC, validateControlRpc } from "./app-control.js";
 import { createGatewayLink } from "./gateway-link.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
@@ -652,16 +653,18 @@ app.get("/healthz", async (_req, res) => {
 // the CLI reads the gateway token from OPENCLAW_GATEWAY_TOKEN in its environment, never from argv.
 // Model control (M): models.list, sessions.describe, sessions.patch. Chat basics + media (B1/B2): sessions.reset (the app session
 // only, params built by the bridge), sessions.search, chat.history (anchored reads), artifacts.download (one image of one message).
+// App control (B5–B7): read methods and the two cron switches, whose params are re-checked here (validateControlRpc).
 const APP_BRIDGE_RPC = new Set(["models.list", "sessions.describe", "sessions.patch",
-  "sessions.reset", "sessions.search", "chat.history", "artifacts.download"]);
+  "sessions.reset", "sessions.search", "chat.history", "artifacts.download", ...CONTROL_READ_RPC, ...CONTROL_WRITE_RPC]);
 // an image artifact comes back as base64 inside the JSON (<= 10 MB image -> ~14 MB): only that call gets the bigger buffer
 const APP_BRIDGE_RPC_BUFFER = { "artifacts.download": 32 * 1024 * 1024 };
 // B0: reads go over the persistent gateway link when it is up (no process spawn); the CLI stays the fallback and the only path
-// for writes (sessions.patch, sessions.reset) and for the reads the link does not carry (see LINK_METHODS in src/gateway-link.js).
+// for writes (sessions.patch, sessions.reset, cron.*) and for the reads the link does not carry (see LINK_METHODS in src/gateway-link.js).
 const APP_BRIDGE_LINK_READS = new Set(["models.list", "sessions.describe"]);
 let gatewayLink = null;
 function appBridgeGatewayCall(method, params) {
   if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
+  if (!validateControlRpc(method, params)) return Promise.reject(new Error(`gateway call ${method}: params not allowed`));
   if (gatewayLink?.isUp() && APP_BRIDGE_LINK_READS.has(method)) {
     return gatewayLink.request(method, params ?? {}).catch((err) => {
       if (err?.code === "link_down" || err?.code === "timeout") return appBridgeCliCall(method, params);
