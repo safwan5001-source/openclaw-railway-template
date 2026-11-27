@@ -161,7 +161,14 @@ function fakeLink({ up = true, impl, version = null } = {}) {
     status() { return { state: this.up ? "up" : "down", since: 0, lastUpAt: null, reconnects: 0, lastError: null, pendingApprovals: 0 }; },
     serverVersion: () => version,
     setDecorator() {},
-    request(method, params, opts) { calls.push({ method, params, opts }); return this.impl(method, params, opts); },
+    reads: [],
+    // the two read-only counting reads of /status are recorded apart: `calls` stays "what was spoken"
+    request(method, params, opts) {
+      if (method === "sessions.list") { this.reads.push(method); return Promise.resolve({ totalCount: 0, count: 0, sessions: [] }); }
+      if (method === "cron.list") { this.reads.push(method); return Promise.resolve({ jobs: [], hasMore: false }); }
+      calls.push({ method, params, opts });
+      return this.impl(method, params, opts);
+    },
   };
   return link;
 }
@@ -461,11 +468,12 @@ test("status: additive fixed fields — features, voice, runs, signing; engine v
     assert.equal(json.link.state, "up", "existing fields stay");
     assert.deepEqual(json.features, CONTRACT.features);
     assert.deepEqual(json.voice, { speak: "ready", warnings: [] });
-    assert.deepEqual(json.runs, { active: 0 });
-    assert.deepEqual(json.signing, { mode: "off" });
+    assert.deepEqual(json.runs, { active: 0, engine: 0, cron: 0, approvalsPending: 0, total: 0, complete: true });
+    assert.deepEqual(json.signing, { mode: "off", active: false, warnings: [], replayProtection: "memory+boot_fence" });
     assert.deepEqual(json.engine, { version: "2026.11.10" });
     assert.deepEqual(Object.keys(json).sort(), ["appSession", "engine", "features", "link", "ok", "runs", "signing", "voice"]);
-    assert.equal(link.calls.length, 0, "status makes no gateway call and no TTS call");
+    assert.equal(link.calls.length, 0, "status makes no TTS call and no write");
+    assert.deepEqual(link.reads, ["sessions.list", "cron.list"], "only the two read-only counting reads");
   } finally { m.close(); }
   const noVersion = await mount({ link: fakeLink(), fetchImpl: noFetch() });
   try {

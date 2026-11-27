@@ -16,7 +16,7 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 
 | Route | What it does | Gateway call (made by the wrapper) |
 |---|---|---|
-| `GET /app/v1/status` | Liveness, the app session key, the link state and the additive fields below (`features`, `voice`, `runs`, `signing`, `engine`). Cheap: no gateway call, no TTS call | — |
+| `GET /app/v1/status` | Liveness, the app session key, the link state and the additive fields below (`features`, `voice`, `runs`, `signing`, `engine`). Cheap: the config file, in-memory state and, at most every 3 s, two read-only counting reads over the persistent link (`runs`); no TTS call, no write | — |
 | `GET /app/v1/sessions` | The conversations the owner may read | `sessions_list` |
 | `GET /app/v1/history?key=&limit=&offset=` | Text messages of one allowed conversation | `sessions_history` |
 | `POST /app/v1/send {message}` | Starts **one** owner turn and returns `runId` at once | `/v1/chat/completions` (stream), session `app:owner` |
@@ -62,8 +62,9 @@ removed with the same rules as history rows, and while the reply is still stream
 { "ok": true, "appSession": "agent:main:app:owner", "link": { "state": "up", ... },
   "features": ["voice.speak.v2", "voice.transcribe.v1", "voice.status.v1", "signing.v1"],
   "voice": { "speak": "ready", "reason": "…", "warnings": [] },
-  "runs": { "active": 0 },
-  "signing": { "mode": "optional", "lastRejected": { "reason": "skew", "at": 0 } },
+  "runs": { "active": 0, "engine": 0, "cron": 0, "approvalsPending": 0, "total": 0, "complete": true },
+  "signing": { "mode": "optional", "active": true, "warnings": [], "replayProtection": "memory+boot_fence",
+               "lastRejected": { "reason": "skew", "at": 0 } },
   "engine": { "version": "…" } }
 ```
 
@@ -76,11 +77,32 @@ removed with the same rules as history rows, and while the reply is still stream
   link path cannot be used yet — no global `tts` block, or no agent block to compare with — so only the tool path speaks) ·
   `mismatch` (`identity_mismatch`) · `unconfigured` (`no_tts_config`, or `tool_path_unavailable`) · `unknown` (`config_unreadable`).
   `warnings` are codes only (`global_auto_enabled`, `global_prefs_path`, `prefs_file_overrides`), see Voice.
-- `runs.active`: app turns running in this bridge right now. Deploy tooling must read it before a restart (release rule below).
-- `signing.mode`: `off` | `optional` | `required` **as in effect** (never a secret). A `required` (or `optional`) without a valid secret
-  degrades to `off` with a warning in the log, and this field is where that shows. `signing.lastRejected {reason, at}`: the last
-  signature this bridge did not accept (`reason` is `missing`, `malformed`, `skew`, `signature`, `replay` or `body`; `at` in ms), absent
-  until there was one.
+- `runs`: how much work is running, counts only, for the release rule below (never a session key, phone number, job id or path).
+  Read-only, over the persistent link, shared for 3 s:
+
+  | Field | Source | Meaning |
+  |---|---|---|
+  | `active` | this bridge, in memory | app turns running right now (always known) |
+  | `engine` | link `sessions.list {activeOnly: true, limit: 1, includeGlobal, includeUnknown}`, read as `totalCount` | sessions with a queued or running turn across **all** sessions: WhatsApp chats, the app, cron-run sessions, subagents (the gateway's live-run projection, before pagination; closed params, one row returned and dropped) |
+  | `cron` | link `cron.list {includeDisabled, limit: 200, compact, includeDeliveryPreviews: false}` | cron jobs with a running state; a list longer than one page is unknown, not guessed |
+  | `approvalsPending` | the approvals this link tracks (events and resync) | pending exec, plugin and system-agent approvals; unknown while the link is down |
+  | `total` | `active + engine + cron` (the known parts) | **only meaningful as "is it zero"**: the parts overlap (the app's own turn is also an active session, a running cron job also has a session). Approvals are not in it |
+  | `complete` | `true` only if `engine`, `cron` and `approvalsPending` were all obtained | `false` means the picture is partial |
+
+  A source that cannot be read read-only is `null` and makes `complete` `false`; nothing is ever guessed. The link allows only these
+  two extra reads, each with an exact fixed params object (anything else is refused locally, `bad_params`); no write method is added.
+  **`runs` does not cover:** work that starts right after the check (re-check immediately before the restart); runs outside the
+  session index (the gateway counts sessionless/internal runs, background exec sessions, media generation and ACP turns in its own
+  maintenance snapshot, which is not exposed on a read-only method the link may call); memory-flush / compaction internals unless they
+  run in a session; queued but not yet running cron jobs; WhatsApp deliveries in flight; and every other service (for example the broker).
+- `signing`: `{mode, active, ...}`, never a secret. `mode` is `off` | `optional` | `required` as configured. `active` is whether this
+  bridge is verifying signatures now (a valid secret and a mode other than `off`). For `required` without a usable secret
+  `active` is `false` and `error` is `secret_missing` | `secret_invalid` | `previous_only`: the bridge **fails closed** (see Signing).
+  For `optional` without a usable secret `reason` says the same (it has nothing to verify and accepts unsigned requests).
+  `warnings` carries `mode_invalid` when `BASHT_BRIDGE_SIGNING_MODE` was not recognised (it is then `optional`).
+  `replayProtection` is always `"memory+boot_fence"`: **NOT durable** (see Signing). `lastRejected {reason, at}`: the last signature
+  this bridge did not accept (`reason` is `missing`, `malformed`, `skew`, `before_boot`, `signature`, `replay` or `body`; `at` in ms),
+  absent until there was one.
 - `engine.version`: the engine version the gateway reported in `hello-ok` on the persistent link; absent until the link has been up once.
 
 ## Model control (M)
@@ -428,54 +450,68 @@ The request target is `req.originalUrl` (the signer must sign the bytes it sends
 Shared vectors, with test-only secrets and the previous-secret case, are in `src/fixtures/bridge-signing-vectors.json`; the bridge's
 tests verify every one byte for byte and so should the app's.
 
-**Verification** (malformed headers are refused before any crypto; every failure is `401 {"ok":false,"error":"bad_signature"}`):
+**Verification** (malformed headers are refused before any crypto; every failure is `401 {"ok":false,"error":"bad_signature"}` in
+`required`, see Modes for `optional`):
 
 1. All four headers present and well-formed (timestamp digits, nonce shape, 64 hex chars, `v1=` + 64 hex chars).
 2. `|now - timestamp| <= 60 s`.
-3. The signature equals the HMAC under the current secret, else under the previous secret (rotation), compared in constant time
+3. **Restart fence:** the timestamp is not earlier than this process's boot time minus 2 s (reason `before_boot`). It closes the replay
+   of a request captured before an engine restart (the nonce memory died with the old process). A request that was genuinely in
+   flight across a restart simply fails once and is retried with a fresh timestamp.
+4. The signature equals the HMAC under the current secret, else under the previous secret (rotation), compared in constant time
    (`crypto.timingSafeEqual` on equal-length buffers).
-4. The nonce has not been seen: a bounded in-memory cache, TTL 180 s, at most 10,000 entries, oldest evicted first. A nonce is spent
-   only by a request whose signature was genuine. The cache is **in memory**: a restart empties it, and the 60 s timestamp window is
-   what bounds a replay across a restart.
-5. After the body is read, `sha256(body bytes)` must equal `X-Basht-Content-SHA256`. Every parser keeps the raw bytes it was given:
+5. The nonce has not been seen: a bounded in-memory cache, TTL 180 s, at most 10,000 entries, oldest evicted first. A nonce is spent
+   only by a request whose signature was genuine.
+6. After the body is read, `sha256(body bytes)` must equal `X-Basht-Content-SHA256`. Every parser keeps the raw bytes it was given:
    the 64 kB JSON parser, the larger `/send` JSON parser and the raw-audio `/transcribe` body. The hash covers the bytes the parser
    hands over, i.e. **after any content decoding** (a `Content-Encoding` is undone before the hash is taken), so the signer must hash
    the decoded body it intends the server to see. GET and empty bodies hash as the empty string.
+
+**Replay protection is NOT durable.** The nonce cache is **in memory and per process**: a restart empties it, and several replicas
+would not share it (**a single replica is assumed**). What limits a replay is the timestamp window (<= 60 s) plus the boot fence above
+(`signing.replayProtection: "memory+boot_fence"`). The bearer token remains the primary credential: signing is a second factor, not an
+anti-replay guarantee across restarts or replicas.
 
 **Environment** (read once at boot, then deleted from `process.env`):
 
 | Variable | Meaning |
 |---|---|
-| `BASHT_BRIDGE_SIGNING_SECRET` | current secret, at least 32 characters (shorter: ignored, one warning) |
-| `BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS` | previous secret, accepted next to the current one during a rotation (ignored without a current secret) |
-| `BASHT_BRIDGE_SIGNING_MODE` | `off` · `optional` · `required`. Default: `optional` when a valid secret is set, `off` otherwise |
+| `BASHT_BRIDGE_SIGNING_SECRET` | current secret, at least 32 characters (shorter: not a secret, one warning) |
+| `BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS` | previous secret, accepted next to the current one during a rotation (never usable without a current secret) |
+| `BASHT_BRIDGE_SIGNING_MODE` | `off` · `optional` · `required`. **`off` only when asked for.** Unset: `optional`. Not recognised: `optional` plus the status warning `mode_invalid` (a typo never enables `required` and never silently disables) |
 
-`required` (or `optional`) without a valid secret **cannot be enforced**: signing silently degrades to `off` with one warning in the
-log, and `GET /status` → `signing.mode` then reads `off` (that is where to look), so a typo can never lock the owner out. An unknown mode value falls back to the default with a warning. With none of the variables set the bridge
-behaves exactly as before.
+**`required` never degrades.** With a missing, too-short or invalid secret (or only a previous secret) the bridge **fails closed**:
+after the bearer check, every `/app/v1` route except `GET /status` answers `503 {"ok":false,"error":"signing_unavailable"}`, and nothing
+is processed or accepted unsigned. `GET /status` (with the bearer) stays reachable and shows `signing: {mode: "required", active:
+false, error: "secret_missing" | "secret_invalid" | "previous_only"}`. The refusal is logged loudly (throttled to once a minute) and at
+boot. `optional` without a usable secret has nothing to verify: requests are accepted unsigned, and `GET /status` says so
+(`signing: {mode: "optional", active: false, reason}`). With no signing variable set at all the bridge is therefore `optional`,
+inactive, which behaves exactly as before.
 
 **Modes.**
 
 | Mode | Request with no `X-Basht-*` signing header | Request with any signing header |
 |---|---|---|
-| `off` | accepted | headers ignored |
-| `optional` | accepted | verified if valid; if present but **not valid** (wrong secret, skew, replay, body hash mismatch, malformed) it is processed as an **unsigned** request, never as verified |
+| `off` (explicit only) | accepted | headers ignored |
+| `optional` | accepted | verified if valid; if present but **not valid** (wrong secret, skew, before boot, replay, body hash mismatch, malformed) it is processed as an **unsigned** request, never as verified |
 | `required` | 401 `bad_signature` | must verify fully, else 401 `bad_signature` |
 
 `optional` never locks the owner out: the bearer token check still applies, and the reason of a rejected signature is logged (once a
 minute per reason, no header value, no secret) and shown in `GET /status` → `signing.lastRejected {reason, at}`. Only `required`
 refuses, and only `required` counts a failed signature (header phase or body hash) in the **same** limiter as a bad token: after 20
 failures a minute the answer is 429 `rate_limited`. A request with a valid token and a valid signature always passes, so an
-anonymous flood cannot lock the owner out. `GET /status` reports `signing.mode` and the `signing.v1` feature.
+anonymous flood cannot lock the owner out. `GET /status` reports `signing` and the `signing.v1` feature.
 
 **Compatibility matrix.**
 
 | App | Engine | Result |
 |---|---|---|
 | old (no signing) | new, `optional` (default once a secret is set) | works: unsigned requests are accepted |
-| new (signs) | old / signing not configured | works: the extra `X-Basht-*` headers are unknown headers and are ignored |
+| new (signs) | old engine (before this feature) | works: the extra `X-Basht-*` headers are unknown headers and are ignored |
+| new (signs) | new, no secret set (`optional`, inactive) | works: nothing to verify, requests accepted unsigned (`signing.active: false`) |
 | new (signs) | new, `optional` | works; valid signatures are verified, an invalid one is accepted as unsigned and shows in `signing.lastRejected` |
 | old (no signing) | new, `required` | **401**: switch to `required` only after the app signs |
+| any | new, `required` with an unusable secret | **503 `signing_unavailable`** on everything but `GET /status`: fail closed, never unsigned acceptance |
 | new (signs) | new, `required` | works; the full protection |
 
 **Rotation runbook** (no downtime, every step reversible):
@@ -488,11 +524,15 @@ anonymous flood cannot lock the owner out. `GET /status` reports `signing.mode` 
 5. First enablement: set the secret on both sides in `optional`, confirm signed calls work, then set `BASHT_BRIDGE_SIGNING_MODE=required`
    on the engine. To roll back, set the mode to `optional` (or `off`) or remove the variables.
 
-## Release rule: do not restart the engine while `runs.active > 0`
+## Release rule: restart the engine only when `runs` says it is idle
 
 The gateway re-runs a turn that a restart interrupted, and that can repeat its side effects (a message sent, an invoice created).
-Before restarting or redeploying the engine, read `GET /app/v1/status` and wait until `runs.active` is `0`; stop the turn from the app if
-it must go. `runs.active` counts the app's turns only; check for other running work (WhatsApp, cron) as usual.
+Restart or redeploy the engine **only when** `GET /app/v1/status` reports `runs.complete === true`, `runs.total === 0` and
+`runs.approvalsPending === 0`, **re-checked immediately before the restart**. `complete: false` (a source could not be read: `engine`,
+`cron` or `approvalsPending` is `null`) is **not** safe: treat it like running work, wait and re-check; a pending approval is work that
+resumes when answered, so it blocks too. Stop an app turn from the app if it must go. `runs` does not cover everything (work that
+starts right after the check, sessionless runs, memory-flush / compaction internals unless they run in a session, and other services
+such as the broker): see the list under `runs` above, and check those by other means.
 
 ## Enable and roll back
 

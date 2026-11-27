@@ -2,7 +2,7 @@
 // stands in for the OpenClaw gateway; shapes are the ones the real 2026.11.10 gateway sent in the lab (docs/BASHT_APP_BRIDGE.md).
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { APP_SESSION_KEY, LINK_CAPS, LINK_METHODS, LINK_SCOPES, TTS_SPEAK_MAX_CHARS, approvalView, createGatewayLink, normalizeEvent, sessionKind } from "./gateway-link.js";
+import { APP_SESSION_KEY, CRON_RUNNING_PARAMS, LINK_CAPS, LINK_METHODS, LINK_SCOPES, SESSIONS_ACTIVE_PARAMS, TTS_SPEAK_MAX_CHARS, approvalView, createGatewayLink, normalizeEvent, sessionKind } from "./gateway-link.js";
 
 const TOKEN = "synthetic-gateway-token-0123456789abcdef";
 // The link's own timers are unref'd by design (they must never keep the wrapper alive), so a test awaiting one of them needs
@@ -268,7 +268,7 @@ test("decorator adds bridge-only facts to records", async () => {
 
 test("the allowlist is exactly the reads, the approval write and tts.speak: everything else stays refused", async () => {
   assert.deepEqual([...LINK_METHODS].sort(), ["approval.get", "approval.history", "approval.resolve", "exec.approval.list", "models.list",
-    "openclaw.approval.list", "plugin.approval.list", "sessions.describe", "tts.speak"]);
+    "openclaw.approval.list", "plugin.approval.list", "sessions.describe", "sessions.list", "tts.speak"].concat("cron.list").sort());
   const gw = fakeGateway({ lists: { "tts.speak": { audioBase64: "AA==", mimeType: "audio/mpeg" } } });
   const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
   link.start();
@@ -363,4 +363,26 @@ test("the engine version is the hello-ok server.version (label shape only), else
     assert.equal(l.serverVersion(), null, JSON.stringify(server)?.slice(0, 30));
     l.stop();
   }
+});
+
+test("the two counting reads (sessions.list, cron.list) are read-only and closed to EXACTLY their fixed params", async () => {
+  const gw = fakeGateway({ lists: { "sessions.list": { totalCount: 0, sessions: [] }, "cron.list": { jobs: [] } } });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  link.start();
+  await until(() => link.isUp());
+  const before = gw.last().sent.length;
+  for (const [m, fixed] of [["sessions.list", SESSIONS_ACTIVE_PARAMS], ["cron.list", CRON_RUNNING_PARAMS]]) {
+    const bad = [undefined, null, {}, [], "x", { ...fixed, extra: 1 }, { ...fixed, limit: 500 }, { ...fixed, activeOnly: false }, { ...fixed, includeDisabled: false },
+      { ...fixed, query: "x" }, { ...fixed, agentId: "main" }, { ...fixed, search: "+9665" }, { ...fixed, offset: 1 }];
+    for (const p of bad) await assert.rejects(link.request(m, p), { code: "bad_params" }, `${m} ${JSON.stringify(p)?.slice(0, 50)}`);
+  }
+  assert.equal(gw.last().sent.length, before, "nothing refused locally reached the gateway");
+  await link.request("sessions.list", { ...SESSIONS_ACTIVE_PARAMS });
+  await link.request("cron.list", { ...CRON_RUNNING_PARAMS });
+  assert.deepEqual(gw.last().sent.slice(-2).map((f) => [f.method, f.params]), [["sessions.list", SESSIONS_ACTIVE_PARAMS], ["cron.list", CRON_RUNNING_PARAMS]]);
+  // no write method rides along with them
+  for (const m of ["sessions.patch", "sessions.reset", "sessions.delete", "cron.add", "cron.run", "cron.update", "cron.remove", "sessions.send", "status"]) {
+    await assert.rejects(link.request(m, {}), { code: "not_allowed" }, m);
+  }
+  link.stop();
 });

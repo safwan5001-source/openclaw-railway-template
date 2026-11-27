@@ -54,46 +54,74 @@ function safeEqual(a, b) {
 }
 
 /**
- * The effective signing configuration from the environment. A secret shorter than 32 characters is ignored (one warning).
- * Mode: `BASHT_BRIDGE_SIGNING_MODE` = off | optional | required; default "optional" when a valid secret is set, "off" otherwise.
- * "optional"/"required" without a valid secret cannot be enforced: signing stays off and says so, so a typo can never lock the
- * owner out. A previous secret is only meaningful next to a current one.
+ * The signing configuration from the environment.
+ *
+ * Secrets: at least 32 characters after trimming; a shorter value is not a secret (one warning, it is never echoed).
+ * Mode (`BASHT_BRIDGE_SIGNING_MODE`): `off` | `optional` | `required`. `off` is EXPLICIT only: an unset mode is `optional`, and an
+ * unrecognised value is `optional` too with the warning `mode_invalid` (a typo never enables `required` and never silently disables).
+ * `required` is never degraded: without a usable secret it is returned as `required` together with `secretError`
+ * (`secret_missing` | `secret_invalid` | `previous_only`), and the router then fails closed (503 signing_unavailable) instead of
+ * accepting unsigned requests. `optional` without a usable secret has nothing to verify and accepts unsigned requests (status says so).
+ * A previous secret only exists next to a current one.
  * @param {Record<string, string | undefined>} env
  * @param {(msg: string) => void} [warn]
- * @returns {{ secret: string | null, previousSecret: string | null, mode: "off" | "optional" | "required" }}
+ * @returns {{ secret: string | null, previousSecret: string | null, mode: "off" | "optional" | "required",
+ *            secretError: "secret_missing" | "secret_invalid" | "previous_only" | null, warnings: string[] }}
  */
 export function signingConfigFromEnv(env, warn = () => {}) {
-  const read = (name) => {
-    const v = String(env?.[name] ?? "").trim();
-    if (!v) return null;
-    if (v.length < MIN_SECRET_LENGTH) { warn(`${name} is shorter than ${MIN_SECRET_LENGTH} characters and is ignored`); return null; }
-    return v;
-  };
-  const secret = read("BASHT_BRIDGE_SIGNING_SECRET");
-  let previousSecret = read("BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS");
-  if (previousSecret && !secret) { warn("BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS is ignored without a valid BASHT_BRIDGE_SIGNING_SECRET"); previousSecret = null; }
-  const asked = String(env?.BASHT_BRIDGE_SIGNING_MODE ?? "").trim().toLowerCase();
-  let mode = secret ? "optional" : "off";
+  const raw = (name) => String(env?.[name] ?? "").trim();
+  const cur = raw("BASHT_BRIDGE_SIGNING_SECRET");
+  const prev = raw("BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS");
+  const curOk = cur.length >= MIN_SECRET_LENGTH;
+  const prevOk = prev.length >= MIN_SECRET_LENGTH;
+  if (cur && !curOk) warn(`BASHT_BRIDGE_SIGNING_SECRET is shorter than ${MIN_SECRET_LENGTH} characters: it is not a usable secret`);
+  if (prev && !prevOk) warn(`BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS is shorter than ${MIN_SECRET_LENGTH} characters and is ignored`);
+  if (prevOk && !curOk) warn("BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS is ignored without a valid BASHT_BRIDGE_SIGNING_SECRET");
+  const warnings = [];
+  const asked = raw("BASHT_BRIDGE_SIGNING_MODE").toLowerCase();
+  let mode = "optional";
   if (asked) {
-    if (!SIGNING_MODES.includes(asked)) warn(`BASHT_BRIDGE_SIGNING_MODE "${asked.slice(0, 20)}" is not off, optional or required: using ${mode}`);
-    else if (asked !== "off" && !secret) warn(`BASHT_BRIDGE_SIGNING_MODE=${asked} needs a valid BASHT_BRIDGE_SIGNING_SECRET: signing stays off`);
-    else mode = asked;
+    if (SIGNING_MODES.includes(asked)) mode = asked;
+    else { warnings.push("mode_invalid"); warn(`BASHT_BRIDGE_SIGNING_MODE "${asked.slice(0, 20)}" is not off, optional or required: using optional`); }
   }
-  return { secret, previousSecret, mode };
+  const secretError = curOk ? null : cur ? "secret_invalid" : prevOk ? "previous_only" : "secret_missing";
+  if (mode === "required" && secretError) {
+    warn(`BASHT_BRIDGE_SIGNING_MODE=required but the signing secret is unusable (${secretError}): every /app/v1 route except GET /status answers 503 signing_unavailable until it is fixed`);
+  }
+  return { secret: curOk ? cur : null, previousSecret: curOk && prevOk ? prev : null, mode, secretError, warnings };
 }
 
+/** Requests whose timestamp is older than the process start by more than this are refused (restart fence). */
+export const BOOT_FENCE_SECONDS = 2;
+
 /**
- * @param {{ secret?: string | null, previousSecret?: string | null, mode?: string, now?: () => number }} o
- *   now: milliseconds (the bridge's own clock). Without a valid secret the verifier is off whatever the mode says.
+ * @param {{ secret?: string | null, previousSecret?: string | null, mode?: string, secretError?: string | null, warnings?: string[],
+ *           now?: () => number, bootEpoch?: number }} o
+ *   now: milliseconds (the bridge's own clock). bootEpoch: unix seconds of this process's start (default: now at creation).
+ *   An unrecognised mode is "optional" with the warning `mode_invalid`. Without any option the verifier is "off".
  */
-export function createSigningVerifier({ secret, previousSecret, mode = "off", now = Date.now } = {}) {
+export function createSigningVerifier({ secret, previousSecret, mode = "off", secretError, warnings = [], now = Date.now, bootEpoch } = {}) {
   const valid = (x) => typeof x === "string" && x.length >= MIN_SECRET_LENGTH;
+  const haveSecret = valid(secret);
   // the previous secret only exists next to a current one (a rotation window); alone it would enforce signing with a retired key
-  const secrets = valid(secret) ? [secret, ...(valid(previousSecret) ? [previousSecret] : [])] : [];
-  const effective = secrets.length && SIGNING_MODES.includes(mode) ? mode : "off";
+  const secrets = haveSecret ? [secret, ...(valid(previousSecret) ? [previousSecret] : [])] : [];
+  const modeOk = SIGNING_MODES.includes(mode);
+  const configured = modeOk ? mode : "optional";
+  const allWarnings = [...new Set([...warnings, ...(modeOk ? [] : ["mode_invalid"])])];
+  const why = haveSecret ? null : secretError ?? (secret ? "secret_invalid" : valid(previousSecret) ? "previous_only" : "secret_missing");
+  const active = haveSecret && configured !== "off";
+  const failClosed = configured === "required" && !haveSecret; // never degraded to accepting unsigned requests
+  // Replay protection is deliberately modest: see the comment on `takeNonce`. The restart fence below closes replay of requests
+  // captured before this process started; it is not durable protection.
+  const boot = Number.isFinite(bootEpoch) ? Math.floor(bootEpoch) : Math.floor(now() / 1000);
   const nonces = new Map(); // nonce -> expiry (ms); insertion order = expiry order, because the TTL is constant
 
-  /** Bounded replay memory (in memory only: a restart empties it, and the 60 s timestamp window bounds what could be replayed). */
+  /**
+   * Bounded replay memory. IN MEMORY AND PER PROCESS, NOT DURABLE: a restart empties it, and several replicas would not share it
+   * (a single replica is assumed). What bounds a replay is the timestamp window (<= 60 s) and, across a restart, the boot fence
+   * (a request stamped before this process started is refused). The bearer token stays the primary credential: signing is a second
+   * factor, not an anti-replay guarantee across restarts or replicas.
+   */
   function takeNonce(nonce) {
     const t = now();
     for (const [n, until] of nonces) { if (until > t) break; nonces.delete(n); }
@@ -104,8 +132,21 @@ export function createSigningVerifier({ secret, previousSecret, mode = "off", no
   }
 
   return {
-    mode: effective,
+    mode: configured,
+    active,
+    failClosed,
+    bootEpoch: boot,
     get nonceCount() { return nonces.size; },
+    /** What /status shows (never a secret): the mode, whether it is verifying, why not, the warnings and the replay protection in force. */
+    status() {
+      return {
+        mode: configured, active,
+        ...(!haveSecret && configured === "required" ? { error: why } : {}),
+        ...(!haveSecret && configured === "optional" ? { reason: why } : {}),
+        warnings: allWarnings,
+        replayProtection: "memory+boot_fence",
+      };
+    },
     /**
      * Header phase (before the body is read). `req`: { method, originalUrl, headers }.
      * @returns {{ ok: true, signed: boolean, contentSha256?: string } | { ok: false, reason: string }}
@@ -113,10 +154,10 @@ export function createSigningVerifier({ secret, previousSecret, mode = "off", no
      *   valid (or absent in "required"); in "optional" the router treats that request as unsigned.
      */
     checkHeaders(req) {
-      if (effective === "off") return { ok: true, signed: false };
+      if (!active) return { ok: true, signed: false }; // off, or nothing to verify with ("required" without a secret never gets here: the router fails closed)
       const h = req.headers ?? {};
       const names = Object.values(SIGNING_HEADERS);
-      if (!names.some((n) => h[n] !== undefined)) return effective === "required" ? { ok: false, reason: "missing" } : { ok: true, signed: false };
+      if (!names.some((n) => h[n] !== undefined)) return configured === "required" ? { ok: false, reason: "missing" } : { ok: true, signed: false };
       // Malformed or incomplete headers are refused before any crypto work. A repeated header arrives joined with ", " and fails these shapes.
       const ts = h[SIGNING_HEADERS.timestamp];
       const nonce = h[SIGNING_HEADERS.nonce];
@@ -125,6 +166,8 @@ export function createSigningVerifier({ secret, previousSecret, mode = "off", no
       if (typeof ts !== "string" || !TS_RE.test(ts) || typeof nonce !== "string" || !NONCE_RE.test(nonce)
         || typeof sha !== "string" || !SHA_RE.test(sha) || typeof sig !== "string" || !SIG_RE.test(sig)) return { ok: false, reason: "malformed" };
       if (Math.abs(Math.floor(now() / 1000) - Number(ts)) > MAX_SKEW_SECONDS) return { ok: false, reason: "skew" };
+      // restart fence: the nonce memory died with the previous process, so anything stamped before this one started is not accepted
+      if (Number(ts) < boot - BOOT_FENCE_SECONDS) return { ok: false, reason: "before_boot" };
       const canonical = canonicalString({ method: req.method, target: req.originalUrl, timestamp: ts, nonce, contentSha256: sha });
       // every secret is tried, without stopping at the first hit: current then previous (rotation)
       let valid = false;

@@ -31,6 +31,7 @@ export const LINK_METHODS = Object.freeze(new Set([
   "models.list", "sessions.describe",
   "exec.approval.list", "plugin.approval.list", "openclaw.approval.list", "approval.get", "approval.history", "approval.resolve",
   "tts.speak",
+  "sessions.list", "cron.list", // read-only, fixed params: only to COUNT running work for GET /status (see src/app-bridge-runs.js)
 ]));
 export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
 /**
@@ -38,7 +39,13 @@ export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
  * gateway's own validation only. `tts.speak` takes `text` and nothing else: the gateway rejects any other param, and a voice, a
  * provider or a model must never ride along from this side.
  */
+/** The ONLY params the link sends for the two counting reads (exact match, nothing else): active sessions (one row, we read `totalCount`) and compact cron jobs. */
+export const SESSIONS_ACTIVE_PARAMS = Object.freeze({ activeOnly: true, limit: 1, includeGlobal: true, includeUnknown: true });
+export const CRON_RUNNING_PARAMS = Object.freeze({ includeDisabled: true, limit: 200, compact: true, includeDeliveryPreviews: false });
+const sameParams = (expected) => (p) => isPlainObject(p) && Object.keys(p).length === Object.keys(expected).length && Object.entries(expected).every(([k, v]) => p[k] === v);
 const PARAM_VALIDATORS = Object.freeze({
+  "sessions.list": sameParams(SESSIONS_ACTIVE_PARAMS),
+  "cron.list": sameParams(CRON_RUNNING_PARAMS),
   "tts.speak": (p) => isPlainObject(p) && Object.keys(p).length === 1 && typeof p.text === "string" && p.text.length >= 1 && p.text.length <= TTS_SPEAK_MAX_CHARS,
 });
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;

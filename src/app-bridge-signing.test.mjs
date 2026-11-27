@@ -9,7 +9,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { createAppBridge } from "./app-bridge.js";
-import { MAX_SKEW_SECONDS, MIN_SECRET_LENGTH, NONCE_MAX_ENTRIES, NONCE_TTL_MS, SIGNING_HEADERS, canonicalString, createSigningVerifier, sha256Hex,
+import { BOOT_FENCE_SECONDS, MAX_SKEW_SECONDS, MIN_SECRET_LENGTH, NONCE_MAX_ENTRIES, NONCE_TTL_MS, SIGNING_HEADERS, canonicalString, createSigningVerifier, sha256Hex,
   signCanonical, signingConfigFromEnv } from "./app-bridge-signing.js";
 
 const V = JSON.parse(fs.readFileSync(new URL("./fixtures/bridge-signing-vectors.json", import.meta.url), "utf8"));
@@ -110,7 +110,7 @@ test("verifier: the body is checked against the signed hash (tamper, truncation,
 });
 
 test("verifier: the timestamp window is +-60 s, both ways; the edge is inside", () => {
-  const at = (deltaSeconds) => createSigningVerifier({ secret: CURRENT, mode: "required", now: () => (post.timestamp + deltaSeconds) * 1000 }).checkHeaders(req(post));
+  const at = (deltaSeconds) => createSigningVerifier({ secret: CURRENT, mode: "required", bootEpoch: post.timestamp - 10_000, now: () => (post.timestamp + deltaSeconds) * 1000 }).checkHeaders(req(post));
   assert.equal(MAX_SKEW_SECONDS, 60);
   assert.equal(at(0).ok, true);
   assert.equal(at(60).ok, true);
@@ -118,7 +118,7 @@ test("verifier: the timestamp window is +-60 s, both ways; the edge is inside", 
   assert.deepEqual(at(61), { ok: false, reason: "skew" });
   assert.deepEqual(at(-61), { ok: false, reason: "skew" });
   assert.deepEqual(at(3600), { ok: false, reason: "skew" });
-  const v = createSigningVerifier({ secret: CURRENT, mode: "required", now: () => (post.timestamp + 60) * 1000 + 999 });
+  const v = createSigningVerifier({ secret: CURRENT, mode: "required", bootEpoch: 0, now: () => (post.timestamp + 60) * 1000 + 999 });
   assert.equal(v.checkHeaders(req(post)).ok, true, "sub-second part of the clock is ignored (floor)");
 });
 
@@ -205,45 +205,55 @@ test("verifier: modes — off ignores everything; optional accepts unsigned and 
   assert.deepEqual(required.checkHeaders(unsigned), { ok: false, reason: "missing" });
   assert.deepEqual(required.checkHeaders({ method: "GET", originalUrl: "/x", headers: { "x-basht-other": "1" } }), { ok: false, reason: "missing" });
   assert.equal(required.checkHeaders(req(post)).ok, true);
-  // no valid secret: the verifier is off whatever the mode says (it could never verify anything)
-  for (const secret of [undefined, null, "", "too-short"]) assert.equal(createSigningVerifier({ secret, mode: "required" }).mode, "off");
-  assert.equal(createSigningVerifier({ secret: CURRENT, mode: "bogus" }).mode, "off");
-  assert.equal(createSigningVerifier().mode, "off");
+  // no valid secret: "required" is NEVER degraded (it fails closed in the router); "optional" has nothing to verify and accepts unsigned
+  for (const secret of [undefined, null, "", "too-short"]) {
+    const r = createSigningVerifier({ secret, mode: "required" });
+    assert.deepEqual([r.mode, r.active, r.failClosed], ["required", false, true], String(secret));
+    const o = createSigningVerifier({ secret, mode: "optional" });
+    assert.deepEqual([o.mode, o.active, o.failClosed], ["optional", false, false]);
+    assert.deepEqual(o.checkHeaders(garbage), { ok: true, signed: false }, "nothing to verify with: accepted as unsigned");
+  }
+  assert.equal(createSigningVerifier({ secret: CURRENT, mode: "bogus" }).mode, "optional", "an unknown mode is never off and never required");
+  assert.deepEqual(createSigningVerifier({ secret: CURRENT, mode: "bogus" }).status().warnings, ["mode_invalid"]);
+  assert.deepEqual([createSigningVerifier().mode, createSigningVerifier().active], ["off", false]);
 });
 
 // ---------------------------------------------------------------- environment ------------------------------------------------------------
 
-test("env: defaults, the 32-character floor, the mode switch, and required never enforced without a secret", () => {
-  const run = (env) => { const w = []; return { ...signingConfigFromEnv(env, (m) => w.push(m)), warnings: w }; };
-  assert.deepEqual(run({}), { secret: null, previousSecret: null, mode: "off", warnings: [] }, "nothing set: off, silent");
-  assert.deepEqual(run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT }), { secret: CURRENT, previousSecret: null, mode: "optional", warnings: [] });
+test("env: off is explicit only; an unset or unknown mode is optional; required is never degraded; the 32-character floor", () => {
+  const run = (env) => { const w = []; return { ...signingConfigFromEnv(env, (m) => w.push(m)), log: w }; };
+  const base = (r) => [r.secret, r.previousSecret, r.mode, r.secretError, r.warnings];
+  assert.deepEqual(base(run({})), [null, null, "optional", "secret_missing", []], "nothing set: optional with nothing to verify (not off)");
+  assert.equal(run({}).log.length, 0, "silent");
+  assert.deepEqual(base(run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT })), [CURRENT, null, "optional", null, []]);
   assert.equal(run({ BASHT_BRIDGE_SIGNING_SECRET: `  ${CURRENT}\n` }).secret, CURRENT, "trimmed, like the app token");
   const both = run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: PREVIOUS });
-  assert.equal(both.previousSecret, PREVIOUS);
-  assert.equal(both.mode, "optional");
+  assert.deepEqual([both.previousSecret, both.mode], [PREVIOUS, "optional"]);
   for (const mode of ["off", "optional", "required", " Required "]) assert.equal(run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: mode }).mode, mode.trim().toLowerCase());
-  // too short: ignored with one warning each
+  assert.equal(run({ BASHT_BRIDGE_SIGNING_MODE: "off" }).mode, "off", "off is possible, but only when asked for");
+  // too short: not a secret (a warning, never the value)
   const short = run({ BASHT_BRIDGE_SIGNING_SECRET: "x".repeat(31) });
-  assert.deepEqual([short.secret, short.mode, short.warnings.length], [null, "off", 1]);
-  assert.ok(!short.warnings.join().includes("xxx"), "the warning never carries the value");
+  assert.deepEqual([short.secret, short.mode, short.secretError, short.log.length], [null, "optional", "secret_invalid", 1]);
+  assert.ok(!short.log.join().includes("xxx"));
   assert.equal(run({ BASHT_BRIDGE_SIGNING_SECRET: "x".repeat(32) }).secret, "x".repeat(32));
   const shortPrev = run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: "short" });
-  assert.deepEqual([shortPrev.previousSecret, shortPrev.mode, shortPrev.warnings.length], [null, "optional", 1]);
-  // a previous secret alone is meaningless
-  const prevOnly = run({ BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: PREVIOUS });
-  assert.deepEqual([prevOnly.secret, prevOnly.previousSecret, prevOnly.mode, prevOnly.warnings.length], [null, null, "off", 1]);
-  // "required" without a valid secret never enables (a typo cannot lock the owner out); so does "optional"
-  for (const mode of ["required", "optional"]) {
-    const r = run({ BASHT_BRIDGE_SIGNING_MODE: mode });
-    assert.deepEqual([r.mode, r.warnings.length], ["off", 1], mode);
-    assert.equal(run({ BASHT_BRIDGE_SIGNING_SECRET: "short", BASHT_BRIDGE_SIGNING_MODE: mode }).mode, "off");
+  assert.deepEqual([shortPrev.previousSecret, shortPrev.mode, shortPrev.log.length], [null, "optional", 1]);
+  // required is NEVER turned into anything else: it is reported as required with the reason it cannot work, and a loud log line
+  for (const [env, why] of [[{}, "secret_missing"], [{ BASHT_BRIDGE_SIGNING_SECRET: "short" }, "secret_invalid"],
+    [{ BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: PREVIOUS }, "previous_only"], [{ BASHT_BRIDGE_SIGNING_SECRET: "short", BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: PREVIOUS }, "secret_invalid"]]) {
+    const r = run({ ...env, BASHT_BRIDGE_SIGNING_MODE: "required" });
+    assert.deepEqual([r.mode, r.secretError, r.secret], ["required", why, null], why);
+    assert.ok(r.log.some((l) => l.includes("503 signing_unavailable") && l.includes(why)), `loud: ${r.log}`);
   }
-  assert.deepEqual(run({ BASHT_BRIDGE_SIGNING_MODE: "off" }), { secret: null, previousSecret: null, mode: "off", warnings: [] });
-  // an unknown mode falls back to the default and says so
-  const typo = run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: "requierd" });
-  assert.deepEqual([typo.mode, typo.warnings.length], ["optional", 1]);
-  assert.equal(run({ BASHT_BRIDGE_SIGNING_MODE: "requierd" }).mode, "off");
-  assert.deepEqual(signingConfigFromEnv(undefined), { secret: null, previousSecret: null, mode: "off" });
+  assert.deepEqual(run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: "required" }).log, [], "a usable secret: nothing to shout about");
+  // an unknown mode value is optional with a warning: never required by typo, never silently off
+  for (const typo of ["requierd", "on", "true", "enforce", "strict", "0"]) {
+    const t = run({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: typo });
+    assert.deepEqual([t.mode, t.warnings, t.log.length], ["optional", ["mode_invalid"], 1], typo);
+  }
+  assert.deepEqual(base(run({ BASHT_BRIDGE_SIGNING_MODE: "requierd" })).slice(2, 5), ["optional", "secret_missing", ["mode_invalid"]]);
+  const none = signingConfigFromEnv(undefined);
+  assert.deepEqual([none.secret, none.mode, none.secretError], [null, "optional", "secret_missing"]);
 });
 
 // ---------------------------------------------------------------- the router -------------------------------------------------------------
@@ -265,7 +275,7 @@ after(() => fs.rmSync(dir, { recursive: true, force: true }));
 async function mount({ signing, token = APP_TOKEN, clock = { t: V.cases[0].timestamp * 1000 }, transcribe = async () => "نص" } = {}) {
   const app = express();
   app.use("/app/v1", createAppBridge({ token, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath, fetchImpl: gateway, now: () => clock.t, transcribe,
-    gatewayCall: async () => ({ ok: true }), ...(signing ? { signing } : {}) }));
+    gatewayCall: async () => ({ ok: true }), ...(signing ? { signing: { bootEpoch: V.cases[0].timestamp - 100, ...signing } } : {}) })); // boot long before the vectors, unless a test says otherwise
   const srv = app.listen(0, "127.0.0.1");
   await new Promise((r) => srv.once("listening", r));
   const origin = `http://127.0.0.1:${srv.address().port}`;
@@ -280,6 +290,8 @@ async function mount({ signing, token = APP_TOKEN, clock = { t: V.cases[0].times
   const plain = (p, { headers = {}, token: tk = APP_TOKEN } = {}) => fetch(`${origin}/app/v1${p}`, { headers: { ...(tk ? { authorization: `Bearer ${tk}` } : {}), ...headers } }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
   return { origin, send, plain, clock, close: () => srv.close() };
 }
+/** The `signing` object of GET /status for a mode that is verifying, or not. */
+const shape = (mode, active, extra = {}) => ({ mode, active, warnings: [], replayProtection: "memory+boot_fence", ...extra });
 const CONF = { secret: CURRENT, previousSecret: PREVIOUS, mode: "optional" };
 const passed = (r) => r.status !== 401 && r.status !== 429;
 
@@ -345,16 +357,16 @@ test("router: modes over HTTP — off ignores signatures; optional: unsigned pas
     for (const [m, label] of [[off, "no config"], [explicitOff, "mode off"]]) {
       assert.equal((await m.plain("/status")).status, 200, `${label}: unsigned`);
       assert.equal((await m.plain("/status", { headers: { "x-basht-signature": "garbage", "x-basht-nonce": "x" } })).status, 200, `${label}: garbage headers are ignored`);
-      assert.deepEqual((await m.plain("/status")).json.signing, { mode: "off" });
+      assert.deepEqual((await m.plain("/status")).json.signing, shape("off", false));
     }
     // optional: never locks anyone out. A signature that is present but not valid is processed as an UNSIGNED request (the bearer
     // token still applies) and the reason is remembered for /status
     assert.equal((await optional.plain("/status")).status, 200, "an old app (no headers) keeps working");
-    assert.deepEqual((await optional.plain("/status")).json.signing, { mode: "optional" }, "nothing rejected so far");
+    assert.deepEqual((await optional.plain("/status")).json.signing, shape("optional", true), "nothing rejected so far");
     const garbage = await optional.plain("/status", { headers: { "x-basht-signature": "garbage" } });
     assert.equal(garbage.status, 200, "a wrong signature does not lock the owner out");
     assert.deepEqual(garbage.json.signing.mode, "optional");
-    assert.deepEqual((await optional.plain("/status")).json.signing, { mode: "optional", lastRejected: { reason: "malformed", at: clock.t } });
+    assert.deepEqual((await optional.plain("/status")).json.signing, shape("optional", true, { lastRejected: { reason: "malformed", at: clock.t } }));
     assert.equal((await optional.plain("/status", { headers: { "x-basht-nonce": "a".repeat(20) } })).status, 200, "one header alone: unsigned");
     const g = V.cases[0];
     assert.equal((await optional.send(g)).status, 200, "a valid signed GET passes");
@@ -456,7 +468,7 @@ test("router: status reports the mode and never a secret", async () => {
     c.bodyBase64 = "";
     const ok = await m.send(c);
     assert.equal(ok.status, 200);
-    assert.deepEqual(ok.json.signing, { mode: "required", lastRejected: { reason: "signature", at: V.cases[0].timestamp * 1000 } }, "the refused attempt above is what /status remembers");
+    assert.deepEqual(ok.json.signing, shape("required", true, { lastRejected: { reason: "signature", at: V.cases[0].timestamp * 1000 } }), "the refused attempt above is what /status remembers");
     const blob = JSON.stringify(ok.json);
     assert.ok(!blob.includes(CURRENT) && !blob.includes(PREVIOUS));
   } finally { m.close(); }
@@ -483,11 +495,17 @@ test("a bridge refuses to exist without the app token, signing or not", () => {
   assert.equal(createAppBridge({ token: "short", gatewayUrl: "x", gatewayToken: "y", configPath: "z", signing: { secret: CURRENT, mode: "required" } }), null);
 });
 
-test("a previous secret without a current one never enforces anything (a retired key must not lock the owner out)", () => {
-  assert.equal(createSigningVerifier({ secret: null, previousSecret: PREVIOUS, mode: "required" }).mode, "off");
-  assert.equal(createSigningVerifier({ secret: "short", previousSecret: PREVIOUS, mode: "required" }).mode, "off");
-  // a too-short previous secret next to a good current one is simply not a second key
+test("a previous secret without a current one is NOT a way in: required fails closed (previous_only), optional has nothing to verify", () => {
+  const r = createSigningVerifier({ secret: null, previousSecret: PREVIOUS, mode: "required" });
+  assert.deepEqual([r.mode, r.active, r.failClosed], ["required", false, true]);
+  assert.deepEqual(r.status(), { mode: "required", active: false, error: "previous_only", warnings: [], replayProtection: "memory+boot_fence" });
+  assert.deepEqual(createSigningVerifier({ secret: "short", previousSecret: PREVIOUS, mode: "required" }).status().error, "secret_invalid");
+  assert.deepEqual(createSigningVerifier({ mode: "required" }).status().error, "secret_missing");
+  assert.deepEqual(createSigningVerifier({ secret: null, previousSecret: PREVIOUS, mode: "optional" }).status(), { mode: "optional", active: false, reason: "previous_only", warnings: [], replayProtection: "memory+boot_fence" });
+  // the retired key never verifies anything on its own
   const prev = V.cases.find((c) => c.signedWith === "previous");
+  assert.deepEqual(createSigningVerifier({ secret: null, previousSecret: PREVIOUS, mode: "optional", now: clockAt(prev) }).checkHeaders(req(prev)), { ok: true, signed: false });
+  // a too-short previous secret next to a good current one is simply not a second key
   assert.equal(createSigningVerifier({ secret: CURRENT, previousSecret: "short", mode: "required", now: clockAt(prev) }).checkHeaders(req(prev)).reason, "signature");
 });
 
@@ -570,12 +588,158 @@ test("router (I3): the rejection reason is logged once a minute per reason, with
   } finally { srv.close(); }
 });
 
-test("router (I3): 'required' without a valid secret degrades to off, visible as status.signing.mode", async () => {
+test("router (A): 'required' without a usable secret FAILS CLOSED — 503 signing_unavailable on everything but GET /status, never unsigned acceptance", async () => {
   const clock = { t: V.cases[0].timestamp * 1000 };
-  const m = await mount({ signing: signingConfigFromEnv({ BASHT_BRIDGE_SIGNING_MODE: "required" }, () => {}), clock });
+  const lines = [];
+  for (const [env, error] of [[{}, "secret_missing"], [{ BASHT_BRIDGE_SIGNING_SECRET: "short" }, "secret_invalid"], [{ BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS: PREVIOUS }, "previous_only"]]) {
+    const signing = signingConfigFromEnv({ ...env, BASHT_BRIDGE_SIGNING_MODE: "required" }, () => {});
+    const app = express();
+    app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath, fetchImpl: gateway, now: () => clock.t,
+      transcribe: async () => "x", gatewayCall: async () => ({ ok: true }), log: { warn: (_t, m) => lines.push(m), info() {} }, signing }));
+    const srv = app.listen(0, "127.0.0.1");
+    await new Promise((r) => srv.once("listening", r));
+    const o = `http://127.0.0.1:${srv.address().port}/app/v1`;
+    const h = { authorization: `Bearer ${APP_TOKEN}`, "content-type": "application/json" };
+    try {
+      for (const [method, p, body] of [["GET", "/sessions"], ["GET", "/history"], ["POST", "/send", '{"message":"x"}'], ["POST", "/speak", '{"text":"x"}'], ["POST", "/new"],
+        ["GET", "/events"], ["GET", "/approvals"], ["GET", "/media"], ["GET", "/nope"], ["DELETE", "/status"], ["POST", "/status"], ["GET", "/status/x"], ["HEAD", "/status"]]) {
+        const r = await fetch(o + p, { method, headers: h, body });
+        if (method === "HEAD") { assert.equal(r.status, 503, `${method} ${p}`); continue; }
+        assert.equal(r.status, 503, `${error} ${method} ${p}`);
+        assert.deepEqual(await r.json(), { ok: false, error: "signing_unavailable" });
+      }
+      // a valid-looking signature does not help: there is no secret to verify it with
+      const c = V.cases[0];
+      const signed = await fetch(o + "/sessions", { headers: { ...h, ...hdr(c) } });
+      assert.equal(signed.status, 503);
+      // the bearer check still comes first
+      assert.deepEqual(await (await fetch(o + "/sessions")).json(), { ok: false, error: "unauthorized" });
+      assert.equal((await fetch(o + "/sessions", { headers: { authorization: "Bearer wrong" } })).status, 401);
+      // GET /status stays reachable with the bearer and says why
+      const st = await fetch(o + "/status", { headers: h });
+      assert.equal(st.status, 200);
+      assert.deepEqual((await st.json()).signing, shape("required", false, { error }));
+      assert.deepEqual((await (await fetch(o + "/status")).json()), { ok: false, error: "unauthorized" }, "not without the bearer");
+    } finally { srv.close(); }
+  }
+  assert.ok(lines.length >= 3 && lines.every((l) => /signing is required but its secret is unusable \((secret_missing|secret_invalid|previous_only)\)/.test(l)), JSON.stringify(lines));
+});
+
+test("router (A): the 503 refusals are logged loudly but throttled, and never carry a secret", async () => {
+  const clock = { t: V.cases[0].timestamp * 1000 };
+  const lines = [];
+  const app = express();
+  app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath, fetchImpl: gateway, now: () => clock.t,
+    log: { warn: (_t, m) => lines.push(m), info() {} }, signing: signingConfigFromEnv({ BASHT_BRIDGE_SIGNING_SECRET: "tiny-secret-value", BASHT_BRIDGE_SIGNING_MODE: "required" }, () => {}) }));
+  const srv = app.listen(0, "127.0.0.1");
+  await new Promise((r) => srv.once("listening", r));
   try {
-    const r = await m.plain("/status");
-    assert.equal(r.status, 200);
-    assert.deepEqual(r.json.signing, { mode: "off" });
-  } finally { m.close(); }
+    for (let i = 0; i < 6; i++) await fetch(`http://127.0.0.1:${srv.address().port}/app/v1/sessions`, { headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    assert.equal(lines.length, 1);
+    clock.t += 61_000;
+    await fetch(`http://127.0.0.1:${srv.address().port}/app/v1/sessions`, { headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    assert.equal(lines.length, 2);
+    assert.ok(!lines.join().includes("tiny-secret-value"));
+  } finally { srv.close(); }
+});
+
+test("router (A): optional without a usable secret accepts unsigned requests and says why; an unknown mode is optional + mode_invalid; off is explicit", async () => {
+  const clock = { t: V.cases[0].timestamp * 1000 };
+  const opt = await mount({ signing: signingConfigFromEnv({}, () => {}), clock });
+  const typo = await mount({ signing: signingConfigFromEnv({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: "requierd" }, () => {}), clock });
+  const off = await mount({ signing: signingConfigFromEnv({ BASHT_BRIDGE_SIGNING_SECRET: CURRENT, BASHT_BRIDGE_SIGNING_MODE: "off" }, () => {}), clock });
+  try {
+    const a = await opt.plain("/status");
+    assert.equal(a.status, 200);
+    assert.deepEqual(a.json.signing, shape("optional", false, { reason: "secret_missing" }));
+    assert.equal((await opt.plain("/sessions")).status, 200, "requests are accepted unsigned");
+    assert.equal((await opt.plain("/status", { headers: { "x-basht-signature": "garbage" } })).status, 200);
+    const t = await typo.plain("/status");
+    assert.deepEqual(t.json.signing, { mode: "optional", active: true, warnings: ["mode_invalid"], replayProtection: "memory+boot_fence" });
+    assert.equal((await typo.plain("/sessions")).status, 200, "an unsigned request is not refused by a mistyped mode");
+    assert.deepEqual((await off.plain("/status")).json.signing, shape("off", false));
+  } finally { opt.close(); typo.close(); off.close(); }
+});
+
+/** A signed GET of `target` as `send()` expects it (a vector-shaped case). */
+function signedGet(target, timestamp, nonce) {
+  const contentSha256 = sha256Hex(Buffer.alloc(0));
+  const c = { method: "GET", target, timestamp, nonce, contentSha256 };
+  return { ...c, name: "signed-get", bodyBase64: "", signature: signCanonical(CURRENT, canonicalString(c)) };
+}
+
+// ---------------------------------------------------------------- (B) the restart fence ----------------------------------------------------
+
+test("restart fence: a signed request stamped before the process started is refused (before_boot); one stamped after passes", () => {
+  const boot = post.timestamp + 30; // the capture is 30 s older than this process, and still inside the 60 s clock window
+  const at = (c, over = {}) => createSigningVerifier({ secret: CURRENT, previousSecret: PREVIOUS, mode: "required", bootEpoch: boot, now: () => (boot + 5) * 1000, ...over }).checkHeaders(req(c));
+  assert.deepEqual(at(post), { ok: false, reason: "before_boot" }, "a pre-restart capture, even with a genuine signature, inside the clock window");
+  // a genuine request stamped after the start passes; the two-second tolerance covers clock rounding
+  const stamp = (ts, nonce) => {
+    const sha = sha256Hex(Buffer.alloc(0));
+    const c = { method: "GET", target: "/app/v1/status", timestamp: ts, nonce, contentSha256: sha };
+    return { method: "GET", originalUrl: c.target, headers: { "x-basht-timestamp": String(ts), "x-basht-nonce": nonce, "x-basht-content-sha256": sha, "x-basht-signature": signCanonical(CURRENT, canonicalString(c)) } };
+  };
+  const v = (over) => createSigningVerifier({ secret: CURRENT, mode: "required", bootEpoch: boot, now: () => (boot + 5) * 1000, ...over });
+  assert.equal(v().checkHeaders(stamp(boot + 1, "post-boot-nonce-0001")).ok, true);
+  assert.equal(v().checkHeaders(stamp(boot, "at-boot-nonce-000001")).ok, true);
+  assert.equal(v().checkHeaders(stamp(boot - 2, "edge-nonce-0000000001")).ok, true, "boot - 2 s is the tolerance");
+  assert.deepEqual(v().checkHeaders(stamp(boot - 3, "before-nonce-00000001")), { ok: false, reason: "before_boot" });
+  assert.equal(BOOT_FENCE_SECONDS, 2);
+  // the default boot epoch is the moment the verifier is made (the process start)
+  let t = 5_000_000_000;
+  const started = createSigningVerifier({ secret: CURRENT, mode: "required", now: () => t });
+  assert.equal(started.bootEpoch, 5_000_000);
+  t += 10_000;
+  assert.deepEqual(started.checkHeaders(stamp(5_000_000 - 3, "captured-nonce-000001")), { ok: false, reason: "before_boot" });
+  assert.equal(started.checkHeaders(stamp(5_000_000 + 8, "fresh-nonce-00000001")).ok, true);
+});
+
+test("restart fence: the shared vectors still verify with a boot epoch earlier than their timestamps; and a 'restart' makes the same captured request fail", () => {
+  for (const c of V.cases) {
+    const v = createSigningVerifier({ secret: CURRENT, previousSecret: PREVIOUS, mode: "required", now: clockAt(c), bootEpoch: c.timestamp - 3600 });
+    assert.deepEqual(v.checkHeaders(req(c)), { ok: true, signed: true, contentSha256: c.contentSha256 }, c.name);
+  }
+  // before a restart the request verifies once, replay is refused; after a restart (new process: empty nonce memory, later boot) the SAME capture is refused
+  const c = V.cases[1];
+  const before = createSigningVerifier({ secret: CURRENT, mode: "required", now: clockAt(c), bootEpoch: c.timestamp - 10 });
+  assert.equal(before.checkHeaders(req(c)).ok, true);
+  assert.equal(before.checkHeaders(req(c)).reason, "replay");
+  const after = createSigningVerifier({ secret: CURRENT, mode: "required", now: () => (c.timestamp + 30) * 1000, bootEpoch: c.timestamp + 20 });
+  assert.deepEqual(after.checkHeaders(req(c)), { ok: false, reason: "before_boot" }, "the nonce memory is gone, the fence is not");
+});
+
+test("restart fence over HTTP: required => 401 bad_signature; optional => accepted as unsigned with lastRejected before_boot", async () => {
+  const c = V.cases[0];
+  const clock = { t: (c.timestamp + 100) * 1000 };
+  const req_ = await mount({ signing: { ...CONF, mode: "required", bootEpoch: c.timestamp + 90 }, clock });
+  const opt = await mount({ signing: { ...CONF, mode: "optional", bootEpoch: c.timestamp + 90 }, clock });
+  try {
+    clock.t = (c.timestamp + 50) * 1000; // the captured request is still inside the 60 s window ...
+    const a = await req_.send(c);
+    assert.deepEqual([a.status, a.json], [401, { ok: false, error: "bad_signature" }]);
+    const b = await opt.send(c);
+    assert.equal(b.status, 200, "optional never locks out");
+    assert.equal((await opt.plain("/status")).json.signing.lastRejected.reason, "before_boot");
+    // "required" needs a signed request even to read /status: a fresh one (stamped after the boot) works and shows the same reason
+    clock.t = (c.timestamp + 95) * 1000;
+    const st = await req_.send(signedGet("/app/v1/status", c.timestamp + 95, "status-after-boot-0001"));
+    assert.equal(st.status, 200);
+    assert.equal(st.json.signing.lastRejected.reason, "before_boot");
+  } finally { req_.close(); opt.close(); }
+});
+
+test("status: signing.replayProtection says memory+boot_fence in every mode (and the docs say it is not durable)", async () => {
+  for (const signing of [undefined, { ...CONF, mode: "optional" }, { ...CONF, mode: "required" }, { ...CONF, mode: "off" }]) {
+    const m = await mount({ signing });
+    try {
+      const r = signing?.mode === "required" ? await m.send(signedGet("/app/v1/status", V.cases[0].timestamp, "replay-status-0000001")) : await m.plain("/status");
+      assert.equal(r.json.signing.replayProtection, "memory+boot_fence");
+    } finally { m.close(); }
+  }
+  const docs = fs.readFileSync(new URL("../docs/BASHT_APP_BRIDGE.md", import.meta.url), "utf8");
+  assert.match(docs, /NOT durable/);
+  assert.match(docs, /single replica/);
+  const src = fs.readFileSync(new URL("./app-bridge-signing.js", import.meta.url), "utf8");
+  assert.match(src, /NOT DURABLE/);
 });

@@ -53,6 +53,7 @@ import { normalizeWhatsAppSender, whatsAppOwnersFrom } from "../patches/whatsapp
 import { createLiveRoutes } from "./app-bridge-live.js";
 import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
 import { createSigningVerifier } from "./app-bridge-signing.js";
+import { createRunsProbe } from "./app-bridge-runs.js";
 import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
@@ -314,6 +315,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   // A signature this bridge did not accept: remembered (reason + time, for /status) and logged once a minute per reason. Never a header value.
   let lastRejected = null;
   const loggedAt = new Map();
+  const noteLoud = (key, message) => {
+    const t = now();
+    if (t - (loggedAt.get(key) ?? -Infinity) >= SIGNATURE_LOG_EVERY_MS) { loggedAt.set(key, t); log?.warn?.("app-bridge", message); }
+  };
   const noteRejected = (reason) => {
     const t = now();
     lastRejected = { reason, at: t };
@@ -327,6 +332,12 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
     // A valid token always passes the token check: anonymous failures must never lock the owner's app out (they only slow down guessing).
     if (!(m && safeEqual(m[1].trim(), appToken))) return authFailure(res, "unauthorized");
+    // "required" with a missing or unusable secret FAILS CLOSED: it is never read as "off". Everything but GET /status (so the owner can
+    // see why) answers 503, after the bearer check, and nothing is processed.
+    if (verifier.failClosed && !(req.method === "GET" && req.path === "/status")) {
+      noteLoud("signing_unavailable", `signing is required but its secret is unusable (${verifier.status().error}): refusing /app/v1 requests`);
+      return res.status(503).json({ ok: false, error: "signing_unavailable" });
+    }
     // Signing (when configured) comes on top of the token, never instead of it. Header phase here; the body hash is checked once the body is read.
     const sig = verifier.checkHeaders(req);
     if (!sig.ok) {
@@ -391,8 +402,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     res.status(502).json({ ok: false, error: "engine_unavailable" });
   };
 
-  // Cheap by design (the deploy tooling and the app poll it): the config file and in-memory state only. No gateway call, no TTS call.
-  router.get("/status", (_req, res) => {
+  // Cheap by design (the deploy tooling and the app poll it): the config file, in-memory state and, at most every 3 s, two read-only
+  // counting reads over the persistent link (runs). No TTS call, no write.
+  const runsProbe = createRunsProbe({ link, now });
+  router.get("/status", async (_req, res) => {
     const guard = readVoiceGuard(configPath, { stateDir });
     const version = link?.serverVersion?.() ?? null;
     res.json({
@@ -400,9 +413,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       features: [...FEATURES], // the shared contract with the app (src/fixtures/voice-contract.json)
       voice: { ...speakStatus(guard, { linkUp: link?.isUp?.() === true, toolPath: !!speechDir }), warnings: guard.warnings },
       // turns running right now: a restart of the engine while this is above 0 makes the gateway re-run them (docs: release rule)
-      runs: { active: [...runs.values()].filter((r) => r.status === "running").length },
-      // the mode in effect (a "required" without a valid secret reads "off"), and the last signature this bridge did not accept: a reason and a time
-      signing: { mode: verifier.mode, ...(lastRejected ? { lastRejected } : {}) },
+      runs: await runsProbe.read([...runs.values()].filter((r) => r.status === "running").length),
+      // mode, whether it is verifying (active), why not (error for required, reason for optional), warnings, the replay protection in force
+      // (in memory + boot fence: NOT durable), and the last signature this bridge did not accept: a reason and a time
+      signing: { ...verifier.status(), ...(lastRejected ? { lastRejected } : {}) },
       ...(version ? { engine: { version } } : {}),
     });
   });
