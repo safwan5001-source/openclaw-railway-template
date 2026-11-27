@@ -22,6 +22,7 @@ import {
   isGatewayStartupReady,
 } from "./gateway-readiness.js";
 import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
+import { createAppBridge } from "./app-bridge.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
 import { restrictToOwner } from "./private-permissions.js";
@@ -604,6 +605,8 @@ function isGatewayReady() {
 async function restartGateway() {
   await stopGatewayProcess();
   gatewayRestartCount = 0;
+  // Also after first-time onboarding / a raw config save: the app bridge needs the gateway's chat endpoint (no-op without the bridge).
+  await ensureAppChatEndpoint();
   return ensureGatewayRunning();
 }
 
@@ -641,6 +644,29 @@ app.get("/healthz", async (_req, res) => {
   });
   res.json({ ok: true, gateway: health.gateway });
 });
+
+// BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
+const appBridge = createAppBridge({
+  token: process.env.BASHT_APP_TOKEN,
+  gatewayUrl: GATEWAY_TARGET,
+  gatewayToken: OPENCLAW_GATEWAY_TOKEN,
+  configPath: configPath(),
+  log,
+});
+delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
+if (appBridge) app.use("/app/v1", appBridge);
+else app.use("/app/v1", (_req, res) => res.status(404).json({ ok: false, error: "not_enabled" }));
+
+/** The bridge speaks to the gateway's chat endpoint, which OpenClaw keeps off by default. Enable it only with the bridge. */
+async function ensureAppChatEndpoint() {
+  if (!appBridge) return;
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.http.endpoints.chatCompletions.enabled", "true", "--strict-json"]));
+    log.info("app-bridge", `chat endpoint enable exit=${r.code}`);
+  } catch (err) {
+    log.warn("app-bridge", `could not enable the chat endpoint: ${err.message}`);
+  }
+}
 
 app.get("/setup/healthz", async (_req, res) => {
   const configured = isConfigured();
@@ -1979,6 +2005,7 @@ const server = app.listen(PORT, () => {
       } catch (err) {
         log.warn("wrapper", `doctor --fix failed: ${err.message}`);
       }
+      await ensureAppChatEndpoint();
       await ensureGatewayRunning();
     })().catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
