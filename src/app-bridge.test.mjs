@@ -397,7 +397,8 @@ test("fast: 'on' only when the current model supports fast mode; off/default alw
 test("history: assistant messages carry provider/model, and a model switch carries its fallback record", async () => {
   const r = await call(`/history?key=${encodeURIComponent(APP_SESSION_KEY)}`);
   assert.equal(r.status, 200);
-  assert.deepEqual(r.json.messages, [
+  assert.ok(r.json.messages.every((m) => Array.isArray(m.media) && m.media.length === 0)); // B2: every row carries `media` (and `id`)
+  assert.deepEqual(r.json.messages.map(({ id: _id, media: _media, ...m }) => m), [
     { role: "user", text: "مرحبا", at: 10 },
     { role: "assistant", text: "Model switched from mock/echo to mock/echo2 (server_error).", at: 11, provider: "openclaw", model: "delivery-mirror",
       fallback: { from: "mock/echo", to: "mock/echo2", reason: "server_error" } },

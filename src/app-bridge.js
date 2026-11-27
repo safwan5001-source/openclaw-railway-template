@@ -11,6 +11,13 @@
 //   POST /app/v1/model { model }   -> pins a listed, available model on the app session ("default" clears the pin)
 //   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
 //   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
+//   B1/B2 (src/app-bridge-convo.js, src/app-bridge-media.js):
+//   POST /send { message, images? }-> images ride on the same turn as `image_url` parts (<= 8, <= 10 MB each, <= 14 MB in total)
+//   GET  /runs/:id                 -> also `steps: [{tool, done}]` (tool names only) while the turn runs
+//   GET  /history?…&before=|around=-> earlier rows (also across a reset) / a window around one message; rows carry id, media, kind
+//   POST /app/v1/new               -> «محادثة جديدة»: sessions.reset on the app session (nothing deleted; earlier rows stay readable)
+//   GET  /app/v1/search?q=         -> sessions.search over the readable conversations only
+//   GET  /app/v1/media?key&msg&ref -> one image/file of one message of a readable conversation (engine-owned files only)
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -28,6 +35,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import express from "express";
 import { whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
+import { SEND_BODY_LIMIT, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
+import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
 
 export const APP_SESSION = "app:owner";
 export const APP_SESSION_KEY = "agent:main:app:owner";
@@ -166,9 +175,11 @@ async function readCompletionStream(body, onText) {
  *           fetchImpl?: typeof fetch, now?: () => number,
  *           gatewayCall?: (method: "models.list" | "sessions.describe" | "sessions.patch", params: object) => Promise<any> }} opts
  *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
+ *   stateDir / workspaceDir: OpenClaw's state dir and the agent workspace — the only roots a MEDIA: file may be served from
+ *     (B2), and where the reset ledger lives (B1). Without them no local file is served.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
-export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall }) {
+export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall, stateDir, workspaceDir }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const router = express.Router();
@@ -186,7 +197,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (failures.count > AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
     return res.status(401).json({ ok: false, error: "unauthorized" });
   });
-  router.use(express.json({ limit: "64kb" }));
+  const jsonBody = express.json({ limit: "64kb" });
+  const sendBody = express.json({ limit: SEND_BODY_LIMIT }); // photos ride on the turn (B2); every other route keeps 64 kB
+  router.use((req, res, next) => (req.path === "/send" ? sendBody : jsonBody)(req, res, next));
 
   const gatewayHeaders = { authorization: `Bearer ${gatewayToken}`, "content-type": "application/json" };
 
@@ -240,6 +253,26 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } catch (err) { fail(res, err, "sessions"); }
   });
 
+  // ---- B1/B2 shared state: the reset ledger, the refs handed out, the roots a MEDIA: file may come from ----
+  const ledger = createResetLedger(stateDir);
+  const refs = createRefCache();
+  const roots = mediaRoots(workspaceDir, stateDir);
+  const mediaCtx = { workspaceDir, stateDir, roots };
+  /** Transcript rows -> the app's rows: text (MEDIA: lines and attachment markers removed), media refs, id, reset boundaries. */
+  const mapRows = (key, rows) => rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))).map((m) => {
+    if (isResetRow(m)) return { role: "system", kind: "reset", text: "", at: Number(m.timestamp) || 0, id: rowId(m), media: [] };
+    const { text, media, messageId } = extractMedia(m, key, messageText(m));
+    for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
+    const pub = media.map((it) => {
+      if (it.kind === "link" || it.artifact) return publicMedia(it, true);
+      const abs = resolveSource(it.file, mediaCtx);
+      let size = null; let ok = false;
+      try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots.some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }
+      return publicMedia({ ...it, size }, ok);
+    });
+    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(m.role === "assistant" ? assistantMeta(m) : {}) };
+  }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0);
+
   router.get("/history", async (req, res) => {
     const key = String(req.query.key ?? APP_SESSION_KEY);
     const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit ?? "50"), 10) || 50, 1), 200);
@@ -247,25 +280,38 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     try {
       // The allowlist is decided by the key alone (app, main, the owner's direct WhatsApp chat), never by a listing.
       if (!isReadable({ key }, ownersFromConfig(configPath))) return res.status(404).json({ ok: false, error: "not_found" });
+      const anchor = ["before", "around"].find((k) => req.query[k] !== undefined);
+      if (anchor) {
+        // B1: earlier rows (also across a reset) or a window around one message: an anchored read inside THIS conversation only
+        const id = String(req.query[anchor]);
+        if (!CURSOR_RE.test(id) || (anchor === "around" && id.includes("."))) return bad(res, "bad_request");
+        if (needsCall(res)) return;
+        const p = await anchoredPage(convoCtx, key, id, anchor);
+        return res.json({ ok: true, key, messages: mapRows(key, p.messages), nextOffset: null, hasMore: false, earlier: p.earlier, found: p.found });
+      }
       const args = { sessionKey: key, limit };
       if (offsetRaw !== undefined) args.offset = Math.max(Number.parseInt(String(offsetRaw), 10) || 0, 0);
       const h = await invoke("sessions_history", args);
-      const messages = (Array.isArray(h.messages) ? h.messages : [])
-        .filter((m) => m && (m.role === "user" || m.role === "assistant"))
-        .map((m) => ({ role: m.role, text: messageText(m), at: Number(m.timestamp) || 0, ...(m.role === "assistant" ? assistantMeta(m) : {}) }))
-        .filter((m) => m.text.trim() !== "");
-      res.json({ ok: true, key, messages, nextOffset: Number.isInteger(h.nextOffset) ? h.nextOffset : null, hasMore: h.hasMore === true });
+      const raw = Array.isArray(h.messages) ? h.messages : [];
+      const messages = mapRows(key, raw);
+      // after «محادثة جديدة» the engine's default view starts at the reset row; the rows before it stay readable (anchored)
+      const first = raw.find((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m)));
+      const earlier = h.hasMore !== true && key === APP_SESSION_KEY && first && isResetRow(first) && ledger.anchorFor(rowId(first)) ? rowId(first) : null;
+      res.json({ ok: true, key, messages, nextOffset: Number.isInteger(h.nextOffset) ? h.nextOffset : null, hasMore: h.hasMore === true, earlier });
     } catch (err) { fail(res, err, "history"); }
   });
 
   router.post("/send", (req, res) => {
     const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
-    if (!message || message.length > MAX_MESSAGE_CHARS) return res.status(400).json({ ok: false, error: "bad_request" });
+    const pics = parseImages(req.body?.images);
+    if (pics.error) return res.status(400).json({ ok: false, error: pics.error });
+    if ((!message && !pics.images.length) || message.length > MAX_MESSAGE_CHARS) return res.status(400).json({ ok: false, error: "bad_request" });
     if ([...runs.values()].some((r) => r.status === "running")) return res.status(409).json({ ok: false, error: "busy" });
 
     const id = crypto.randomUUID();
     const ctl = new AbortController();
-    const run = { id, status: "running", text: "", error: null, startedAt: now(), firstTokenAt: null, finishedAt: null, abort: () => ctl.abort() };
+    const run = { id, status: "running", text: "", error: null, startedAt: now(), firstTokenAt: null, finishedAt: null, abort: () => ctl.abort(),
+      steps: [], stepsAt: 0, images: pics.images.length };
     runs.set(id, run);
     while (runs.size > MAX_RUNS_KEPT) runs.delete(runs.keys().next().value);
 
@@ -275,7 +321,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const r = await fetchImpl(`${gatewayUrl}/v1/chat/completions`, {
         method: "POST",
         headers: { ...gatewayHeaders, "x-openclaw-session-key": APP_SESSION },
-        body: JSON.stringify({ model: "openclaw/default", stream: true, messages: [{ role: "user", content: message }] }),
+        body: JSON.stringify({ model: "openclaw/default", stream: true, messages: [{ role: "user", content: turnContent(message, pics.images) }] }),
         signal: ctl.signal,
       });
       if (!r.ok || !r.body) throw new Error(`chat ${r.status}`);
@@ -296,10 +342,21 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     firstTokenMs: r.firstTokenAt == null ? null : r.firstTokenAt - r.startedAt,
     totalMs: r.finishedAt == null ? null : r.finishedAt - r.startedAt,
   });
-  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: r.text, error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r) });
+  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: r.text, error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
+    steps: r.steps ?? [] });
+
+  /** B1 tool progress: refreshed only while the app polls a running turn, at most every STEPS_EVERY_MS; names only. */
+  const refreshSteps = (r) => {
+    if (r.status !== "running" || r.stepsBusy || now() - r.stepsAt < STEPS_EVERY_MS) return;
+    r.stepsBusy = true; r.stepsAt = now();
+    invoke("sessions_history", { sessionKey: APP_SESSION_KEY, limit: 12, includeTools: true })
+      .then((h) => { if (r.status === "running") r.steps = stepsFrom(h.messages, r.startedAt); })
+      .catch(() => {}).finally(() => { r.stepsBusy = false; });
+  };
 
   router.get("/runs/:id", (req, res) => {
     const r = runs.get(req.params.id);
+    if (r) refreshSteps(r);
     return r ? res.json(view(r)) : res.status(404).json({ ok: false, error: "not_found" });
   });
 
@@ -473,7 +530,23 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } catch (err) { if (err?.refused) return bad(res, "rejected"); fail(res, err, "fast patch"); }
   }));
 
+  // ---- B1/B2 routes: «محادثة جديدة», search, media ----
+  const readableKey = (key) => isReadable({ key }, ownersFromConfig(configPath));
+  const convoCtx = { gatewayCall, invoke, appKey: APP_SESSION_KEY, ledger, log, now, fail, turnRunning, readable: readableKey,
+    labelOf: (key) => sessionLabel({ key }),
+    readableKeys: async () => { const owners = ownersFromConfig(configPath); const keys = (await allSessions()).filter((r) => isReadable(r, owners)).map((r) => r.key);
+      return [...new Set([APP_SESSION_KEY, MAIN_SESSION_KEY, ...keys])]; } };
+  registerConvoRoutes(router, convoCtx);
+  registerMediaRoute(router, { ...mediaCtx, readable: readableKey, gatewayCall, cache: refs, log,
+    findMessage: async (key, messageId) => {
+      if (!gatewayCall) return null;
+      const r = await gatewayCall("chat.history", { sessionKey: key, messageId, limit: 1 });
+      return (Array.isArray(r?.messages) ? r.messages : []).find((m) => rowId(m) === messageId) ?? null;
+    } });
+
   // Anything else under /app/v1 ends here: it must never fall through to the gateway proxy (that would forward the app token).
   router.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));
+  // a body the parser refused (too large, not JSON) is answered in the bridge's own JSON shape, never as an HTML error page
+  router.use((err, _req, res, _next) => res.status(err?.status === 413 ? 413 : 400).json({ ok: false, error: err?.status === 413 ? "too_large" : "bad_request" }));
   return router;
 }
