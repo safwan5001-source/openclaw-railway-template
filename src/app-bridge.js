@@ -21,13 +21,15 @@
 //   write targets APP_SESSION_KEY only, with values validated against what the engine itself listed. No config writes.
 // - The app is the owner's own client, so its turns are owner turns (same agent, same shared memory, same tool policy and
 //   approval rules as the Control UI). They run in their own session (`app:owner`), separate from the WhatsApp chat.
-// - Reads are limited to the owner's own conversations: the app session, the main session and the owner's direct WhatsApp
-//   chat(s) (owners from commands.ownerAllowFrom). Group chats and other people's chats are never listed or read.
+// - Reads are limited to the owner's own conversations: the app session, the owner's direct WhatsApp chat(s) (owners from
+//   commands.ownerAllowFrom; the key is parsed exactly) and the main session ONLY while it can hold nobody else's messages
+//   (mainIsOwnerOnly: session.dmScope per peer, or every DM channel an owner-only allowlist). Group chats and other people's chats
+//   are never listed or read. See docs/BASHT_APP_BRIDGE.md ("Which conversations the app can read").
 // - A turn keeps running if the phone goes away: the bridge, not the phone, holds the upstream request.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import express from "express";
-import { whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
+import { normalizeWhatsAppSender, whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
 
 export const APP_SESSION = "app:owner";
 export const APP_SESSION_KEY = "agent:main:app:owner";
@@ -43,6 +45,12 @@ const MODELS_CACHE_MS = 60_000;
 const MAX_MODEL_REF = 200;
 const FAST_MODES = { on: true, off: false, default: null };
 const RESET_RECHECK_MS = 1500;
+const DESCRIBE_CACHE_MS = 2500; // GET /model polling shares one sessions.describe (a CLI spawn) for this long; any write invalidates it
+const GATEWAY_CONCURRENCY = 2;  // at most this many `openclaw gateway call` processes at once …
+const GATEWAY_QUEUE_MAX = 16;   // … and this many waiting; beyond that a call fails fast (the engine, WhatsApp first, must not starve)
+const PER_PEER_DM_SCOPES = new Set(["per-peer", "per-channel-peer", "per-account-channel-peer"]);
+// agent:main:whatsapp:[<account>:]direct:<peer> — the optional account segment is never a chat-kind word ("group:direct:<x>")
+const WHATSAPP_DIRECT_KEY = /^agent:main:whatsapp:(?:(?!(?:direct|group|channel|thread):)[^:]+:)?direct:([^:]+)$/i;
 
 /** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
 export function safeStr(v, max = 200) {
@@ -110,13 +118,44 @@ export function ownersFromConfig(configPath) {
   }
 }
 
-/** Is this session one the app may read? App + main session, and the owner's own direct WhatsApp chat(s). */
-export function isReadable(row, owners) {
+/**
+ * Can the main session (`agent:main:main`) hold only the owner's own messages? With OpenClaw's default `session.dmScope` ("main")
+ * every admitted direct-message sender lands in it, so it is readable only when DMs are split per peer, or when every configured
+ * channel admits direct messages from owners only (dmPolicy "disabled", or "allowlist" whose entries are all owners — verifiable
+ * for WhatsApp only). "pairing"/"open" or any other channel → not owner-only. Never throws (fails closed).
+ */
+export function mainIsOwnerOnly(cfg, owners) {
+  try {
+    if (PER_PEER_DM_SCOPES.has(String(cfg?.session?.dmScope ?? ""))) return true;
+    const channels = cfg?.channels && typeof cfg.channels === "object" ? cfg.channels : {};
+    return Object.entries(channels).every(([name, c]) => {
+      if (!c || typeof c !== "object" || c.enabled === false || c.dmPolicy === "disabled") return true;
+      if (name !== "whatsapp" || c.dmPolicy !== "allowlist" || !Array.isArray(c.allowFrom) || !c.allowFrom.length) return false;
+      return c.allowFrom.every((e) => { const n = normalizeWhatsAppSender(e); return !!n && owners.includes(n); });
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** What the app may read, from the gateway config (read fresh on each call; the file is small). Never throws. */
+export function readPolicyFromConfig(configPath) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const owners = whatsAppOwnersFrom(cfg?.commands?.ownerAllowFrom);
+    return { owners, mainReadable: mainIsOwnerOnly(cfg, owners) };
+  } catch {
+    return { owners: [], mainReadable: false };
+  }
+}
+
+/** Is this session one the app may read? The app session, the owner's own direct WhatsApp chat(s), and main if owner-only. */
+export function isReadable(row, owners, mainReadable = false) {
   const key = String(row?.key ?? "");
-  if (key === APP_SESSION_KEY || key === MAIN_SESSION_KEY) return true;
-  if (!/^agent:main:whatsapp:(?:[^:]+:)?direct:/i.test(key)) return false;
-  const peer = key.slice(key.lastIndexOf(":") + 1);
-  const digits = peer.replace(/\D/g, "");
+  if (key === APP_SESSION_KEY) return true;
+  if (key === MAIN_SESSION_KEY) return mainReadable === true;
+  const m = WHATSAPP_DIRECT_KEY.exec(key); // exact: no extra segments (e.g. …:direct:<other>:<owner>) and no group keys
+  const digits = m ? m[1].replace(/\D/g, "") : "";
   return digits.length > 0 && owners.some((o) => o === `+${digits}`);
 }
 
@@ -133,6 +172,19 @@ function sessionLabel(row) {
   if (row.key === MAIN_SESSION_KEY) return "الجلسة الرئيسية";
   if (String(row.key).includes(":whatsapp:")) return "واتساب";
   return String(row.label || row.title || row.key);
+}
+
+/** At most `max` calls of `fn` at once, up to `queueMax` waiting (first come, first served); more fail at once. */
+export function capConcurrency(fn, max, queueMax) {
+  let active = 0;
+  const waiting = [];
+  const next = () => { if (active < max && waiting.length) { active++; waiting.shift()(); } };
+  return (...args) => {
+    if (active >= max && waiting.length >= queueMax) return Promise.reject(new Error("gateway call queue full"));
+    return new Promise((resolve) => { waiting.push(resolve); next(); })
+      .then(() => fn(...args))
+      .finally(() => { active--; next(); });
+  };
 }
 
 /** Reads the SSE stream of /v1/chat/completions, calling onText with the growing text (the first call marks the first token). */
@@ -168,9 +220,10 @@ async function readCompletionStream(body, onText) {
  *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
-export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall }) {
+export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
+  const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
   const router = express.Router();
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
@@ -229,8 +282,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
 
   router.get("/sessions", async (_req, res) => {
     try {
-      const owners = ownersFromConfig(configPath);
-      const rows = (await allSessions()).filter((r) => isReadable(r, owners));
+      const { owners, mainReadable } = readPolicyFromConfig(configPath);
+      const rows = (await allSessions()).filter((r) => isReadable(r, owners, mainReadable));
       const sessions = rows
         .map((r) => ({ key: r.key, label: sessionLabel(r), channel: String(r.channel ?? ""), updatedAt: Number(r.updatedAt) || 0,
           status: String(r.status ?? ""), writable: r.key === APP_SESSION_KEY }))
@@ -246,7 +299,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const offsetRaw = req.query.offset;
     try {
       // The allowlist is decided by the key alone (app, main, the owner's direct WhatsApp chat), never by a listing.
-      if (!isReadable({ key }, ownersFromConfig(configPath))) return res.status(404).json({ ok: false, error: "not_found" });
+      const { owners, mainReadable } = readPolicyFromConfig(configPath);
+      if (!isReadable({ key }, owners, mainReadable)) return res.status(404).json({ ok: false, error: "not_found" });
       const args = { sessionKey: key, limit };
       if (offsetRaw !== undefined) args.offset = Math.max(Number.parseInt(String(offsetRaw), 10) || 0, 0);
       const h = await invoke("sessions_history", args);
@@ -287,7 +341,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         run.error = run.status === "error" ? "engine_error" : null;
         if (run.status === "error") log?.warn?.("app-bridge", `run failed: ${err?.message ?? err}`);
       })
-      .finally(() => { clearTimeout(timer); run.finishedAt = now(); });
+      .finally(() => { clearTimeout(timer); run.finishedAt = now(); forgetDescribe(); }); // the turn saved the session: a cached describe is stale
 
     res.status(202).json({ ok: true, runId: id });
   });
@@ -335,6 +389,19 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (!s || s.key !== APP_SESSION_KEY) throw new Error("sessions.describe: unexpected session");
     return s;
   }
+  // GET /model only: one describe shared by concurrent and closely repeated reads. Writes always describe afresh, and any
+  // write (or a turn ending) makes the next read fetch again.
+  let described = { at: 0, writes: -1, value: null, pending: null };
+  function forgetDescribe() { described = { at: 0, writes: -1, value: null, pending: null }; }
+  function describeForRead() {
+    if (described.value && described.writes === writes && now() - described.at < DESCRIBE_CACHE_MS) return Promise.resolve(described.value);
+    if (described.pending && described.writes === writes) return described.pending;
+    const mark = writes;
+    const pending = describeApp().then((value) => { if (described.pending === pending) described = { at: now(), writes: mark, value, pending: null }; return value; },
+      (err) => { if (described.pending === pending) described = { at: 0, writes: -1, value: null, pending: null }; throw err; });
+    described = { at: 0, writes: mark, value: null, pending };
+    return pending;
+  }
 
   // Settings writes (model / thinking / fast) run one at a time — two devices changing settings together never interleave
   // (e.g. a level validated against the old model landing on the new one). A new turn waits for the queue to drain.
@@ -369,7 +436,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (needsCall(res)) return;
     try {
       const [s, hist, models] = await Promise.all([
-        describeApp(),
+        describeForRead(),
         invoke("sessions_history", { sessionKey: APP_SESSION_KEY, limit: 20 }).catch(() => null),
         listModels().then((m) => m.rows).catch(() => null),
       ]);
