@@ -158,6 +158,8 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   let retryTimer = null;
   let watchdog = null;
   let tickMs = DEFAULT_TICK_MS;
+  let approvalsSynced = false; // true only once EVERY approval list was read on the CURRENT connection (an empty map before that is "unknown", not zero)
+  let syncGen = 0; // bumps on every (re)connect and drop: a resync that finishes after its connection ended must not mark the next one synced
   let serverVersion = null; // hello-ok `server.version` of the current connection (an engine version label, nothing else)
   let stopped = true;
 
@@ -228,6 +230,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
 
   /** After (re)connecting: the pending approvals are read again, and any that arrived while the link was down enter the ring. */
   async function resync() {
+    const gen = syncGen;
     // Only approvals known BEFORE this resync can be forgotten, and only for kinds whose list was actually read: one that
     // arrives as a live event while the lists are being read stays pending (it is simply not in an earlier list answer).
     const before = new Map([...pending].map(([id, p]) => [id, p.kind]));
@@ -245,11 +248,13 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       }
     }
     for (const [id, kind] of before) if (!seen.has(id) && read.has(kind) && pending.get(id)?.kind === kind) pending.delete(id);
+    if (gen === syncGen && state === "up" && read.size === Object.keys(LIST_METHOD).length) approvalsSynced = true;
   }
 
   function dropped(reason) {
     clearTimer(watchdog);
     ws = null;
+    syncGen += 1; approvalsSynced = false;
     failInflight("link_down");
     if (stopped) { setState("off"); return; }
     if (state === "up") { downSince = now(); push({ type: "gateway.down" }); }
@@ -321,6 +326,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
           lastUpAt = now(); downSince = null; lastError = null;
           reconnects += 1;
           push({ type: "gateway.up", downForMs: downFor });
+          syncGen += 1; approvalsSynced = false;
           setState("up");
           armWatchdog();
           resync().catch(() => {});
@@ -349,6 +355,8 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
     kick() { if (!stopped && !ws) { clearTimer(retryTimer); attempt = 0; connect(); } },
     isUp: () => state === "up",
     status: () => ({ state, since, lastUpAt, reconnects: Math.max(0, reconnects - 1), lastError: state === "up" ? null : lastError, pendingApprovals: pending.size }),
+    /** True only once every approval list was read on the CURRENT connection; before that `status().pendingApprovals` is not authoritative. */
+    approvalsSynced: () => state === "up" && approvalsSynced,
     /** The engine version the gateway reported in hello-ok, or null (unknown / link never up). Costs nothing: no request is made. */
     serverVersion: () => serverVersion,
     /**

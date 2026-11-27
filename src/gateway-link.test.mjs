@@ -196,6 +196,38 @@ test("approvals: tracked from events, deduplicated, resynced after a reconnect, 
   link.stop();
 });
 
+test("approvalsSynced: false until every approval list was read on the current connection; reset on drop; a failed list keeps it false", async () => {
+  let releasePlugin; let failPlugin = false;
+  const gw = fakeGateway({
+    lists: { "exec.approval.list": [], "openclaw.approval.list": [] },
+    onReq: (f, reply) => {
+      if (f.method !== "plugin.approval.list") return undefined;
+      if (failPlugin) { reply(false, null, { code: "UNAVAILABLE", message: "x" }); return true; }
+      releasePlugin = () => reply(true, []); return true;
+    },
+  });
+  const link = createGatewayLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS });
+  assert.equal(link.approvalsSynced(), false);
+  link.start();
+  await until(() => link.isUp() && typeof releasePlugin === "function");
+  await tick();
+  assert.equal(link.status().pendingApprovals, 0);
+  assert.equal(link.approvalsSynced(), false, "link is up but one list is still unread: an empty map is not zero");
+  releasePlugin(); await tick(); await tick();
+  assert.equal(link.approvalsSynced(), true);
+  // dropped: unknown again until the next connection has re-read every list
+  gw.last().close();
+  await until(() => link.status().state === "down");
+  assert.equal(link.approvalsSynced(), false);
+  // a list that fails on the next connection leaves it unknown (never a silent zero)
+  failPlugin = true;
+  link.kick();
+  await until(() => link.isUp());
+  await tick(); await tick();
+  assert.equal(link.approvalsSynced(), false);
+  link.stop();
+});
+
 test("resync never forgets an approval that arrived as a live event while the lists were being read", async () => {
   let releasePlugin;
   const gw = fakeGateway({

@@ -16,11 +16,12 @@ const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
 const SECRETS = ["+966500000001", "agent:main:whatsapp:direct:+966500000001", "job-secret-id-1", "/data/workspace/private", "customer name"];
 
 /** A link whose two counting reads answer from `answers`; every request is recorded. */
-function fakeLink({ up = true, pending = 0, answers = {} } = {}) {
+function fakeLink({ up = true, pending = 0, synced = true, answers = {} } = {}) {
   const requests = [];
   const link = {
-    up, pending, requests, answers,
+    up, pending, synced, requests, answers,
     isUp() { return this.up; },
+    approvalsSynced() { return this.up && this.synced; },
     status() { return { state: this.up ? "up" : "down", since: 0, lastUpAt: null, reconnects: 0, lastError: null, pendingApprovals: this.pending }; },
     serverVersion: () => null,
     setDecorator() {},
@@ -85,6 +86,19 @@ test("probe: one source unavailable => null and complete:false (never a guess); 
     assert.deepEqual({ engine: r.engine, cron: r.cron, total: r.total, complete: r.complete }, want, JSON.stringify(want));
     assert.equal(r.active, 1);
   }
+});
+
+test("probe: approvals not yet synced on this connection are unknown (null, complete:false), never zero", async () => {
+  const link = fakeLink({ pending: 0, synced: false, answers: { "sessions.list": sessionsAnswer(0), "cron.list": cronAnswer(0) } });
+  const probe = createRunsProbe({ link, now: () => 0, ttlMs: 0 });
+  const r = await probe.read(0);
+  assert.equal(r.approvalsPending, null);
+  assert.equal(r.complete, false);
+  assert.equal(r.total, 0);
+  link.synced = true;
+  const r2 = await probe.read(0);
+  assert.equal(r2.approvalsPending, 0);
+  assert.equal(r2.complete, true);
 });
 
 test("probe: no link, or a link that is down => engine, cron and approvals are null, complete:false, and no request is made", async () => {

@@ -158,6 +158,7 @@ function fakeLink({ up = true, impl, version = null } = {}) {
     calls,
     impl: impl ?? (async () => ({ audioBase64: MP3.toString("base64"), provider: "openai", outputFormat: "mp3", mimeType: "audio/mpeg", fileExtension: ".mp3" })),
     isUp() { return this.up; },
+    approvalsSynced() { return this.up; },
     status() { return { state: this.up ? "up" : "down", since: 0, lastUpAt: null, reconnects: 0, lastError: null, pendingApprovals: 0 }; },
     serverVersion: () => version,
     setDecorator() {},

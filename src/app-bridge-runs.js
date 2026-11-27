@@ -6,7 +6,8 @@
 //   engine            sessions.list {activeOnly: true} -> `totalCount`: every session with a queued or running turn, across ALL sessions
 //                     (WhatsApp chats, the app, cron-run sessions, subagents: the gateway's live-run projection, before pagination)
 //   cron              cron.list (compact) -> jobs whose `runningAtMs` is set; a truncated list (hasMore) is unknown, never a guess
-//   approvalsPending  the approvals this link is tracking (events + resync); unknown while the link is down
+//   approvalsPending  the approvals this link is tracking (events + resync); unknown while the link is down OR until every approval list
+//                     was read on the current connection (`link.approvalsSynced()`): an empty, not-yet-synced map is never reported as zero
 //   total             active + engine + cron (known parts only). The parts overlap (the app's own turn is also an active session, a
 //                     running cron job also has a session): use `total` only as "is it zero", never as a number of runs.
 //   complete          true only when engine, cron and approvalsPending were all obtained
@@ -60,7 +61,9 @@ export function createRunsProbe({ link, now = Date.now, ttlMs = RUNS_CACHE_MS } 
   return {
     async read(activeApp) {
       const { engine, cron } = await sources();
-      const approvals = link?.isUp?.() ? count(link.status()?.pendingApprovals) : null;
+      const up = link?.isUp?.() === true;
+      // The approval map is only authoritative once every list was read on this connection; before that (or after a failed read) it is unknown.
+      const approvals = up && link.approvalsSynced?.() === true ? count(link.status()?.pendingApprovals) : null;
       return {
         active: activeApp, engine, cron, approvalsPending: approvals,
         total: activeApp + (engine ?? 0) + (cron ?? 0),

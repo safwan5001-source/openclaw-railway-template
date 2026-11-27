@@ -85,7 +85,7 @@ removed with the same rules as history rows, and while the reply is still stream
   | `active` | this bridge, in memory | app turns running right now (always known) |
   | `engine` | link `sessions.list {activeOnly: true, limit: 1, includeGlobal, includeUnknown}`, read as `totalCount` | sessions with a queued or running turn across **all** sessions: WhatsApp chats, the app, cron-run sessions, subagents (the gateway's live-run projection, before pagination; closed params, one row returned and dropped) |
   | `cron` | link `cron.list {includeDisabled, limit: 200, compact, includeDeliveryPreviews: false}` | cron jobs with a running state; a list longer than one page is unknown, not guessed |
-  | `approvalsPending` | the approvals this link tracks (events and resync) | pending exec, plugin and system-agent approvals; unknown while the link is down |
+  | `approvalsPending` | the approvals this link tracks (events and resync) | pending exec, plugin and system-agent approvals; **unknown (`null`) while the link is down and until all three approval lists were read on the current connection** (an empty map right after (re)connecting, or after a failed list read, is never reported as zero) |
   | `total` | `active + engine + cron` (the known parts) | **only meaningful as "is it zero"**: the parts overlap (the app's own turn is also an active session, a running cron job also has a session). Approvals are not in it |
   | `complete` | `true` only if `engine`, `cron` and `approvalsPending` were all obtained | `false` means the picture is partial |
 
