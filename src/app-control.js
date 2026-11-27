@@ -204,9 +204,16 @@ export function mapHit(h, providerId = "memory-core") {
   return { file, snippet, score: num(h.score), lines, date: /^\d{4}-\d{2}-\d{2}/.exec(file)?.[0] ?? null, reference: ref };
 }
 
-/** Text paging: PART_CHARS per part, at most MAX_PARTS. */
+/** Whole memory text for display: the same path / secret-shaped-token redaction as cleanText, with layout kept (no trimming,
+ * no collapsing, newlines and tabs kept; other control characters removed). */
+export function redactText(v) {
+  if (typeof v !== "string") return "";
+  return v.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").replace(PATHISH, "…").replace(SECRETISH, "…");
+}
+
+/** Text paging: PART_CHARS per part, at most MAX_PARTS. The text is redacted (redactText) before it is paged. */
 export function textPart(text, part) {
-  const t = typeof text === "string" ? text.replace(/\r\n/g, "\n") : "";
+  const t = redactText(text);
   const parts = Math.max(1, Math.min(MAX_PARTS, Math.ceil(t.length / PART_CHARS)));
   const p = Math.min(Math.max(part, 0), parts - 1);
   return { text: t.slice(p * PART_CHARS, (p + 1) * PART_CHARS), part: p, parts, chars: t.length, truncated: t.length > MAX_PARTS * PART_CHARS };

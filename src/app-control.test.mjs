@@ -69,9 +69,9 @@ const RESULTS = {
     { path: "sessions/x.jsonl", snippet: "group chat text", source: "sessions" },
     ...Array.from({ length: Math.max(0, (p.maxResults ?? 10) - 4) }, (_, i) => ({ path: `memory/2026-10-${String(i + 1).padStart(2, "0")}.md`, snippet: `n${i}`, source: "memory" })),
   ] }),
-  "memory.get": (p) => ({ status: "ok", reference: p.reference, text: p.reference.id === "MEMORY.md" ? "x".repeat(45_000) : "# 2026-11-26\nاتفقنا مع النخبة" }),
+  "memory.get": (p) => ({ status: "ok", reference: p.reference, text: p.reference.id === "MEMORY.md" ? "x".repeat(45_000) : "# 2026-11-26\nاتفقنا مع النخبة\nالمفتاح sk-live-abcdefghijklmnop في /data/.openclaw/openclaw.json" }),
   "agents.files.get": (p) => ({ agentId: "main", workspace: "/data/workspace", file: p.name === "USER.md"
-    ? { name: "USER.md", path: "/data/workspace/USER.md", missing: false, size: 30, updatedAtMs: 9, hash: "h", content: "# USER.md\n- يفضّل العربية" }
+    ? { name: "USER.md", path: "/data/workspace/USER.md", missing: false, size: 30, updatedAtMs: 9, hash: "h", content: "# USER.md\n- يفضّل العربية\n- token ghp_abcdefghijklmnop at /data/workspace/secrets.txt" }
     : { name: p.name, path: `/data/workspace/${p.name}`, missing: true } }),
   "channels.status": () => ({ ts: 1, channelOrder: ["whatsapp", "telegram"], channelLabels: { whatsapp: "WhatsApp", telegram: "Telegram" },
     channelAccounts: { whatsapp: [{ accountId: "+966500000001", name: "Safwan", enabled: true, configured: true, linked: true, running: true, connected: true,
@@ -281,6 +281,9 @@ test("memory search: memory files only, validated query, basenames, opaque refs;
   assert.deepEqual(calls("memory.get")[0].params, { reference: { providerId: "memory-core", id: "memory/2026-11-26.md" } });
   assert.equal(item.file, "2026-11-26.md");
   assert.match(item.text, /اتفقنا مع النخبة/);
+  // a full memory page gets the same redaction as search snippets (Codex review on #54)
+  assert.doesNotMatch(item.text, /sk-live|\/data\//);
+  assert.match(item.text, /المفتاح … في …/);
   assert.equal((await get(`/memory/item?ref=${"0".repeat(24)}`)).status, 404);
   assert.equal((await get("/memory/item?ref=memory/2026-11-26.md")).status, 404);
   assert.equal(calls("memory.get").length, 1);
@@ -298,7 +301,8 @@ test("memory files: MEMORY.md and USER.md only, read-only content, missing is re
   assert.equal((await get("/memory/file?name=../openclaw.json")).status, 400);
   const u = await (await get("/memory/file?name=USER.md")).json();
   noLeak(u);
-  assert.deepEqual(u, { ok: true, name: "USER.md", exists: true, updatedAt: 9, text: "# USER.md\n- يفضّل العربية", part: 0, parts: 1, chars: 25, truncated: false });
+  const text = "# USER.md\n- يفضّل العربية\n- token … at …";
+  assert.deepEqual(u, { ok: true, name: "USER.md", exists: true, updatedAt: 9, text, part: 0, parts: 1, chars: text.length, truncated: false });
   const m = await (await get("/memory/file?name=MEMORY.md")).json();
   assert.equal(m.exists, false);
   assert.ok(calls("agents.files.get").every((c) => ["MEMORY.md", "USER.md"].includes(c.params.name)));
