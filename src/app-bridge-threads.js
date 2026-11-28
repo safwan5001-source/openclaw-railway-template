@@ -8,7 +8,8 @@
 //   POST /threads/:tid/sends/:clientMsgId/resend {message, images?, originalAt, sessionSha256, previousRefusal?}   owner button only
 //   GET  /threads/:tid/runs/:runId                       live text/status of one run (events; history + agent.wait after a restart)
 //   POST /threads/:tid/runs/:runId/abort                 chat.abort {unqualified key, runId}
-//   GET/POST /threads/:tid/model, GET/POST /threads/:tid/thinking    per-conversation settings (sessions.describe / sessions.patch)
+//   GET/POST /threads/:tid/{model,thinking,fast}         per-conversation settings (sessions.describe / sessions.patch)
+//   GET  /threads/state?tids=a,b                         engine state of ≤100 conversations (archived, active run, last activity)
 //   POST /threads/:tid/restore                           an archived conversation back to active (explicit owner action)
 //   POST /threads/search {q, tids[]}                     sessions.search over the given conversations; results carry tid, never a key
 //
@@ -67,7 +68,7 @@ export function classifySendError(err) {
     const msg = String(err.message ?? "");
     if (c === "INVALID_REQUEST" && (err.reason === "chat-request-conflict" || /chat-request-conflict/.test(msg))) return { status: 409, error: "conflict" };
     if (c === "INVALID_REQUEST" && /\bis archived\b/i.test(msg)) return { status: 409, error: "archived" };
-    if (c === "UNAVAILABLE" && /\bTRANSCRIPT_COLD\b/.test(`${msg} ${err.reason ?? ""}`)) return { status: 409, error: "transcript_cold" };
+    if (c === "UNAVAILABLE" && /\bTRANSCRIPT_COLD\b/.test(`${msg} ${err.reason ?? ""}`)) return { status: 409, error: "cold" };
     if (c === "INVALID_REQUEST" && /exceeds size limit/i.test(msg)) return { status: 413, error: "too_large", reason: "engine_limit" };
     return { status: 502, error: "outcome_unknown", reason: "engine_refused" };
   }
@@ -425,9 +426,10 @@ export function registerThreadRoutes(router, ctx) {
     model: s ? { id: ctx.models.modelRef(s.modelProvider, s.model), source: s.modelOverrideSource === "user" ? "override" : s.modelOverrideSource === "auto" ? "fallback" : "default" }
       : { id: null, source: "default" },
     thinking: s ? { level: str(s.thinkingLevel, 40), default: str(s.thinkingDefault, 40), levels: ctx.models.levelIds(s.thinkingLevels) } : { level: null, default: null, levels: [] },
+    fast: s ? { enabled: typeof s.effectiveFastMode === "boolean" ? s.effectiveFastMode : null, source: str(s.effectiveFastModeSource, 40) } : { enabled: null, source: null },
     archived: s?.archived === true,
   });
-  for (const what of ["model", "thinking"]) {
+  for (const what of ["model", "thinking", "fast"]) {
     router.get(`/threads/:tid/${what}`, async (req, res) => {
       const k = keysOf(req, res); if (!k) return;
       if (needCall(res)) return;
@@ -471,6 +473,50 @@ export function registerThreadRoutes(router, ctx) {
       } catch (err) { if (err?.refused) return reply(res, 400, "rejected"); failRead(res, err, "thinking patch"); }
       return undefined;
     });
+  });
+
+  const FAST = { on: true, off: false, default: null };
+  router.post("/threads/:tid/fast", (req, res) => {
+    const k = keysOf(req, res); if (!k) return undefined;
+    if (needCall(res)) return undefined;
+    const mode = typeof req.body?.mode === "string" ? req.body.mode.trim() : "";
+    if (!Object.hasOwn(FAST, mode)) return bad(res);
+    return serial(k.qualified, async () => {
+      try {
+        const s = await describe(k.qualified);
+        if (s === null) return reply(res, 409, "not_started");
+        if (s.hasActiveRun === true) return reply(res, 409, "busy");
+        if (mode === "on") {
+          const row = (await modelsFor(k.qualified)).find((m) => m.id === ctx.models.modelRef(s.modelProvider, s.model));
+          if (!row?.supportsFastMode) return bad(res, "fast_mode_unsupported");
+        }
+        await gatewayCall("sessions.patch", { key: k.qualified, fastMode: FAST[mode] });
+        res.json({ ok: true, thread: k.tid, fast: { mode } });
+      } catch (err) { if (err?.refused) return reply(res, 400, "rejected"); failRead(res, err, "fast patch"); }
+      return undefined;
+    });
+  });
+
+  // GET /threads/state?tids=a,b,…: engine-side state of up to 100 conversations the API names (archived, active run, last activity).
+  // Read over the link with sessions.describe (it answers for archived keys too, lab E7); a conversation that cannot be read is
+  // `unknown`, never "not archived".
+  router.get("/threads/state", async (req, res) => {
+    const raw = typeof req.query.tids === "string" ? req.query.tids.split(",") : [];
+    if (!raw.length || raw.length > 100) return bad(res);
+    const keys = [];
+    for (const t of raw) { const k = threadKeys(t); if (!k) return bad(res, "bad_tid"); if (!keys.some((x) => x.tid === k.tid)) keys.push(k); }
+    if (!link?.isUp?.()) return linkDown(res);
+    const out = {};
+    for (let i = 0; i < keys.length; i += 5) {
+      await Promise.all(keys.slice(i, i + 5).map(async (k) => {
+        try {
+          const s = await describe(k.qualified);
+          out[k.tid] = s === null ? { exists: false } : { exists: true, archived: s.archived === true, archiveReason: str(s.archiveReason, 40),
+            lastActivityAt: Number.isSafeInteger(s.lastActivityAt) ? s.lastActivityAt : null, hasActiveRun: s.hasActiveRun === true };
+        } catch { out[k.tid] = { unknown: true }; }
+      }));
+    }
+    res.json({ ok: true, threads: out });
   });
 
   router.post("/threads/:tid/restore", (req, res) => {

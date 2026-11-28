@@ -40,6 +40,7 @@ import { CLIENT_MSG_ID_RE, UNQUALIFIED_THREAD_KEY_RE } from "./thread-keys.js";
  * (docs/BASHT_THREADS_RELEASE.md). Options 1/2 (no owner entry) are rejected: untrusted, sticky memory quarantine.
  */
 export const WRITE_LINK_CONFIG = Object.freeze({
+  profile: "A", // plan v2.2 `writeLinkProfile`; reported in /status (flag on)
   decision: "D-B4-10",
   decisionStatus: "PENDING OWNER DECISION",
   role: "operator",

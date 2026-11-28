@@ -55,7 +55,7 @@ import { createLiveRoutes } from "./app-bridge-live.js";
 import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createRunsProbe } from "./app-bridge-runs.js";
-import { EXTRA_FEATURES, attachmentLimits, wrapperCommit } from "./app-bridge-status.js";
+import { EXTRA_FEATURES, attachmentLimits, resumeGuardConfigured, wrapperCommit } from "./app-bridge-status.js";
 import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, checkMediaFile, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, cleanSnippet, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
@@ -451,7 +451,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       signing: { ...verifier.status(), ...(lastRejected ? { lastRejected } : {}) },
       ...(version ? { engine: { version } } : {}),
       // B4 (flag on only): the write link's state and the CLOSED list of definite send refusals (everything else is unknown)
-      ...(threads ? { threads: { writeLink: writeLink ? writeLink.status().state : "off", definiteRefusals: [...DEFINITE_REFUSALS] } } : {}),
+      ...(threads ? { writeLinkProfile: writeLink?.config?.profile ?? null,
+        threads: { writeLink: writeLink ? writeLink.status().state : "off", definiteRefusals: [...DEFINITE_REFUSALS],
+          resumeGuard: { configured: resumeGuardConfigured(configPath) } } } : {}),
     });
   });
 

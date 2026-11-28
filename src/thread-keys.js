@@ -57,7 +57,7 @@ export const THREAD_FEATURES = Object.freeze(["sessions.multi.v1", "send.ws.v1",
  * doing anything. The API may treat ONLY these as "not sent"; every other answer (502 outcome_unknown, any other status or body,
  * no answer at all) is UNKNOWN and must never be retried automatically.
  */
-export const DEFINITE_REFUSALS = Object.freeze(["busy", "busy_unknown", "archived", "conflict", "transcript_cold", "not_written",
+export const DEFINITE_REFUSALS = Object.freeze(["busy", "busy_unknown", "archived", "conflict", "cold", "not_written",
   "bad_request", "command_not_allowed", "too_large"]);
 
 // Leading characters the gateway trims before it looks for a command (JS whitespace, which includes NBSP U+00A0 and BOM U+FEFF),

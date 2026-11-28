@@ -104,3 +104,10 @@ test("shipped disabled: nothing in the wrapper loads it; it registers only the t
     assert.ok(!s.includes(PLUGIN_ID) && !/plugins\.load\.paths|plugins\.entries/.test(s), `${f} must not load the guard`);
   }
 });
+
+test("fail closed: an inspection that throws makes the hook throw (the engine then blocks the call), never 'not sensitive'", () => {
+  const h = harness(undefined);
+  resume(h);
+  const params = { get calls() { throw new Error("hostile params"); } };
+  assert.throws(() => call(h, "execute_tools", params));
+});

@@ -286,7 +286,7 @@ const CASES = [
   [err("bad_params"), 400, "bad_request"],
   [err("INVALID_REQUEST", { refused: true, reason: "chat-request-conflict" }), 409, "conflict"],
   [err("INVALID_REQUEST", { refused: true, message: 'Session "agent:main:app:owner:x" is archived. Restore it before starting new work.' }), 409, "archived"],
-  [err("UNAVAILABLE", { refused: true, message: "SessionTranscriptColdError: transcript is cold code=TRANSCRIPT_COLD" }), 409, "transcript_cold"],
+  [err("UNAVAILABLE", { refused: true, message: "SessionTranscriptColdError: transcript is cold code=TRANSCRIPT_COLD" }), 409, "cold"],
   [err("INVALID_REQUEST", { refused: true, message: "Error: attachment big.png: image exceeds size limit (6752083 > 6291456 bytes)" }), 413, "too_large"],
   [err("INVALID_REQUEST", { refused: true, message: "changed while starting work" }), 502, "outcome_unknown", "engine_refused"],
   [err("UNAVAILABLE", { refused: true, message: "gateway starting" }), 502, "outcome_unknown", "engine_refused"],
@@ -599,4 +599,51 @@ test("approvals (flag on): /approvals rows carry their thread; history rows use 
     assert.ok(r0.json.approvals.every((a) => !("thread" in a)), "flag off: unchanged shape");
     assert.ok((await off.call("GET", "/approvals/history")).json.items.every((i) => !("thread" in i)));
   } finally { await b.close(); await off.close(); }
+});
+
+test("fast mode per conversation, and /threads/state: describe per tid, archived/active/lastActivity, unreadable = unknown (never 'not archived')", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    b.link.sessions[key] = { key, sessionId: "s", modelProvider: "mock", model: "echo", archived: true, archiveReason: "age-retention", lastActivityAt: 7, hasActiveRun: false };
+    assert.equal((await b.call("POST", `/threads/${A}/fast`, { mode: "on" })).json.reason, "fast_mode_unsupported");
+    assert.equal((await b.call("POST", `/threads/${A}/fast`, { mode: "off" })).status, 200);
+    assert.deepEqual(b.calls.filter((c) => c.method === "sessions.patch").map((c) => c.params), [{ key, fastMode: false }]);
+    assert.equal((await b.call("POST", `/threads/${B}/fast`, { mode: "off" })).json.error, "not_started");
+    const s = await b.call("GET", `/threads/state?tids=${A},${B},legacy`);
+    assert.deepEqual(s.json.threads[A], { exists: true, archived: true, archiveReason: "age-retention", lastActivityAt: 7, hasActiveRun: false });
+    assert.deepEqual(s.json.threads[B], { exists: false });
+    b.link.failDescribe = true;
+    assert.deepEqual((await b.call("GET", `/threads/state?tids=${A}`)).json.threads[A], { unknown: true });
+    assert.equal((await b.call("GET", `/threads/state?tids=${A},BAD`)).status, 400);
+    assert.equal((await b.call("GET", `/threads/state?tids=${Array.from({ length: 101 }, () => A).join(",")}`)).status, 400);
+  } finally { await b.close(); }
+});
+
+test("/status (flag on): writeLinkProfile 'A' and whether the D-B4-9 guard is configured (a boolean, nothing else)", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b4-guard-"));
+  const cfg = path.join(dir, "openclaw.json");
+  const { resumeGuardConfigured } = await import("./app-bridge-status.js");
+  try {
+    assert.equal(resumeGuardConfigured(cfg), null, "unreadable");
+    fs.writeFileSync(cfg, JSON.stringify({ plugins: { load: { paths: ["/app/src/plugins/basht-resume-guard.mjs"] }, entries: { "basht-resume-guard": { enabled: true, hooks: { allowConversationAccess: true } } } } }));
+    assert.equal(resumeGuardConfigured(cfg), true);
+    for (const p of [{ load: { paths: [] }, entries: { "basht-resume-guard": { enabled: true, hooks: { allowConversationAccess: true } } } },
+      { load: { paths: ["/app/src/plugins/basht-resume-guard.mjs"] }, entries: { "basht-resume-guard": { enabled: false, hooks: { allowConversationAccess: true } } } },
+      { load: { paths: ["/app/src/plugins/basht-resume-guard.mjs"] }, entries: { "basht-resume-guard": { enabled: true } } },
+      { enabled: false, load: { paths: ["/app/src/plugins/basht-resume-guard.mjs"] }, entries: { "basht-resume-guard": { enabled: true, hooks: { allowConversationAccess: true } } } }]) {
+      fs.writeFileSync(cfg, JSON.stringify({ plugins: p }));
+      assert.equal(resumeGuardConfigured(cfg), false, JSON.stringify(p));
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  const wl = fakeWriteLink(); wl.config = { profile: "A" };
+  const b = await bridge({ writeLink: wl });
+  try {
+    const s = await b.call("GET", "/status");
+    assert.equal(s.json.writeLinkProfile, "A");
+    assert.deepEqual(s.json.threads.resumeGuard, { configured: null });
+  } finally { await b.close(); }
+  const off = await bridge({ threads: false, writeLink: wl });
+  try { const s = await off.call("GET", "/status"); assert.equal(s.json.writeLinkProfile, undefined); } finally { await off.close(); }
 });
