@@ -643,9 +643,7 @@ test("an image block that cannot be served pairs with its stored file; one that 
   for (const [name, [block, file, want]] of Object.entries(cases)) assert.deepEqual(shape(msg(`msg-fb-${name.replace(/\W+/g, "")}`.slice(0, 40), block, file)), want, name);
   // two blocks: the unservable one takes ITS file, the servable one keeps its own bytes, no file is used twice
   const two = row("msg-fb-two-0001", "user", [{ type: "text", text: `${marker("stored.png")} ${marker("stored.jpg")}` }, png(BIGPNG.toString("base64")), { type: "image", data: JPEG_B64, mimeType: "image/jpeg" }], 1);
-  assert.deepEqual(shape(two), ["file:media://inbound/stored.png", "inline:true"].length === 2 ? shape(two) : [], "shape is stable");
-  const items = shape(two);
-  assert.equal(items.length, 2); assert.equal(new Set(items).size, 2); assert.ok(items.includes("inline:true"));
+  assert.deepEqual(shape(two), ["file:media://inbound/stored.png", "inline:true"]);
   // through the bridge: the oversize photo is a downloadable file entry, not a 413 ref
   rows.push(msg("msg-fb-view-001", png(BIGPNG.toString("base64")), "stored.png"), msg("msg-fb-view-002", png(BIGPNG.toString("base64")), null));
   const h = await hist();
