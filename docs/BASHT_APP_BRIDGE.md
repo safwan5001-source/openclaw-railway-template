@@ -351,6 +351,17 @@ buffer. Every call is built by the bridge with the app session key or a key that
   **Refs change once:** a WhatsApp photo used to list two entries (artifact + marker file); it is now one, so its position-based `ref` is different. A `ref` the app already holds for such a row answers 404 until `/history` is read again (the app re-reads it).
   An entry that cannot be served is `available: false` and `/media` answers 404/413/415, as for files. Not provable in the lab: what
   a CLI-backed model runtime writes for a photo (a mock vision model was used), and which of these shapes the production rows actually have.
+- **`runId` on a user row (additive).** `/history` user rows of the app session carry `runId`, the same id `POST /send` returned, **only
+  when the bridge knows it**; otherwise the field is absent. Lab (OpenClaw 2026.11.10): the engine stores nothing the bridge could
+  send or read back on the user row itself. Its `idempotencyKey` is `<internal run id>:user`, a uuid the chat endpoint never reveals
+  (the endpoint reads no idempotency header or body field, and the stream's `id` is a different one, `chatcmpl_<uuid>`). The stream
+  `id` is, however, what the engine writes as `__openclaw.runId` on the reply rows of that turn. The bridge links that id to the
+  `runId` it returned (in memory, last 500 turns) and gives a user row the `runId` of the reply row right after it, when: the key is
+  the app session, the next row is an assistant row whose engine run id was linked in this process, and that row is not older than
+  the user row. So there is no `runId` for: rows of any other conversation (WhatsApp), turns started by another client, turns before
+  the last bridge restart, a turn that failed or was stopped before a reply row existed (the id is also unknown until the first
+  stream chunk), and rows whose reply is outside the page that was read. Only the bridge's own uuid is ever published: no engine run
+  id, idempotency key, row id of another row, session key or internal id.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
   - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the

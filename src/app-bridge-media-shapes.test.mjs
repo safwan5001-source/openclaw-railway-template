@@ -30,6 +30,9 @@ let dir, ws, stateDir, gateway, server, base;
 let rows = []; // what sessions_history / chat.history return for the app session
 let chatBodies = []; // chat-completions bodies the fake gateway received
 let chatMode = "ok"; // ok | limit | boom
+let engineId = null; // the id the fake engine gives the next turn on its stream chunks
+const OWNER_KEY = "agent:main:whatsapp:direct:+966500000001";
+let ownerRows = [];
 const rpc = [];
 
 const row = (id, role, content, ts, fields = {}) => ({ role, content, timestamp: ts, __openclaw: { id, ...(fields.facts ? { media: fields.facts } : {}) } });
@@ -55,7 +58,7 @@ before(async () => {
   fs.writeFileSync(path.join(inbound, "abc124"), "<html><script>1</script></html>"); // not what its recorded type says
   fs.writeFileSync(path.join(inbound, "abc125"), PDF_BYTES);
   fs.writeFileSync(path.join(inbound, "abc126"), JPEG);
-  fs.writeFileSync(path.join(dir, "openclaw.json"), "{}");
+  fs.writeFileSync(path.join(dir, "openclaw.json"), JSON.stringify({ commands: { ownerAllowFrom: ["whatsapp:+966500000001"] } }));
   const abs = `${stateDir}/media/inbound/wa-photo---11.jpg`;
   rows = [
     // the engine's own history view of an app photo: inline payload replaced by an artifact id
@@ -101,15 +104,15 @@ before(async () => {
       if (req.url === "/tools/invoke") {
         res.writeHead(200, { "content-type": "application/json" });
         const { tool } = JSON.parse(body);
-        if (tool === "sessions_history") return res.end(JSON.stringify({ ok: true, result: { details: { sessionKey: APP_SESSION_KEY, hasMore: false, messages: rows } } }));
-        if (tool === "sessions_list") return res.end(JSON.stringify({ ok: true, result: { details: { sessions: [{ key: APP_SESSION_KEY }], hasMore: false } } }));
+        if (tool === "sessions_history") { const { args } = JSON.parse(body); return res.end(JSON.stringify({ ok: true, result: { details: { sessionKey: args.sessionKey, hasMore: false, messages: args.sessionKey === OWNER_KEY ? ownerRows : rows } } })); }
+        if (tool === "sessions_list") return res.end(JSON.stringify({ ok: true, result: { details: { sessions: [{ key: APP_SESSION_KEY }, { key: OWNER_KEY }], hasMore: false } } }));
         return res.end(JSON.stringify({ ok: false }));
       }
       chatBodies.push(JSON.parse(body));
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (chatMode === "limit") return res.end(`data: ${JSON.stringify({ error: { message: "429 The usage limit has been reached" } })}\n\n`);
       if (chatMode === "boom") return res.end(`data: ${JSON.stringify({ error: { message: "provider exploded" } })}\n\n`);
-      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "تم" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...(engineId ? { id: engineId } : {}), choices: [{ index: 0, delta: { content: "تم" } }] })}\n\n`);
       setTimeout(() => res.end("data: [DONE]\n\n"), 10);
     });
   });
@@ -454,4 +457,44 @@ test("a FIFO with an allowlisted name is refused at once, by the listing check a
     assert.deepEqual(JSON.parse(out), { ok: false, err: "unavailable" });
     void ctx;
   } finally { fs.rmSync(fifoDir, { recursive: true, force: true }); }
+});
+
+// ------------------------------------------------------------------ runId on the user row of a turn /send started ----------------------
+
+const ENGINE_A = "chatcmpl_11111111-2222-4333-8444-555555555555";
+const ENGINE_B = "chatcmpl_66666666-7777-4888-8999-aaaaaaaaaaaa";
+const userRow = (id, ts, text = "سؤال") => ({ role: "user", content: text, timestamp: ts, idempotencyKey: `internal-${id}:user`, __openclaw: { id, idempotencyKey: `internal-${id}:user` } });
+const replyRow = (id, ts, runId) => ({ role: "assistant", content: [{ type: "text", text: "جواب" }], timestamp: ts, __openclaw: { id, ...(runId ? { runId } : {}) } });
+const runIdsOf = (h) => Object.fromEntries(h.messages.filter((m) => m.role === "user").map((m) => [m.id, m.runId]));
+
+test("history: the user row of a turn /send started carries that turn's runId (via the reply row of the same turn); nothing else does", async () => {
+  engineId = ENGINE_A;
+  const sent = await call("/send", { method: "POST", body: { message: "سؤال" } });
+  assert.equal((await waitRun(sent.json.runId)).status, "done");
+  engineId = null;
+  rows.push(userRow("msg-run-user-1", 1000), replyRow("msg-run-asst-1", 1001, ENGINE_A));
+  // a turn this process did not start (other client, an earlier process): no runId, whatever its reply carries
+  rows.push(userRow("msg-run-user-2", 2000), replyRow("msg-run-asst-2", 2001, ENGINE_B));
+  // no reply yet / a user row followed by another user row / a reply older than the row / a reply with no run id
+  rows.push(userRow("msg-run-user-3", 3000), userRow("msg-run-user-4", 3001), replyRow("msg-run-asst-4", 3002, ENGINE_A));
+  rows.push(userRow("msg-run-user-5", 4000), replyRow("msg-run-asst-5", 3999, ENGINE_A));
+  rows.push(userRow("msg-run-user-6", 5000), replyRow("msg-run-asst-6", 5001));
+  const h = await hist();
+  const ids = runIdsOf(h);
+  assert.equal(ids["msg-run-user-1"], sent.json.runId);
+  assert.match(sent.json.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  for (const id of ["msg-run-user-2", "msg-run-user-3", "msg-run-user-5", "msg-run-user-6"]) assert.equal(ids[id], undefined, id);
+  assert.equal(ids["msg-run-user-4"], sent.json.runId, "the user row right before the reply is the turn's own (user-3 had no reply of its own)");
+  for (const m of h.messages.filter((x) => x.role === "assistant")) assert.ok(!("runId" in m), "assistant rows carry no runId");
+  for (const m of h.messages.filter((x) => x.id !== "msg-run-user-1" && x.id !== "msg-run-user-4")) assert.ok(!("runId" in m), m.id);
+  // no engine id, internal idempotency key or other id in the public JSON
+  const text = JSON.stringify(h);
+  for (const secret of [ENGINE_A, ENGINE_B, "chatcmpl_", "internal-", ":user", "idempotency"]) assert.ok(!text.includes(secret), `leaked: ${secret}`);
+});
+
+test("history: a conversation other than the app session never carries a runId, even if its reply carries an id this process linked", async () => {
+  ownerRows = [userRow("msg-wa-user-01", 10), replyRow("msg-wa-asst-01", 11, ENGINE_A)];
+  const r = (await call(`/history?key=${encodeURIComponent(OWNER_KEY)}&limit=10`)).json;
+  assert.deepEqual(r.messages.map((m) => m.id), ["msg-wa-user-01", "msg-wa-asst-01"]);
+  assert.ok(r.messages.every((m) => !("runId" in m)));
 });

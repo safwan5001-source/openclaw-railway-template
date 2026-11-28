@@ -64,6 +64,9 @@ export const MAIN_SESSION_KEY = "agent:main:main";
 export const MIN_TOKEN_LENGTH = 32;
 export const MAX_MESSAGE_CHARS = 8000;
 const MAX_RUNS_KEPT = 20;
+/** The id the engine's chat endpoint gives a turn (`id` of every stream chunk; `__openclaw.runId` of the reply rows it writes). */
+const ENGINE_RUN_ID = /^chatcmpl_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_RUN_LINKS = 500; // engine run id -> the runId /send returned, kept in memory for the rows of recent turns
 const RUN_TIMEOUT_MS = 15 * 60_000;
 const READ_TIMEOUT_MS = 15_000;
 const AUTH_FAILURES_PER_MINUTE = 20;
@@ -260,7 +263,7 @@ export function capConcurrency(fn, max, queueMax) {
 }
 
 /** Reads the SSE stream of /v1/chat/completions, calling onText with the growing text (the first call marks the first token). */
-async function readCompletionStream(body, onText) {
+async function readCompletionStream(body, onText, onEngineRunId) {
   const decoder = new TextDecoder();
   let buf = "";
   let text = "";
@@ -277,6 +280,7 @@ async function readCompletionStream(body, onText) {
         let j;
         try { j = JSON.parse(data); } catch { continue; }
         if (j?.error) throw new Error(typeof j.error?.message === "string" ? j.error.message : "agent run failed");
+        if (onEngineRunId && typeof j?.id === "string" && ENGINE_RUN_ID.test(j.id)) onEngineRunId(j.id);
         const delta = j?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta) { text += delta; onText(text); }
       }
@@ -308,6 +312,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
   const router = express.Router();
   const resetState = { active: false }; // B1: shared by /new and /send (see app-bridge-convo.js)
+  const runLinks = new Map(); // engine run id -> runId of /send (this process only)
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
   // B4: a reply that finishes while the app was not polling (phone locked / app closed) is worth a push; /events is the server's
@@ -452,7 +457,21 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const roots = mediaRoots(workspaceDir, stateDir); // a getter: roots are resolved lazily
   const mediaCtx = { workspaceDir, stateDir, roots };
   /** Transcript rows -> the app's rows: text (MEDIA: lines and attachment markers removed), media refs, id, reset boundaries. */
-  const mapRows = (key, rows) => rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))).map((m) => {
+  /**
+   * The runId /send returned for the turn that wrote user row `i` of `list`, or null. The engine does not store any id of its own on
+   * the user row (its `idempotencyKey` is an internal run id the chat endpoint never reveals), but the reply row of the same turn
+   * carries the id of the stream (`__openclaw.runId`), which this process saw and linked to the runId it returned. So: a user row of
+   * the app session whose very next row is an assistant row with such an id, written no earlier than the user row. Nothing is
+   * taken from any other id: a row of another conversation, a turn this process did not start, or a turn with no reply has none.
+   */
+  const runIdOf = (key, list, i) => {
+    if (key !== APP_SESSION_KEY || list[i]?.role !== "user") return null;
+    const next = list[i + 1];
+    const engineId = next?.role === "assistant" ? next.__openclaw?.runId : null;
+    if (typeof engineId !== "string" || !(Number(next.timestamp) >= Number(list[i].timestamp))) return null;
+    return runLinks.get(engineId) ?? null;
+  };
+  const mapRows = (key, rows) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
     if (isResetRow(m)) return { role: "system", kind: "reset", text: "", at: Number(m.timestamp) || 0, id: rowId(m), media: [] };
     const { text, media, messageId } = extractMedia(m, key, messageText(m));
     for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
@@ -463,8 +482,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const ok = c.ok; const size = ok ? c.size : null;
       return publicMedia({ ...it, size }, ok);
     });
-    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(m.role === "assistant" ? assistantMeta(m) : {}) };
-  }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0);
+    const runId = runIdOf(key, list, i);
+    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(runId ? { runId } : {}), ...(m.role === "assistant" ? assistantMeta(m) : {}) };
+  }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0); };
 
   router.get("/history", async (req, res) => {
     const key = String(req.query.key ?? APP_SESSION_KEY);
@@ -526,7 +546,11 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         signal: ctl.signal,
       });
       if (!r.ok || !r.body) throw new Error(`chat ${r.status}`);
-      run.text = await readCompletionStream(r.body, (t) => { run.firstTokenAt ??= now(); run.text = t; });
+      run.text = await readCompletionStream(r.body, (t) => { run.firstTokenAt ??= now(); run.text = t; }, (engineId) => {
+        if (runLinks.has(engineId)) return;
+        runLinks.set(engineId, id);
+        while (runLinks.size > MAX_RUN_LINKS) runLinks.delete(runLinks.keys().next().value);
+      });
       run.status = "done";
     })()
       .catch((err) => {
