@@ -314,7 +314,7 @@ persona (`<state dir>/settings/tts.json`): it would read `mismatch` too.
 
 ## Chat basics and media (B1 + B2)
 
-Code: `src/app-bridge-convo.js` and `src/app-bridge-media.js`. Tests: `src/app-bridge-media.test.mjs`. The wrapper's CLI allowlist
+Code: `src/app-bridge-convo.js` and `src/app-bridge-media.js`. Tests: `src/app-bridge-media.test.mjs`, `src/app-bridge-media-shapes.test.mjs`. The wrapper's CLI allowlist
 adds `sessions.reset`, `sessions.search`, `chat.history` and `artifacts.download`; only `artifacts.download` gets a 32 MB output
 buffer. Every call is built by the bridge with the app session key or a key that passed `isReadable`.
 
@@ -327,9 +327,27 @@ buffer. Every call is built by the bridge with the app session key or a key that
   `MEDIA:` lines (the engine's rule: standalone, outside code) and `[media attached: …]` markers are removed from `text` and
   become `media: [{ref, kind: image|file, name, mime, size, available}]`, or `{kind: "link", url}` for a public https URL.
   A `ref` is `sha256(key, messageId, position, source)`. Paths and artifact ids never leave the bridge.
+- **Images in the transcript (lab, OpenClaw 2026.11.10).** Every image block in the rows the bridge reads is one `media` entry, and a
+  message with an image is never dropped from `/history` (a row with no text and no image still is). Shapes, from the engine's
+  `sessions_history` tool and the anchored `chat.history` read (the same projection; the raw stored block is `{type: "image", data,
+  mimeType}`, with `data` inline, in the engine's database):
+
+  | Block the bridge sees | When | Entry |
+  |---|---|---|
+  | `{type: "image", mimeType, artifactId, omitted: true, bytes}` | every stored image: an app photo (vision model), a WhatsApp photo. The engine replaces `data` by an artifact id and adds the decoded size | served with `artifacts.download` |
+  | `{type: "image", data, mimeType}` (or `source.data`) | never seen in the lab through either read (the engine's projection removes `data`); handled if a row ever carries it | decoded from that block on demand, only if type is png/jpeg/gif/webp, size ≤ 20 MB and the first bytes match; the base64 is never copied into a cache or a response |
+  | `{type: "image", mimeType, omitted: true, bytes}` (no `artifactId`) | the stored block has no payload left | the file facts of the message (`__openclaw.media` → `media://inbound/<id>`), if any, are served through the engine-owned roots; else `available: false` |
+  | no image block, text `User sent image(s) with no text.` | a turn of images only on a model without image input (the engine drops the image) | one `available: false` image entry |
+
+  `User sent image(s) with no text.` is the engine's own sentence for an image-only turn; in a user row it is not shown as text.
+  A WhatsApp photo has the block, the marker `[media attached: <path> (<type>) | media://inbound/<id>]` and the file fact: they name
+  one picture and give one entry (the marker's stored-upload URL, or else its path, is the source; the type and file name are not).
+  An entry that cannot be served is `available: false` and `/media` answers 404/413/415, as for files. Not provable in the lab: what
+  a CLI-backed model runtime writes for a photo (a mock vision model was used), and which of these shapes the production rows actually have.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
-  - Image blocks are fetched with `artifacts.download` (image types only, bytes must match).
+  - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the
+    re-read message (an inline ref is never answered from the cache, which holds no payload) under the same limits.
   - Allowed roots are resolved per request (a root created after the wrapper started is honoured).
   - Files are served only if their realpath (symlinks resolved, `O_NOFOLLOW`) is a regular file inside the agent workspace or
     `<stateDir>/media`, the extension is on a fixed list (images, PDF, txt/md/csv/json, docx/xlsx/pptx, mp3/m4a/ogg/wav, mp4),

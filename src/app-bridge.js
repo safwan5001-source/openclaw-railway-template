@@ -445,7 +445,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const { text, media, messageId } = extractMedia(m, key, messageText(m));
     for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
     const pub = media.map((it) => {
-      if (it.kind === "link" || it.artifact) return publicMedia(it, true);
+      if (it.kind === "link") return publicMedia(it, true);
+      if (it.avail !== undefined) return publicMedia(it, it.avail); // an image block: served from the transcript, or unavailable (never dropped)
       const abs = resolveSource(it.file, mediaCtx);
       let size = null; let ok = false;
       try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots().some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }

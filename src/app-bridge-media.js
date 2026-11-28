@@ -117,10 +117,22 @@ export function splitMediaLines(text) {
 }
 
 const ATTACHED = /\[media attached(?: \d+\/\d+)?: ([^\]\n]{1,2048})\]/g;
+/**
+ * What one `[media attached: …]` marker names. The engine writes `<path> (<content type>) | <url> "<file name>"` with every part
+ * but the path optional (`media://inbound/<id>` replaces the path of a stored upload). The stored-upload URL wins when there is
+ * one; else the path. The content type and the file name are never part of the source.
+ */
+function attachedSource(raw) {
+  const s = String(raw).trim().replace(/\s+"[^"]{0,300}"$/, "");
+  const [first, ...more] = s.split(/\s+\|\s+/);
+  const strip = (v) => v.trim().replace(/\s+\([^()]*\)$/, "");
+  const url = more.map(strip).find((v) => /^media:\/\/inbound\//i.test(v));
+  return url ?? strip(first);
+}
 /** `[media attached: media://inbound/<id>]` markers the engine adds to a user message for a stored upload. */
 export function splitAttachedMarkers(text) {
   const sources = [];
-  const rest = String(text ?? "").replace(ATTACHED, (_m, src) => { sources.push(src.trim().replace(/\s+\(.*\)$/, "")); return ""; });
+  const rest = String(text ?? "").replace(ATTACHED, (_m, src) => { sources.push(attachedSource(src)); return ""; });
   return { text: rest.replace(/\n{3,}/g, "\n\n").trim(), sources };
 }
 
@@ -189,31 +201,126 @@ export function mediaRef(key, messageId, index, source) {
   return crypto.createHash("sha256").update(`${key}\0${messageId}\0${index}\0${source}`).digest("hex").slice(0, 32);
 }
 
+/** The text the engine's chat endpoint writes for a turn made of images only. It is not the owner's words: never shown. */
+export const IMAGE_ONLY_PLACEHOLDER = "User sent image(s) with no text.";
+
+/** The key two references to the same stored upload share: `media://inbound/<id>` and the absolute path of that file are one. */
+const sameFileKey = (src) => {
+  const s = String(src);
+  const m = /^media:\/\/inbound\/([^/\\]+)$/i.exec(s) ?? /[/\\]media[/\\]inbound[/\\]([^/\\]+)$/.exec(s);
+  return m ? `inbound/${m[1]}` : s;
+};
+
+/** Decoded size of a base64 string without decoding it. */
+const base64Bytes = (data) => Math.floor((data.length * 3) / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+
+/** The inline base64 payload of an image block of a transcript message (`data`, or `source.data` in the provider shape), else "". */
+function inlineData(p) {
+  const d = typeof p?.data === "string" ? p.data : typeof p?.source?.data === "string" ? p.source.data : "";
+  return d;
+}
+
 /**
- * Media items of one transcript message, in display order. Each entry keeps its private `source` (artifact id or file reference);
- * the public view (`publicMedia`) drops it. `text` comes back without the MEDIA: lines / attachment markers.
+ * Is the inline payload of block `p` something /media may serve? Looks at the declared type, the size and the first bytes only
+ * (the whole payload is decoded, and checked again, when the bytes are asked for).
+ */
+function inlineUsable(data, mime) {
+  if (!INLINE_MIMES.has(mime) || data.length < 8 || base64Bytes(data) > MAX_MEDIA_BYTES) return false;
+  const head = data.slice(0, Math.min(48, data.length - (data.length % 4)));
+  return /^[A-Za-z0-9+/]+$/.test(head) && bytesMatch(mime, Buffer.from(head, "base64"));
+}
+
+/**
+ * Media items of one transcript message, in display order. Each entry keeps its private `source` (artifact id, block index or file
+ * reference); the public view (`publicMedia`) drops it. `text` comes back without the MEDIA: lines / attachment markers.
+ *
+ * An image block of a message can be, depending on what the engine kept:
+ *   - `{type:"image", artifactId, mimeType, bytes, omitted:true}`: what the engine's own history view shows for every stored image
+ *     (the inline payload is replaced by an artifact id; read back with `artifacts.download`);
+ *   - `{type:"image", data, mimeType}`: the payload inline (raw transcript shape; served by decoding that block on demand);
+ *   - `{type:"image", mimeType, bytes, omitted:true}`: nothing left to read from the block. The message's own file facts
+ *     (`__openclaw.media`, the `[media attached: …]` marker) may still name the stored file; else the image is listed as unavailable.
+ * An image block never makes the message disappear: it always yields one item, `avail: false` when its bytes cannot be served.
+ * A file reference that names the same upload as an image block is that block's file, not a second image.
  */
 export function extractMedia(m, key, text = textOf(m)) {
   const id = typeof m?.__openclaw?.id === "string" ? m.__openclaw.id : "";
-  const items = [];
   const content = Array.isArray(m?.content) ? m.content : [];
-  for (const p of content) {
-    if (p?.type !== "image" || typeof p.artifactId !== "string" || p.artifactId.length > 2048) continue;
-    const mime = typeof p.mimeType === "string" ? p.mimeType.toLowerCase() : "image/png";
-    items.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", artifact: p.artifactId, mime, name: `image${MIME_EXT[mime] ?? ".png"}`,
-      size: Number.isFinite(p.bytes) ? p.bytes : null });
-  }
+  const blocks = [];
+  content.forEach((p, ci) => {
+    if (p?.type !== "image") return;
+    const mime = typeof p.mimeType === "string" && p.mimeType.length < 100 ? p.mimeType.toLowerCase() : "";
+    const size = Number.isFinite(p.bytes) ? p.bytes : null;
+    if (typeof p.artifactId === "string" && p.artifactId && p.artifactId.length <= 2048) {
+      const mm = mime || "image/png";
+      blocks.push({ kind: INLINE_MIMES.has(mm) ? "image" : "file", artifact: p.artifactId, mime: mm, name: `image${MIME_EXT[mm] ?? ".png"}`, size, avail: true });
+      return;
+    }
+    const data = inlineData(p);
+    if (data) {
+      const mm = mime || "image/png";
+      const ok = inlineUsable(data, mm);
+      blocks.push({ kind: INLINE_MIMES.has(mm) ? "image" : "file", inline: ci, mime: mm, name: `image${MIME_EXT[mm] ?? ".png"}`, size: base64Bytes(data), avail: ok });
+      return;
+    }
+    blocks.push({ kind: "image", missing: ci, mime: mime || null, name: `image${MIME_EXT[mime] ?? ""}`, size, avail: false });
+  });
+
   let rest = text;
   const files = [];
   if (m?.role === "assistant") { const s = splitMediaLines(rest); rest = s.text; files.push(...s.sources); }
   const a = splitAttachedMarkers(rest); rest = a.text; files.push(...a.sources);
-  for (const src of files) {
-    if (/^https:\/\//i.test(src)) { items.push({ kind: "link", url: src.slice(0, 2048), name: baseName(src.split("?")[0]) }); continue; }
-    const t = typeOf(src);
-    items.push({ kind: t?.[1] ? "image" : "file", file: src, mime: t?.[0] ?? null, name: baseName(src), size: null });
+  // what the engine recorded for the stored uploads of this message (a marker may be missing; these are projected to media://inbound/<id>)
+  const facts = m?.role === "user" && Array.isArray(m?.__openclaw?.media) ? m.__openclaw.media : [];
+  const hints = new Map(); // file reference -> the content type the engine recorded for it
+  for (const f of facts) {
+    const src = [f?.path, f?.url].find((v) => typeof v === "string" && /^media:\/\/inbound\/[^/\\]+$/i.test(v));
+    if (!src) continue;
+    files.push(src);
+    if (typeof f.contentType === "string") hints.set(src, f.contentType.toLowerCase());
   }
-  const media = items.slice(0, MAX_MEDIA_PER_MESSAGE).map((it, i) => ({ ...it, ref: it.kind === "link" ? null : mediaRef(key, id, i, it.artifact ?? it.file) }));
+  const seenFiles = new Set();
+  const refs = files.filter((src) => { const k = sameFileKey(src); if (seenFiles.has(k)) return false; seenFiles.add(k); return true; }).map((src) => {
+    if (/^https:\/\//i.test(src)) return { kind: "link", url: src.slice(0, 2048), name: baseName(src.split("?")[0]) };
+    const t = typeOf(src);
+    const hint = hints.get(src);
+    const image = t ? t[1] : INLINE_MIMES.has(hint); // an id without an extension: the recorded content type decides
+    return { kind: image ? "image" : "file", file: src, mime: t?.[0] ?? (INLINE_MIMES.has(hint) ? hint : null), name: baseName(src), size: null };
+  });
+
+  // each image block takes the next image file reference of the same message: it is that block's file (used only when the block
+  // itself has nothing to read), never a second picture
+  // (only in a user row: an assistant reply that carries a block and a MEDIA: line shows both)
+  const items = [];
+  const spare = m?.role === "user" ? refs.filter((r) => r.kind === "image") : [];
+  const used = new Set();
+  for (const b of blocks) {
+    const own = spare.shift();
+    if (own) used.add(own);
+    items.push(b.missing !== undefined && own ? own : b);
+  }
+  items.push(...refs.filter((r) => !used.has(r)));
+
+  // a turn of images only: the engine writes its own sentence for it. It goes; and an image the engine kept nothing of is still listed
+  if (m?.role === "user" && rest.trim() === IMAGE_ONLY_PLACEHOLDER) {
+    rest = "";
+    if (!items.some((it) => it.kind === "image" || (it.kind === "file" && it.mime?.startsWith("image/")))) items.push({ kind: "image", missing: -1, mime: null, name: "image", size: null, avail: false });
+  }
+  const source = (it) => it.artifact ?? it.file ?? (it.inline !== undefined ? `inline:${it.inline}` : `missing:${it.missing}`);
+  const media = items.slice(0, MAX_MEDIA_PER_MESSAGE).map((it, i) => ({ ...it, ref: it.kind === "link" ? null : mediaRef(key, id, i, source(it)) }));
   return { text: rest, media, messageId: id };
+}
+
+/** The bytes of an inline image block of message `m` (the item came from extractMedia of that same message), or {error}. */
+export function inlineImageBytes(m, item) {
+  const p = Array.isArray(m?.content) ? m.content[item.inline] : null;
+  const data = p?.type === "image" ? inlineData(p) : "";
+  if (!data || !INLINE_MIMES.has(item.mime)) return { error: "not_found" };
+  if (base64Bytes(data) > MAX_MEDIA_BYTES) return { error: "too_large" };
+  const bytes = Buffer.from(data, "base64");
+  if (bytes.length > MAX_MEDIA_BYTES) return { error: "too_large" };
+  if (!bytesMatch(item.mime, bytes.subarray(0, 64))) return { error: "unsupported" };
+  return { bytes };
 }
 
 /**
@@ -307,17 +414,25 @@ export function registerMediaRoute(router, ctx) {
     try {
       if (!ctx.readable(key)) return gone();
       let hit = ctx.cache.get(ref);
-      if (!hit || hit.key !== key || hit.messageId !== msg) {
-        // not handed out by this process (restart) or asked for another message: re-derive the refs from that message itself
-        const m = await ctx.findMessage(key, msg);
-        if (!m) return gone();
-        const { media } = extractMedia(m, key);
+      let found = null; // the message itself, when it had to be read (an inline image is decoded from it, never cached)
+      if (!hit || hit.key !== key || hit.messageId !== msg || hit.item.inline !== undefined) {
+        // not handed out by this process (restart), asked for another message, or an inline image (its bytes live in the
+        // transcript row, not here): re-derive the refs from that message itself
+        found = await ctx.findMessage(key, msg);
+        if (!found) return gone();
+        const { media } = extractMedia(found, key);
         const item = media.find((it) => it.ref === ref);
         if (!item) return gone();
         hit = { key, messageId: msg, item };
         ctx.cache.put(key, msg, item);
       }
       const it = hit.item;
+      if (it.inline !== undefined) {
+        const r = inlineImageBytes(found, it);
+        if (r.error) return res.status(r.error === "too_large" ? 413 : r.error === "unsupported" ? 415 : 404).json({ ok: false, error: r.error });
+        return send(res, it.mime, it.name, r.bytes.length, (out) => out.end(r.bytes));
+      }
+      if (it.missing !== undefined) return gone(); // the engine kept no bytes for this image
       if (it.artifact) {
         if (!ctx.gatewayCall) return res.status(503).json({ ok: false, error: "not_available" });
         const d = await ctx.gatewayCall("artifacts.download", { sessionKey: key, artifactId: it.artifact });
