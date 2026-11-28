@@ -371,6 +371,25 @@ buffer. Every call is built by the bridge with the app session key or a key that
   first reply). So the sequence user A, user B, reply A was not seen; the strict rule above makes sure a late reply could never
   hand A's id to B if it happened. The bridge's busy check still looks only at its own turns (it can start a turn right after a stop
   while the engine winds the stopped one down); that is documented, not changed.
+- **What the app can download.** `/media` (and the `available` flag of every `media` entry, which applies the very same rules) serves a
+  local file only if ALL of these hold; the pieces are in one place (`src/app-bridge-media.js`) and pinned by `src/app-bridge-media-guard.test.mjs`:
+  1. **Roots.** Its real path (symlinks resolved, no final symlink followed) is a regular file inside the agent workspace or `<stateDir>/media`. Nothing else.
+  2. **Type.** The extension is on the fixed list (images png/jpg/jpeg/gif/webp/heic/heif, pdf, txt, md, csv, json, docx, xlsx, pptx, mp3, m4a, ogg, wav, mp4), or the id has none and the
+     engine recorded an inline-viewable image type for that stored upload; the first bytes match the type; the size is at most 20 MB. SVG, HTML, scripts and everything else are never served.
+  3. **Protected paths (initial guard).** Judged on the real path, below the root it is under (where the root itself lives does not matter), case-insensitively. A file is refused when
+     any path segment starts with `.` (`.env`, `.git`, `.ssh`, `.openclaw`); or any directory is `memory`, `memories`, `dreams`, `dreaming`, `credentials`, `secrets`, `auth`, `backups` or
+     `node_modules`; or its name is `MEMORY.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, `DREAMS.md`, `openclaw.json`, `auth.json`,
+     `auth-profiles.json`, `credentials.json`, `secrets.json`, `config.json` or `settings.json`; or its name contains, between separators or at its ends, `secret(s)`, `credential(s)`,
+     `token(s)`, `password(s)`, `apikey`, `api-key`, `api_key`, `privatekey`, `private-key`, `private_key`, `auth-profile(s)` (`my-token.json` and `db_password.txt` are refused,
+     `tokenizer-notes.md` and `secretary.md` are not). For `.txt .md .csv .json` the first 4 KiB must also hold no private-key header (`-----BEGIN … PRIVATE KEY-----`) and no
+     well-known token shape (`sk-ant-…`, `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `github_pat_`, `AKIA…`, `xox?-…`, `Bearer eyJ….….…`): best effort, head only. A symlink to a protected
+     file or directory is refused (the real path is judged). Hard links are out of scope (realpath cannot tell a second name from the first).
+  A refused file is answered exactly like a file that is not there (`available: false`, `/media` 404): the app is never told why. The lists are constants in one place, not configuration.
+  **This is an initial guard, not the final design:** the allow-listed outbox for files the agent sends (and the full review of what else a workspace may expose) is Batch 7. Until then,
+  if the owner really wants a memory or config file in the chat, they can ask for its content as text in the conversation; the file route will not serve the file itself.
+  Legitimate flows are unchanged: images, documents, reports (`out/`, `reports/2026/`, the workspace root), audio and video, and everything under `<stateDir>/media` (inbound uploads,
+  generated images, speech) are listed and served as before. A workspace folder that is literally named `memory`, `backups`, `auth`, `secrets` or `credentials`, or a file whose name has
+  one of the words above, is not downloadable through the app any more.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
   - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the
