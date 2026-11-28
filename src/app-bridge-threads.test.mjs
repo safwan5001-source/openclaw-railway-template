@@ -948,11 +948,14 @@ test("Codex: an OLDER turn behind a tool-heavy later turn is located by bounded 
     // the membership check still holds: thread B does not have K1
     link.history[`agent:main:app:owner:${B}`] = { messages: [] };
     assert.equal((await b.call("GET", `/threads/${B}/runs/${K1}`)).status, 404);
-    // paging cannot tell (the engine does not say whether older rows exist): unknown, not not_found
-    link.history[key] = pager(false, 20);
-    const u = await b.call("GET", `/threads/${A}/runs/${K1}`);
-    assert.equal(u.status, 200); assert.equal(u.json.status, "unknown"); assert.equal(u.json.located, false); assert.equal(u.json.text, "");
   } finally { await b.close(); }
+  // paging cannot tell (the engine does not say whether older rows exist): unknown, not not_found
+  link.history[key] = pager(false, 20);
+  const b2 = await bridge({ link });
+  try {
+    const u = await b2.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(u.status, 200); assert.equal(u.json.status, "unknown"); assert.equal(u.json.located, false); assert.equal(u.json.text, "");
+  } finally { await b2.close(); }
 });
 
 // ---------------------------------------------------------------- fix round 2: integration repro shapes (P2-B4-1-INTEGRATION) ----------
@@ -1117,4 +1120,166 @@ test("round-2 edges: two real finals keep the FIRST; ack 'ok' is done even with 
     const r = await b2.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: null });
     assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "already_received" });
   } finally { await b2.close(); }
+});
+
+
+// ---------------------------------------------------------------- fix round 2, review N1-N6 and Codex (9555422) --------------------------
+const toolRowsN = (n, ts) => Array.from({ length: n }, (_, i) => ({ role: "toolResult", toolName: "exec", content: [{ type: "text", text: "x" }], timestamp: ts + i, __openclaw: { id: `tool${String(i).padStart(5, "0")}` } }));
+
+test("N1 (R2-A): a missed final in a tool-heavy turn (>50 rows) finalises with the engine's text, found by bounded paging", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  const b = await bridge({ link });
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    const all = [userRow(K1, "row0001"), ...toolRowsN(60, 10), { role: "assistant", content: [{ type: "text", text: "FINAL ANSWER" }], stopReason: "stop", timestamp: 100, __openclaw: { id: "row9999", runId: K1 } }];
+    link.history[key] = (p) => {
+      if (!p.messageId) return { messages: all.slice(-p.limit), hasMore: all.length > p.limit };
+      const at = all.findIndex((m) => m.__openclaw.id === p.messageId);
+      const lo = Math.max(0, at - p.limit + 1);
+      return { messages: all.slice(lo, at + 1), anchor: { hasOlder: lo > 0 } };
+    };
+    link.waits[K1] = "ok";
+    await sleep(1600);
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "FINAL ANSWER"); assert.equal(r.json.textPending, undefined);
+    const r2 = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r2.json.text, "FINAL ANSWER");
+  } finally { await b.close(); }
+});
+
+test("N1 (R2-B): the run ends between reads: agent.wait is read FIRST; text never freezes empty — pending, then filled on a later poll", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  const b = await bridge({ link });
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    let reads = 0;
+    const order = [];
+    const orig = link.request.bind(link);
+    link.request = async (m, p, o) => { if (m === "agent.wait" || m === "chat.history") order.push(m); return orig(m, p, o); };
+    link.history[key] = () => (++reads === 1 ? { messages: [userRow(K1, "row0001")] }
+      : { messages: [userRow(K1, "row0001"), { role: "assistant", content: [{ type: "text", text: "FINAL" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] });
+    link.waits[K1] = "ok"; // terminal, but the first history page does not have the reply row yet
+    await sleep(1600);
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(order[0], "agent.wait", "agent.wait before history");
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, ""); assert.equal(r.json.textPending, true, "pending, not frozen");
+    const r2 = await b.call("GET", `/threads/${A}/runs/${K1}`); // the very next poll re-reads (no 1.5 s throttle while pending)
+    assert.equal(r2.json.text, "FINAL"); assert.equal(r2.json.textPending, undefined);
+  } finally { await b.close(); }
+});
+
+test("N1: a notice-only final (no reply text in the event) is pending and filled from the engine's reply row", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  const b = await bridge({ link });
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 1, state: "final", message: { role: "assistant", content: [{ type: "text", text: "⚠️ Exec failed", openclawStatusNotice: true }] } });
+    link.history[key] = { messages: [userRow(K1, "row0001"), replyRow(K1, "row0002", "the real reply")] };
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "the real reply");
+  } finally { await b.close(); }
+});
+
+test("Codex: the resumed reply text is the continuation's answer, never a trailing engine status notice", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  link.history[key] = { messages: [userRow(K1, "row0001"),
+    { role: "assistant", content: [{ type: "text", text: "continued answer" }], stopReason: "stop", timestamp: 5, __openclaw: { id: "row0005", runId: "run-r2", continuation: { source: "restart" } } },
+    { role: "assistant", content: [{ type: "text", text: "↪️ Model Fallback: x", openclawStatusNotice: true }], timestamp: 6, __openclaw: { id: "row0006", runId: "run-r2" } }] };
+  const b = await bridge({ link });
+  try {
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.deepEqual(r.json.resumed, { runId: "run-r2", text: "continued answer" });
+  } finally { await b.close(); }
+});
+
+test("Codex: an UNCACHED run whose turn holds K's final reply (stopReason stop) is 'done' even when agent.wait times out (gateway + wrapper restart)", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  link.history[key] = { messages: [userRow(K1, "row0001"), replyRow(K1, "row0002", "finished before the restart")] }; // agent.wait K -> "timeout"
+  const b = await bridge({ link });
+  try {
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "finished before the restart");
+    link.history[key] = { messages: [userRow(K1, "row0001"), { role: "assistant", content: [{ type: "text", text: "let me check" }], stopReason: "toolUse", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K1}`)).json.status, "unknown", "a non-final row is not completion");
+  } finally { await b.close(); }
+});
+
+test("N2: an engine REFUSAL of the already-used-id check is reported distinctly (precheck_refused), bounded; nothing is sent", async () => {
+  const link = fakeLink();
+  const timeouts = [];
+  const orig = link.request.bind(link);
+  link.request = async (m, p, o) => {
+    if (m === "agent.wait") { timeouts.push(o?.timeoutMs); throw Object.assign(new Error("missing scope: operator.read"), { code: "INVALID_REQUEST", refused: true }); }
+    return orig(m, p, o);
+  };
+  const b = await bridge({ link });
+  try {
+    assert.deepEqual((await send(b, A, K1)).json, { ok: false, error: "not_written", reason: "precheck_refused" });
+    assert.ok(timeouts[0] <= 3000, "a short timeout inside the send mutex");
+    assert.equal(b.writeLink.sends.length, 0);
+  } finally { await b.close(); }
+});
+
+test("N3: polling an unknown id in a long conversation pages back once; repeated polls within 5 s reuse it (2 link reads each)", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  const rows = []; for (let i = 0; i < 3000; i++) rows.push({ role: i % 2 ? "assistant" : "user", content: "x", timestamp: i, __openclaw: { id: `r${String(i).padStart(6, "0")}` } });
+  link.history[key] = (p) => {
+    if (!p.messageId) return { messages: rows.slice(-p.limit), hasMore: true };
+    const at = rows.findIndex((m) => m.__openclaw.id === p.messageId);
+    return { messages: rows.slice(Math.max(0, at - p.limit + 1), at + 1), anchor: { hasOlder: at - p.limit + 1 > 0 } };
+  };
+  const b = await bridge({ link });
+  try {
+    let before = link.requests.length;
+    const r = await b.call("GET", `/threads/${A}/runs/${K2}`);
+    assert.equal(r.json.status, "unknown"); assert.equal(r.json.located, false);
+    assert.ok(link.requests.length - before <= 12, String(link.requests.length - before));
+    before = link.requests.length;
+    await b.call("GET", `/threads/${A}/runs/${K2}`);
+    assert.equal(link.requests.length - before, 2, "agent.wait + one history page");
+  } finally { await b.close(); }
+});
+
+test("N6 (#24): /threads/legacy/reset holds the SEND MUTEX: a thread send arriving during the reset is not written until it ends", async () => {
+  let release;
+  const link = fakeLink();
+  link.sessions["agent:main:app:owner"] = { key: "agent:main:app:owner", sessionId: "s" };
+  const gc = async (method, params) => {
+    if (method === "sessions.describe") return { session: link.sessions[params.key] ?? null };
+    if (method === "sessions.reset") { await new Promise((r) => { release = r; }); return { ok: true, key: params.key }; }
+    throw new Error(`unexpected ${method}`);
+  };
+  const b = await bridge({ link, gatewayCall: gc });
+  try {
+    const reset = b.call("POST", "/threads/legacy/reset", {});
+    await until(() => !!release);
+    const s = send(b, B, K1);
+    await sleep(100);
+    assert.equal(b.writeLink.sends.length, 0, "no write while the reset runs");
+    release();
+    assert.equal((await reset).status, 200);
+    assert.equal((await s).status, 202);
+    assert.equal(b.writeLink.sends.length, 1);
+  } finally { await b.close(); }
+});
+
+test("N6 (#38): a RESEND to 'legacy' during legacy /new is busy (legacy), nothing written", async () => {
+  let release;
+  const link = fakeLink();
+  const lkey = "agent:main:app:owner";
+  link.sessions[lkey] = { key: lkey, sessionId: "s" };
+  const gc = async (method, params) => {
+    if (method === "sessions.describe") return { session: link.sessions[params.key] ?? null };
+    if (method === "sessions.reset") { await new Promise((r) => { release = r; }); return { ok: true, key: params.key }; }
+    throw new Error(`unexpected ${method}`);
+  };
+  const b = await bridge({ link, gatewayCall: gc });
+  try {
+    const reset = b.call("POST", "/new", {});
+    await until(() => !!release);
+    const r = await b.call("POST", `/threads/legacy/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: await sha("s") });
+    assert.deepEqual(r.json, { ok: false, error: "busy", busyThread: "legacy" });
+    assert.equal(b.writeLink.sends.length, 0);
+    release(); await reset;
+  } finally { await b.close(); }
 });

@@ -119,11 +119,12 @@ Lab evidence: P2-B4-1-LAB §3.2 candidate 3 (fresh approval prevented every dupl
 
 **Enable (production config write: owner approval + the gate, because the gateway reloads plugins):**
 
-`config set` REPLACES an array, so the load path is merged with the existing ones first (the script refuses to guess when the
-current value is not a JSON array or null; check `openclaw config get --help` for the output flag of your version first):
+`config set` REPLACES an array, so the load path is merged with the existing ones first (the script stops when `config get` fails, and refuses to
+guess when the current value is not a JSON array or null; check `openclaw config get --help` for the output flag of your version first):
 
 ```bash
-cur=$(openclaw config get plugins.load.paths --json 2>/dev/null)
+# a FAILING `config get` must stop here: never read as "no paths" (that would overwrite the existing ones)
+cur=$(openclaw config get plugins.load.paths --json) || { echo "config get failed: stop, nothing written"; exit 1; }
 new=$(node -e '
 const raw = process.argv[1]; let cur;
 try { cur = raw && raw.trim() ? JSON.parse(raw) : null; } catch { console.error("not JSON: stop"); process.exit(1); }
