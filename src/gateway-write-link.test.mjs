@@ -21,7 +21,8 @@ function fakeGateway({ scopes = [...WRITE_LINK_CONFIG.scopes], hello = {}, onReq
       setImmediate(() => { this.readyState = 1; this.emit({ type: "event", event: "connect.challenge", payload: { nonce: "n" } }); }); }
     emit(f) { if (!this.closed) this.onmessage?.({ data: JSON.stringify(f) }); }
     send(raw) {
-      if (this.readyState !== 1) throw new Error("not open");
+      if (this.readyState === 0) throw new Error("InvalidStateError"); // WHATWG: only CONNECTING throws …
+      if (this.readyState !== 1) { this.dropped = (this.dropped ?? 0) + 1; return undefined; } // … CLOSING/CLOSED silently drop the frame
       const f = JSON.parse(raw); this.sent.push(f);
       const reply = (ok, payload, error) => setImmediate(() => this.emit({ type: "res", id: f.id, ok, payload, error }));
       if (f.method === "connect") return reply(true, { type: "hello-ok", protocol: 4, auth: { role: "operator", scopes }, policy: { tickIntervalMs: 15000, maxPayload: 26214400, attachments: { maxBytes: 19464192, maxImageBytes: 6291456 } }, ...hello });
@@ -112,13 +113,14 @@ test("failure codes: not_written (definite) before the write; ack_lost and ack_t
   const idle = createGatewayWriteLink({ url: "ws://x", token: TOKEN, WebSocketImpl: fakeGateway().FakeWS });
   await assert.rejects(idle.chatSend({ sessionKey: KEY, message: "x", idempotencyKey: K }), { code: "not_written" });
   // send() throws: not written
-  const a = await up({ onReq: (f, _r, sock) => { if (f.method === "chat.send") { sock.readyState = 1; throw new Error("boom"); } return false; } });
+  const a = await up({ onReq: (f) => { if (f.method === "chat.send") throw new Error("boom"); return false; } });
   await assert.rejects(a.link.chatSend({ sessionKey: KEY, message: "x", idempotencyKey: K }), { code: "not_written" });
   a.link.stop();
   // socket not OPEN (closing): a WHATWG send would silently drop -> refuse as not_written instead of "written"
   const b = await up();
   b.gw.last().readyState = 2;
   await assert.rejects(b.link.chatSend({ sessionKey: KEY, message: "x", idempotencyKey: K }), { code: "not_written" });
+  assert.equal(b.gw.last().dropped ?? 0, 0, "not even handed to a closing socket");
   b.link.stop();
   // written, then the socket closes before the answer: ack_lost (the engine may have it: lab l1-acklost, the run completed)
   let writes = 0;

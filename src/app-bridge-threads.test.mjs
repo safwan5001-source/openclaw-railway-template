@@ -135,6 +135,9 @@ test("flag off: no capability ids, no threads field, /threads/* is 404 like an o
       assert.equal(r.status, 404, p); assert.deepEqual(r.json, { ok: false, error: "not_found" });
     }
     assert.equal(b.writeLink.sends.length, 0);
+    // the body limit of /threads/* is the old 64 kB JSON limit too (the photo-sized parser exists only with the flag on)
+    const big = await b.call("POST", `/threads/${A}/send`, { message: "x".repeat(100_000), clientMsgId: K1 });
+    assert.equal(big.status, 413); assert.deepEqual(big.json, { ok: false, error: "too_large" });
   } finally { await b.close(); }
 });
 
@@ -202,7 +205,7 @@ test("every lab negative tid and clientMsgId is refused at the bridge with 400, 
 test("command filter: '/', format/bidi marks then '/', and '!' + anything are refused with command_not_allowed (no write)", async () => {
   const b = await bridge();
   try {
-    for (const m of ["/status", "‏/config", "﻿ /x", "! ls", "!مهم", "​/model fake/m2", " /compact", " !x"]) {
+    for (const m of ["/status", "\u200f/config", "\ufeff /x", "! ls", "!مهم", "\u200b/model fake/m2", " /compact", "\u00a0!x"]) {
       const r = await send(b, A, K1, m);
       assert.equal(r.status, 400, JSON.stringify(m)); assert.deepEqual(r.json, { ok: false, error: "command_not_allowed" });
     }
@@ -232,6 +235,7 @@ test("cap: a legacy HTTP turn running -> thread send busy (legacy); a thread run
     let open; b.httpGw.gate = new Promise((r) => { open = r; });
     const l = await b.call("POST", "/send", { message: "hi" });
     assert.equal(l.status, 202);
+    await sleep(W + 30); // past the accept window: only the RUNNING legacy turn can make this busy
     const r = await send(b, B, K1);
     assert.deepEqual(r.json, { ok: false, error: "busy", busyThread: "legacy" });
     open(); await sleep(50); await sleep(W + 20);
@@ -410,7 +414,8 @@ test("resend: allowed once, with the SAME id, only inside 24 h, same engine sess
       assert.equal(r.status, 409, `${reason}: ${r.text}`); assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason });
     };
     // past 24 h
-    await refuse(`/threads/${A}/sends/${K2}/resend`, { ...body, originalAt: clock - RESEND_WINDOW_MS - 1 }, "window");
+    assert.equal(RESEND_WINDOW_MS, 24 * 60 * 60_000);
+    await refuse(`/threads/${A}/sends/${K2}/resend`, { ...body, originalAt: clock - 24 * 60 * 60_000 - 1 }, "window");
     // the engine session changed (delete-and-recreate): the bridge's own describe comparison, not chat.send.sessionId
     await refuse(`/threads/${A}/sends/${K2}/resend`, { ...body, sessionSha256: await sha("sid-other") }, "session_changed");
     // "<K>:user" is already in the transcript

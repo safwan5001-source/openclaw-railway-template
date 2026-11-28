@@ -63,7 +63,7 @@ export const DEFINITE_REFUSALS = Object.freeze(["busy", "busy_unknown", "archive
 // Leading characters the gateway trims before it looks for a command (JS whitespace, which includes NBSP U+00A0 and BOM U+FEFF),
 // plus every Unicode format character (\p{Cf}: RLM, LRM, ALM, ZWJ, ZWNJ, ZWSP, WJ, BOM…) as a conservative superset: the Arabic
 // keyboard inserts RLM, and a mark the gateway does not trim today might be trimmed by a later version.
-const LEADING_IGNORABLE = /^[\s ﻿\p{Cf}]+/u;
+const LEADING_IGNORABLE = /^[\s\u00a0\ufeff\p{Cf}]+/u;
 
 /**
  * Defence in depth for the write link (plan N5, corrected by lab L1(g)): refuse a message that would be read as a command if the

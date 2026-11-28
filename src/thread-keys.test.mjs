@@ -40,9 +40,9 @@ test("clientMsgId: a lowercase UUID only (braces, URN, uppercase, no dashes are 
 });
 
 test("command filter: '/' after whitespace or ANY format/bidi mark, and '!' followed by anything, are refused (lab L1(g))", () => {
-  const refused = ["/status", " /status", "\t/status", "\n/status", " /status", "﻿/status", "﻿ /x", "‏/config", "‎/model x",
-    "؜/compact", "‍/reset", "‌/new", "​/status", "⁠/status", "‏ ‏/status", "‏‏‎/x", "/", "/notacommand",
-    "! ls", "!ls", "!", "!مهم", "!important", " ! echo X", "‏! echo", " !x"];
+  const refused = ["/status", " /status", "\t/status", "\n/status", "\u00a0/status", "\ufeff/status", "\ufeff /x", "\u200f/config", "\u200e/model x",
+    "\u061c/compact", "\u200d/reset", "\u200c/new", "\u200b/status", "\u2060/status", "\u200f \u200f/status", "\u200f\u200f\u200e/x", "/", "/notacommand",
+    "! ls", "!ls", "!", "!مهم", "!important", " ! echo X", "\u200f! echo", "\u00a0!x"];
   for (const t of refused) assert.equal(commandRefusal(t), "command_not_allowed", JSON.stringify(t));
   const allowed = ["hello", "مرحبا", "status /x", "hi\n/status", "a!", "؟!", "／status", "،/status", "x /status", "1/2", "", "   "];
   for (const t of allowed) assert.equal(commandRefusal(t), null, JSON.stringify(t));
