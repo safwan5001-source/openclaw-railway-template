@@ -14,11 +14,11 @@ const KEY = `app:owner:${HEX}`;
 const png = (bytes) => { const b = Buffer.alloc(bytes); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b); return b.toString("base64"); };
 
 /** onReq(frame, reply, sock): return true when handled. `hello` overrides the hello-ok payload. */
-function fakeGateway({ scopes = [...WRITE_LINK_CONFIG.scopes], hello = {}, onReq } = {}) {
+function fakeGateway({ scopes = [...WRITE_LINK_CONFIG.scopes], hello = {}, onReq, silent = () => false } = {}) {
   const sockets = [];
   class FakeWS {
     constructor(url) { this.url = url; this.sent = []; this.closed = false; this.readyState = 0; sockets.push(this);
-      setImmediate(() => { this.readyState = 1; this.emit({ type: "event", event: "connect.challenge", payload: { nonce: "n" } }); }); }
+      setImmediate(() => { this.readyState = 1; if (!silent(sockets.length)) this.emit({ type: "event", event: "connect.challenge", payload: { nonce: "n" } }); }); }
     emit(f) { if (!this.closed) this.onmessage?.({ data: JSON.stringify(f) }); }
     send(raw) {
       if (this.readyState === 0) throw new Error("InvalidStateError"); // WHATWG: only CONNECTING throws …
@@ -169,5 +169,17 @@ test("events reach listeners (chat deltas of every session are broadcast to ever
   gw.last().event("chat", { runId: K, state: "final" });
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(seen, [["chat", "delta"]]);
+  link.stop();
+});
+
+test("m11: a socket that opens but never sends connect.challenge is dropped after the connect timeout, and the link reconnects", async () => {
+  const gw = fakeGateway({ silent: (n) => n === 1 }); // the first socket stays silent, the second one behaves
+  const link = createGatewayWriteLink({ url: "ws://x", token: TOKEN, WebSocketImpl: gw.FakeWS, connectTimeoutMs: 40, random: () => 0 });
+  link.start();
+  await until(() => link.status().state === "down", 1500);
+  assert.equal(link.status().lastError, "connect_timeout");
+  assert.equal(gw.sockets[0].closed, true);
+  await until(() => link.isUp(), 3000); // backoff 1 s * 0.8, then a normal handshake
+  assert.equal(gw.sockets.length, 2);
   link.stop();
 });

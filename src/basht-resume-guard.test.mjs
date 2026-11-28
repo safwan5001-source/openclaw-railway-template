@@ -111,3 +111,10 @@ test("fail closed: an inspection that throws makes the hook throw (the engine th
   const params = { get calls() { throw new Error("hostile params"); } };
   assert.throws(() => call(h, "execute_tools", params));
 });
+
+test("m9: before_agent_run never throws (the engine treats that hook as fail-closed for EVERY run)", () => {
+  const h = harness(undefined);
+  const hostile = { get prompt() { throw new Error("boom"); }, get messages() { throw new Error("boom"); } };
+  assert.equal(h.before_agent_run(hostile, { runId: "r9", trigger: "event" }), undefined);
+  assert.equal(h.before_agent_run({ prompt: NOTE }, null), undefined);
+});

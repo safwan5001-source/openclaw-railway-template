@@ -13,6 +13,9 @@
 // Sensitive tools come from a CLOSED catalog (SENSITIVE_CATALOG); config can only choose which catalog entries are on.
 // Daftra writes go through `execute_tools` {calls:[{name, arguments}]}: the inspector treats a call as a read ONLY when every
 // inner tool name is a read verb; anything else (or anything malformed) is sensitive (fail closed). A thrown hook blocks the call.
+// Known heuristic limit (review m9): a read-verb name with an UNLISTED write word (reset, generate, sync, upload, toggle, …) passes
+// as a read, and export/download/report_gap count as reads. Replace READ_VERB with an explicit allowlist from the real Daftra
+// catalog before enabling in production.
 import crypto from "node:crypto";
 
 export const PLUGIN_ID = "basht-resume-guard";
@@ -79,11 +82,15 @@ export function createGuard(config, log = () => {}) {
   const mark = (set, k, v) => { if (set instanceof Map) set.set(k, v); else set.add(k); while (set.size > MAX_RUNS) set.delete(set.keys().next().value); };
   return {
     resumed,
+    // before_agent_run is fail-closed in the engine: a throw here would block EVERY run (WhatsApp included), so it never throws
+    // (review m9). A run it could not inspect is simply not marked; sensitive calls are still gated by before_tool_call's own rules.
     before_agent_run(event, ctx) {
-      const runId = ctx?.runId;
-      if (!runId) return undefined;
-      if (ctx.trigger === "event" && RESUME_RE.test(String(event?.prompt ?? ""))) { mark(resumed, runId); log(`resumed run marked`); }
-      mark(anchors, runId, ctx.trigger === "user" ? runId : anchorOf(event?.messages));
+      try {
+        const runId = ctx?.runId;
+        if (!runId) return undefined;
+        if (ctx.trigger === "event" && RESUME_RE.test(String(event?.prompt ?? ""))) { mark(resumed, runId); log(`resumed run marked`); }
+        mark(anchors, runId, ctx.trigger === "user" ? runId : anchorOf(event?.messages));
+      } catch { /* never block a run from here */ }
       return undefined;
     },
     before_tool_call(event, ctx) {

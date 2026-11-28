@@ -119,8 +119,19 @@ Lab evidence: P2-B4-1-LAB §3.2 candidate 3 (fresh approval prevented every dupl
 
 **Enable (production config write: owner approval + the gate, because the gateway reloads plugins):**
 
+`config set` REPLACES an array, so the load path is merged with the existing ones first (the script refuses to guess when the
+current value is not a JSON array or null; check `openclaw config get --help` for the output flag of your version first):
+
 ```bash
-openclaw config set plugins.load.paths '["/app/src/plugins/basht-resume-guard.mjs"]' --strict-json   # MERGE with any existing paths
+cur=$(openclaw config get plugins.load.paths --json 2>/dev/null)
+new=$(node -e '
+const raw = process.argv[1]; let cur;
+try { cur = raw && raw.trim() ? JSON.parse(raw) : null; } catch { console.error("not JSON: stop"); process.exit(1); }
+if (cur !== null && !Array.isArray(cur)) { console.error("not an array: stop"); process.exit(1); }
+const p = "/app/src/plugins/basht-resume-guard.mjs"; const a = cur ?? [];
+console.log(JSON.stringify(a.includes(p) ? a : [...a, p]));' "$cur") || exit 1
+echo "plugins.load.paths: $cur -> $new"      # read it before writing
+openclaw config set plugins.load.paths "$new" --strict-json
 openclaw config set plugins.entries.basht-resume-guard '{"enabled":true,"hooks":{"allowConversationAccess":true}}' --strict-json
 openclaw plugins list   # must show basht-resume-guard enabled; add this check to the release gate while it is on
 ```
@@ -130,7 +141,7 @@ Settings: the closed defaults (`mode: approve_on_resume`, both catalog entries, 
 sensitive: [ids], injectIdempotencyKey: bool}`; anything unknown ⇒ the defaults). Whether a standalone-file plugin may carry a
 `config` block is **unverified** (the gateway may require it to be empty); the defaults need none.
 
-**Disable:** remove the path from `plugins.load.paths` (or set `plugins.entries.basht-resume-guard.enabled:false`), then
+**Disable:** remove the path from `plugins.load.paths` (the same merge script in reverse: write the array without it), or set `plugins.entries.basht-resume-guard.enabled:false`, then
 `openclaw plugins reload basht-resume-guard` or a gated restart; `plugins list` must no longer show it.
 
 **Residual risk (owner acceptance, D-B4-9):** the ambiguity of a call cut mid-execution remains (the owner must check external state

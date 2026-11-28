@@ -21,6 +21,7 @@ const K3 = "33333333-3333-4333-8333-333333333333";
 const OWNER = "+966500000001";
 const EPOCH = "a1b2c3d4e5f6";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const until = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error("timeout"); await sleep(5); } };
 const sha = async (s) => (await import("node:crypto")).createHash("sha256").update(s).digest("hex");
 
 function fakeLink(o = {}) {
@@ -105,6 +106,7 @@ async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWrite
     if (method === "sessions.describe") return { session: link.sessions[params.key] ?? null };
     if (method === "models.list") return { models: [{ id: "echo", provider: "mock", available: true }, { id: "echo2", provider: "mock", available: true }] };
     if (method === "sessions.patch") return { ok: true };
+    if (method === "sessions.reset") return { ok: true, key: params.key };
     if (method === "sessions.search") return { results: params.sessionKeys.map((k, i) => ({ sessionKey: k, messageId: `msg00${i}x`, role: "user", timestamp: 5, snippet: "hello there" })) };
     throw new Error(`unexpected ${method}`);
   });
@@ -665,4 +667,246 @@ test("/status (flag on): writeLinkProfile 'A' and whether the D-B4-9 guard is co
   } finally { await b.close(); }
   const off = await bridge({ threads: false, writeLink: wl });
   try { const s = await off.call("GET", "/status"); assert.equal(s.json.writeLinkProfile, undefined); } finally { await off.close(); }
+});
+
+// ---------------------------------------------------------------- fix round (review P2-B4-1-CODE-REVIEW + Codex) ---------------------
+const rowsOf = (n, t0, prefix = "r") => Array.from({ length: n }, (_, i) => ({ role: "assistant", content: [{ type: "text", text: `t${i}` }], timestamp: t0 + i,
+  __openclaw: { id: `${prefix}${String(i).padStart(5, "0")}` } }));
+
+test("I1: history paging at the advertised maximum (limit=100 with before=) passes the REAL link validator; no 502", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    const all = rowsOf(300, 1000);
+    b.link.history[key] = (p) => {
+      if (!p.messageId) return { messages: all.slice(-p.limit), hasMore: true };
+      const at = all.findIndex((m) => m.__openclaw.id === p.messageId);
+      const lo = Math.max(0, at - Math.floor(p.limit / 2));
+      return { messages: all.slice(lo, lo + p.limit), anchor: { hasOlder: lo > 0 } };
+    };
+    for (const q of ["limit=100", "limit=100&before=r00250", "limit=500&before=r00250", "limit=1&before=r00250", "before=r00250"]) {
+      const r = await b.call("GET", `/threads/${A}/history?${q}`);
+      assert.equal(r.status, 200, `${q}: ${r.text}`);
+    }
+    const r = await b.call("GET", `/threads/${A}/history?limit=100&before=r00250`);
+    assert.ok(r.json.messages.length >= 99 && r.json.messages.length <= 100, String(r.json.messages.length));
+    assert.equal(r.json.messages.at(-1).id, "r00249", "the rows right before the anchor");
+    assert.ok(r.json.earlier, "a cursor for the page before");
+    assert.ok(b.link.requests.filter((q) => q.method === "chat.history").every((q) => q.params.limit <= 200));
+  } finally { await b.close(); }
+});
+
+test("I2: a run whose terminal event was missed (write link dropped/reconnected) is reconciled from the engine: final status and text", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    assert.equal((await send(b, A, K1)).status, 202);
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 1, state: "delta", deltaText: "par" });
+    b.writeLink.isUp = () => false; // the link dropped: final/error/aborted never arrive on it
+    b.link.history[key] = { messages: [{ role: "user", idempotencyKey: `${K1}:user`, content: "hello", timestamp: 1, __openclaw: { id: "row0001" } },
+      { role: "assistant", content: [{ type: "text", text: "partial and then the full reply" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
+    b.link.waits[K1] = "ok";
+    let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "partial and then the full reply");
+    assert.ok(b.link.requests.some((q) => q.method === "agent.wait" && q.params.runId === K1 && q.params.timeoutMs === 0), "agent.wait, bounded");
+    b.writeLink.isUp = () => true; // reconnected later: the record stays final
+    r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done");
+    // an engine error is reconciled the same way
+    await sleep(W + 20);
+    assert.equal((await send(b, A, K2)).status, 202);
+    b.link.waits[K2] = "error";
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K2}`)).json.status, "error");
+  } finally { await b.close(); }
+});
+
+test("I2: terminal events that arrive while the ack is awaited (then ack_timeout) are kept: polling shows the final text", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    b.writeLink.behave = (p) => {
+      b.writeLink.emit("chat", { runId: p.idempotencyKey, sessionKey: key, seq: 1, state: "delta", deltaText: "fast" });
+      b.writeLink.emit("chat", { runId: p.idempotencyKey, sessionKey: key, seq: 2, state: "final", message: { role: "assistant", content: [{ type: "text", text: "fast reply" }] } });
+      throw Object.assign(new Error("ack_timeout"), { code: "ack_timeout" });
+    };
+    const s = await send(b, A, K1);
+    assert.equal(s.json.error, "outcome_unknown");
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "fast reply");
+    // a DEFINITE refusal leaves no live record behind
+    await sleep(W + 20);
+    b.writeLink.behave = () => { throw Object.assign(new Error("not_written"), { code: "not_written" }); };
+    assert.equal((await send(b, A, K2)).json.error, "not_written");
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K2}`)).status, 404);
+  } finally { await b.close(); }
+});
+
+test("Codex: a resumed reply is bound to ITS turn: polling an earlier turn never reports a later turn's interruption or text", async () => {
+  const link = fakeLink();
+  const key = `agent:main:app:owner:${A}`;
+  link.history[key] = { messages: [
+    { role: "user", idempotencyKey: `${K1}:user`, content: "first", timestamp: 1, __openclaw: { id: "row0001" } },
+    { role: "assistant", content: [{ type: "text", text: "first reply" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } },
+    { role: "user", idempotencyKey: `${K2}:user`, content: "second", timestamp: 3, __openclaw: { id: "row0003" } },
+    { role: "assistant", content: [{ type: "text", text: "second, cut" }], timestamp: 4, __openclaw: { id: "row0004", runId: K2 } },
+    { role: "assistant", content: [{ type: "text", text: "second continued" }], timestamp: 6, __openclaw: { id: "row0006", runId: "run-r2", continuation: { source: "restart" } } },
+    { role: "assistant", content: [{ type: "text", text: "someone else's run" }], timestamp: 7, __openclaw: { id: "row0007", runId: "run-other" } }] };
+  link.waits[K1] = "ok";
+  const b = await bridge({ link });
+  try {
+    const r1 = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r1.json.interrupted, false); assert.equal(r1.json.resumed, null); assert.equal(r1.json.text, "first reply"); assert.equal(r1.json.status, "done");
+    const r2 = await b.call("GET", `/threads/${A}/runs/${K2}`);
+    assert.equal(r2.json.interrupted, true);
+    assert.deepEqual(r2.json.resumed, { runId: "run-r2", text: "second continued" }, "only the continuation run's own rows");
+  } finally { await b.close(); }
+});
+
+test("I3: after a bridge restart, an API clock AHEAD of the engine cannot end reconciliation early: the earlier K row is still found", async () => {
+  const T = Date.now() - 10 * 60_000; // the engine wrote "<K>:user" at T, then a tool-heavy turn of 200 rows within 60 s
+  const key = `agent:main:app:owner:${A}`;
+  const kRow = { role: "user", idempotencyKey: `${K1}:user`, content: "hello", timestamp: T, __openclaw: { id: "krow00001" } };
+  const older = rowsOf(10, T - 5000, "o");
+  const newer = rowsOf(200, T + 1, "n").map((m, i) => ({ ...m, timestamp: T + 1 + i * 300 }));
+  const all = [...older, kRow, ...newer];
+  const link = fakeLink();
+  link.sessions[key] = { key, sessionId: "sid-1" };
+  link.history[key] = (p) => {
+    if (!p.messageId) return { messages: all.slice(-p.limit), hasMore: true };
+    const at = all.findIndex((m) => m.__openclaw.id === p.messageId);
+    return { messages: all.slice(Math.max(0, at - p.limit + 1), at + 1), anchor: { hasOlder: at - p.limit + 1 > 0 } };
+  };
+  const b = await bridge({ link }); // a fresh bridge: no in-memory record of K
+  try {
+    const r = await b.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: T + 2 * 60_000, sessionSha256: await sha("sid-1") });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "already_received" });
+    assert.equal(b.writeLink.sends.length, 0);
+  } finally { await b.close(); }
+});
+
+test("I4: an outcome_unknown send counts for the one-run cap (a second send right after is busy)", async () => {
+  const b = await bridge();
+  try {
+    b.writeLink.behave = () => { throw Object.assign(new Error("ack_lost"), { code: "ack_lost" }); };
+    assert.equal((await send(b, A, K1)).json.error, "outcome_unknown");
+    b.writeLink.behave = null;
+    assert.deepEqual((await send(b, B, K2)).json, { ok: false, error: "busy", busyThread: A });
+    assert.equal(b.writeLink.sends.length, 1);
+  } finally { await b.close(); }
+});
+
+test("I4: reconciliation whose agent.wait gives no answer (timeout) fails closed: resend_not_allowed", async () => {
+  const link = fakeLink();
+  const key = `agent:main:app:owner:${A}`;
+  link.sessions[key] = { key, sessionId: "sid-1" };
+  const orig = link.request.bind(link);
+  link.request = async (method, params, o) => { if (method === "agent.wait") throw Object.assign(new Error("timeout"), { code: "timeout" }); return orig(method, params, o); };
+  const b = await bridge({ link });
+  try {
+    const r = await b.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: await sha("sid-1") });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "reconcile_incomplete" });
+    assert.equal(b.writeLink.sends.length, 0);
+  } finally { await b.close(); }
+});
+
+test("I4: an id sent in thread A cannot be resent through thread B (other_thread), nothing written", async () => {
+  const b = await bridge();
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    await sleep(W + 20);
+    const r = await b.call("POST", `/threads/${B}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: null });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "other_thread" });
+    assert.equal(b.writeLink.sends.length, 1);
+  } finally { await b.close(); }
+});
+
+test("I4: thread media is served for a hex tid (an inline image of that conversation's own message), and only through that tid", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    const png = Buffer.alloc(80); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png);
+    const row = { role: "user", content: [{ type: "text", text: "look" }, { type: "image", data: png.toString("base64"), mimeType: "image/png" }], timestamp: 1, __openclaw: { id: "imgrow001" } };
+    b.link.history[key] = (p) => ({ messages: [row] });
+    const h = await b.call("GET", `/threads/${A}/history`);
+    const ref = h.json.messages[0].media[0].ref;
+    assert.match(ref, /^[0-9a-f]{32}$/);
+    const m = await b.call("GET", `/threads/${A}/media?msg=imgrow001&ref=${ref}`);
+    assert.equal(m.status, 200, m.text);
+    assert.equal(m.text.length > 0, true);
+    assert.equal((await b.call("GET", `/threads/${B}/media?msg=imgrow001&ref=${ref}`)).status, 404, "B's key is not A's: another conversation's media is never served");
+  } finally { await b.close(); }
+});
+
+test("m3/m2: after a bridge restart the ENGINE says whether an id ran (any thread): a reused id is already_sent; another thread's run is 404", async () => {
+  const link = fakeLink();
+  link.waits[K1] = "ok"; // K1 ran in thread A before the bridge restarted
+  const b = await bridge({ link });
+  try {
+    assert.deepEqual((await send(b, B, K1)).json, { ok: false, error: "already_sent" });
+    assert.equal(b.writeLink.sends.length, 0);
+    assert.equal((await b.call("GET", `/threads/${B}/runs/${K1}`)).status, 404, "agent.wait is global: B never reports A's run");
+    assert.equal((await b.call("GET", `/threads/${B}/sends/${K1}?since=1`)).json.wait, null);
+    link.request = ((orig) => async (m, p, o) => { if (m === "agent.wait") throw Object.assign(new Error("x"), { code: "link_down" }); return orig(m, p, o); })(link.request.bind(link));
+    assert.deepEqual((await send(b, B, K2)).json, { ok: false, error: "not_written", reason: "precheck_failed" }, "no answer: definite, nothing sent");
+  } finally { await b.close(); }
+});
+
+test("I5: POST /threads/legacy/reset resets the legacy conversation (sessions.reset, as /new) under the cap; flag off = 404", async () => {
+  const b = await bridge();
+  const off = await bridge({ threads: false });
+  try {
+    b.link.active = [`agent:main:app:owner:${A}`];
+    assert.deepEqual((await b.call("POST", "/threads/legacy/reset", {})).json, { ok: false, error: "busy", busyThread: A });
+    assert.ok(!b.calls.some((c) => c.method === "sessions.reset"));
+    b.link.active = [];
+    const r = await b.call("POST", "/threads/legacy/reset", {});
+    assert.equal(r.status, 200, r.text); assert.equal(r.json.ok, true);
+    assert.deepEqual(b.calls.find((c) => c.method === "sessions.reset").params, { key: "agent:main:app:owner", reason: "new" });
+    assert.equal((await b.call("POST", `/threads/${A}/reset`, {})).status, 404, "only the legacy conversation is reset here");
+    assert.equal((await off.call("POST", "/threads/legacy/reset", {})).status, 404);
+  } finally { await b.close(); await off.close(); }
+});
+
+test("m5: a legacy reset under way makes a thread send to 'legacy' busy; legacy settings share ONE queue whichever route is used", async () => {
+  const timeline = [];
+  let resetGate;
+  const link = fakeLink();
+  link.sessions["agent:main:app:owner"] = { key: "agent:main:app:owner", sessionId: "s", thinkingLevels: [{ id: "low" }, { id: "high" }] };
+  const gc = async (method, params) => {
+    if (method === "sessions.describe") return { session: link.sessions[params.key] ?? null };
+    if (method === "sessions.reset") { await new Promise((r) => { resetGate = r; }); return { ok: true, key: params.key }; }
+    if (method === "sessions.patch") { timeline.push(`start:${params.thinkingLevel}`); await sleep(80); timeline.push(`end:${params.thinkingLevel}`); return { ok: true }; }
+    throw new Error(`unexpected ${method}`);
+  };
+  const b = await bridge({ link, gatewayCall: gc });
+  try {
+    const reset = b.call("POST", "/new", {});
+    await until(() => !!resetGate);
+    assert.deepEqual((await send(b, "legacy", K1)).json, { ok: false, error: "busy", busyThread: "legacy" });
+    resetGate(); await reset;
+    await Promise.all([b.call("POST", "/thinking", { level: "low" }), b.call("POST", "/threads/legacy/thinking", { level: "high" })]);
+    assert.deepEqual(timeline, ["start:low", "end:low", "start:high", "end:high"], "never interleaved");
+  } finally { await b.close(); }
+});
+
+test("m1/m6/m8: the settings queue map is pruned; an unavailable model is refused; a percent-encoded tid is refused", async () => {
+  const { createKeyedSerial } = await import("./app-bridge-threads.js");
+  const q = createKeyedSerial();
+  await Promise.all([q("a", () => sleep(5)), q("b", () => sleep(5)), q("a", () => sleep(5))]);
+  await sleep(5);
+  assert.equal(q.size(), 0);
+  const b = await bridge({ gatewayCall: async (m, p) => {
+    if (m === "models.list") return { models: [{ id: "down", provider: "mock", available: false }] };
+    if (m === "sessions.patch") throw new Error("must not patch");
+    throw new Error(m);
+  } });
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    b.link.sessions[key] = { key, sessionId: "s", modelProvider: "mock", model: "echo" };
+    assert.equal((await b.call("POST", `/threads/${A}/model`, { model: "mock/down" })).json.reason, "model_unavailable");
+    const enc = [...A].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+    const r = await b.call("GET", `/threads/${enc}/model`);
+    assert.equal(r.status, 400); assert.equal(r.json.reason, "bad_tid");
+    assert.equal((await b.call("GET", `/threads/%6c%65%67%61%63%79/model`)).json.reason, "bad_tid", "'legacy' encoded too");
+  } finally { await b.close(); }
 });
