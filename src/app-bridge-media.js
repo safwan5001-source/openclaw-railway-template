@@ -345,7 +345,8 @@ export function extractMedia(m, key, text = textOf(m)) {
     // are still checked against it when served)
     const hint = t ? null : (INLINE_MIMES.has(hints.get(sameFileKey(src))) ? hints.get(sameFileKey(src)) : null);
     const name = baseName(src);
-    return { kind: t ? (t[1] ? "image" : "file") : hint ? "image" : "file", file: src, mime: t?.[0] ?? hint, ...(hint ? { hint } : {}),
+    const recorded = hints.get(sameFileKey(src));
+    return { kind: t ? (t[1] ? "image" : "file") : hint ? "image" : "file", pictured: !!(t?.[0].startsWith("image/") || recorded?.startsWith("image/")), file: src, mime: t?.[0] ?? hint, ...(hint ? { hint } : {}),
       name: hint && !path.extname(name) ? `${name}${MIME_EXT[hint]}` : name, size: null };
   });
 
@@ -353,10 +354,14 @@ export function extractMedia(m, key, text = textOf(m)) {
   // itself has nothing to read), never a second picture
   // (only in a user row: an assistant reply that carries a block and a MEDIA: line shows both)
   const items = [];
-  const spare = m?.role === "user" ? refs.filter((r) => r.kind === "image") : [];
+  // (every picture file of the message counts, a heic too: a block that is not inline-viewable must not shift the pairing of the next one)
+  const spare = m?.role === "user" ? refs.filter((r) => r.pictured) : [];
   const used = new Set();
   for (const b of blocks) {
-    const own = spare.shift();
+    // the next picture file of the message; one whose type is known and differs from the block's is another picture's (a heic block
+    // without a file of its own must not take the jpeg's)
+    const at = spare.findIndex((r) => !b.mime || !r.mime || b.mime === r.mime);
+    const own = at >= 0 ? spare.splice(at, 1)[0] : undefined;
     if (own) used.add(own);
     items.push(b.missing !== undefined && own ? own : b);
   }

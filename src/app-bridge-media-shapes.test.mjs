@@ -527,3 +527,45 @@ test("tiny inline images whose whole payload is one short base64 string: padding
     assert.notEqual((await getMedia(`msg-pad-bad-${id}`, m.media[0].ref)).status, 200, id);
   }
 });
+
+// ------------------------------------------------------------------ pairing blocks with their files, heic included ---------------------
+
+test("image blocks pair, in order, with ALL picture files of the message: a heic (not inline-viewable) does not shift the next block's file", async () => {
+  const inbound = path.join(stateDir, "media", "inbound");
+  for (const [n, b] of [["h1.heic", HEIC], ["h2.heic", HEIC], ["j1.jpg", JPEG], ["j2.jpg", JPEG]]) fs.writeFileSync(path.join(inbound, n), b);
+  const fact = (n, ct) => ({ path: `media://inbound/${n}`, url: `media://inbound/${n}`, contentType: ct, kind: "image" });
+  const gone = (mime) => ({ type: "image", mimeType: mime, omitted: true, bytes: 9 });
+  const k = APP_SESSION_KEY;
+  const files = (m) => extractMedia(m, k).media.map((i) => i.artifact ?? i.file ?? `<${i.missing !== undefined ? "missing" : "inline"}>`);
+  const H = fact("h1.heic", "image/heic"), H2 = fact("h2.heic", "image/heic"), J = fact("j1.jpg", "image/jpeg"), J2 = fact("j2.jpg", "image/jpeg");
+  const u = (id, content, facts) => row(id, "user", content, 1, { facts });
+  // heic then jpeg, jpeg then heic: each block takes its own file, none twice
+  assert.deepEqual(files(u("msg-pair-001", [gone("image/heic"), gone("image/jpeg")], [H, J])), ["media://inbound/h1.heic", "media://inbound/j1.jpg"]);
+  assert.deepEqual(files(u("msg-pair-002", [gone("image/jpeg"), gone("image/heic")], [J, H])), ["media://inbound/j1.jpg", "media://inbound/h1.heic"]);
+  assert.deepEqual(files(u("msg-pair-003", [gone("image/heic"), gone("image/heic")], [H, H2])), ["media://inbound/h1.heic", "media://inbound/h2.heic"]);
+  // a heic block with an artifact keeps its artifact; the file it names is the same picture, not a second one; the jpeg keeps its own file
+  assert.deepEqual(files(u("msg-pair-004", [{ type: "image", mimeType: "image/heic", artifactId: "artifact_heic" }, gone("image/jpeg")], [H, J])), ["artifact_heic", "media://inbound/j1.jpg"]);
+  // a heic block with no file of its own does not take the jpeg's (types known and different); the jpeg block does
+  assert.deepEqual(files(u("msg-pair-005", [gone("image/heic"), gone("image/jpeg")], [J])), ["<missing>", "media://inbound/j1.jpg"]);
+  assert.deepEqual(files(u("msg-pair-005", [gone("image/jpeg"), gone("image/heic")], [H])), ["<missing>", "media://inbound/h1.heic"]);
+  // more blocks than facts, more facts than blocks: no crash, no duplicates, stable order
+  assert.deepEqual(files(u("msg-pair-006", [gone("image/jpeg"), gone("image/jpeg"), gone("image/jpeg")], [J, J2])), ["media://inbound/j1.jpg", "media://inbound/j2.jpg", "<missing>"]);
+  assert.deepEqual(files(u("msg-pair-007", [gone("image/jpeg")], [J, J2, H])), ["media://inbound/j1.jpg", "media://inbound/j2.jpg", "media://inbound/h1.heic"]);
+  assert.deepEqual(files(u("msg-pair-008", [], [H, J])), ["media://inbound/h1.heic", "media://inbound/j1.jpg"]);
+  assert.deepEqual(files(u("msg-pair-009", [gone("image/jpeg")], [])), ["<missing>"]);
+  // a pdf file is no picture: it never takes an image block's place and is listed after
+  const pdf = { path: "media://inbound/abc125", url: "media://inbound/abc125", contentType: "application/pdf", kind: "document" };
+  assert.deepEqual(files(u("msg-pair-010", [gone("image/jpeg")], [pdf, J])), ["media://inbound/j1.jpg", "media://inbound/abc125"]);
+  for (const m of [u("msg-pair-001", [gone("image/heic"), gone("image/jpeg")], [H, J]), u("msg-pair-006", [gone("image/jpeg"), gone("image/jpeg"), gone("image/jpeg")], [J, J2])]) {
+    const refsOf = extractMedia(m, k).media.map((i) => i.ref); assert.equal(new Set(refsOf).size, refsOf.length, "refs are unique");
+  }
+  // through the bridge: the heic is one entry (kind file, served as a download), the jpeg is available and served
+  rows.push(u("msg-pair-view1", [gone("image/heic"), gone("image/jpeg")], [H, J]));
+  const h = await hist();
+  const [a, b] = media(h, "msg-pair-view1").media;
+  assert.equal(media(h, "msg-pair-view1").media.length, 2);
+  assert.deepEqual([a.kind, a.mime, a.available], ["file", "image/heic", true]);
+  assert.deepEqual([b.kind, b.mime, b.available], ["image", "image/jpeg", true]);
+  assert.ok((await getMedia("msg-pair-view1", a.ref)).bytes.equals(HEIC));
+  assert.ok((await getMedia("msg-pair-view1", b.ref)).bytes.equals(JPEG));
+});
