@@ -1004,7 +1004,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       return new Promise((resolve) => { res.locals.resetSettled = resolve; next(); });
     });
   });
-  registerConvoRoutes(router, convoCtx);
+  const convo = registerConvoRoutes(router, convoCtx);
   registerMediaRoute(router, { ...mediaCtx, readable: readableKey, gatewayCall, cache: refs, log,
     findMessage: async (key, messageId) => {
       if (!gatewayCall) return null;
@@ -1013,7 +1013,19 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } });
 
   if (threads) {
-    registerThreadRoutes(router, { link, writeLink, gatewayCall, now, log, gate,
+    // POST /threads/legacy/reset (plan §3.4, review I5): the explicit reset of the legacy conversation once the API refuses legacy /new.
+    // The same reset as /new (sessions.reset, nothing deleted, the ledger for earlier rows), plus the global one-run cap under the
+    // send mutex: no reset while ANY app conversation runs, and no send starts while it is under way. Same settings queue as /new.
+    router.post("/threads/legacy/reset", (req, res) => {
+      let gone = false;
+      res.once("close", () => { gone = true; });
+      return gate.exclusive(async () => {
+        const c = await gate.check();
+        if (!c.ok) return res.status(c.status).json({ ok: false, error: c.error, ...(c.busyThread ? { busyThread: c.busyThread } : {}) });
+        return serial(() => (gone || res.destroyed || res.writableEnded ? undefined : convo.reset(res)));
+      });
+    });
+    registerThreadRoutes(router, { link, writeLink, gatewayCall, now, log, gate, legacySerial: serial, legacyResetActive: () => resetState.active,
       boot: () => link?.epoch ?? writeLink?.epoch ?? null,
       mapRows: (key, rows) => mapRows(key, rows, false, { thread: true }),
       messageText, cleanLiveText, cleanSnippet,
