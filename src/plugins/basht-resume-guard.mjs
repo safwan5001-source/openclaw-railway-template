@@ -8,9 +8,9 @@
 //   2. before_tool_call: for a SENSITIVE tool call inside a marked run, returns `requireApproval` (critical): a FRESH owner approval,
 //      listed by `openclaw approvals pending` and resolvable from the app (plugin kind). The owner decides; nothing re-runs silently.
 //      Mode "approve_sensitive" asks for every sensitive call (also outside resumed runs); "block_on_resume" refuses instead of asking.
-//   3. Optional (off by default): injects a stable `idempotency_key` into a sensitive call's params, for tool servers that honour
+//   3. Off in the shipped defaults (no config surface, BUG-4): can inject a stable `idempotency_key` into a sensitive call's params, for tool servers that honour
 //      one (the real Daftra API support is UNVERIFIED). Anchored on the chat.send id of the user turn being served.
-// Sensitive tools come from a CLOSED catalog (SENSITIVE_CATALOG); config can only choose which catalog entries are on.
+// Sensitive tools come from a CLOSED catalog (SENSITIVE_CATALOG); DEFAULT_CONFIG turns both entries on.
 // Daftra writes go through `execute_tools` {calls:[{name, arguments}]}: the inspector treats a call as a read ONLY when every
 // inner tool name is a read verb; anything else (or anything malformed) is sensitive (fail closed). A thrown hook blocks the call.
 // Known heuristic limit (review m9): a read-verb name with an UNLISTED write word (reset, generate, sync, upload, toggle, …) passes
@@ -44,17 +44,11 @@ export const SENSITIVE_CATALOG = Object.freeze({
 });
 export const DEFAULT_CONFIG = Object.freeze({ mode: "approve_on_resume", sensitive: Object.freeze(["daftra.execute_tools", "message.send"]), injectIdempotencyKey: false });
 
-/** A closed config: unknown keys, unknown catalog ids or a bad mode make the WHOLE config invalid (then the defaults apply). */
-export function resolveConfig(raw) {
-  if (raw === undefined || raw === null || (typeof raw === "object" && !Array.isArray(raw) && Object.keys(raw).length === 0)) return { ...DEFAULT_CONFIG, source: "default" };
-  const ok = typeof raw === "object" && !Array.isArray(raw)
-    && Object.keys(raw).every((k) => ["mode", "sensitive", "injectIdempotencyKey"].includes(k))
-    && (raw.mode === undefined || MODES.includes(raw.mode))
-    && (raw.sensitive === undefined || (Array.isArray(raw.sensitive) && raw.sensitive.length > 0 && raw.sensitive.every((s) => Object.hasOwn(SENSITIVE_CATALOG, s))))
-    && (raw.injectIdempotencyKey === undefined || typeof raw.injectIdempotencyKey === "boolean");
-  if (!ok) return { ...DEFAULT_CONFIG, source: "invalid" };
-  return { mode: raw.mode ?? DEFAULT_CONFIG.mode, sensitive: [...(raw.sensitive ?? DEFAULT_CONFIG.sensitive)], injectIdempotencyKey: raw.injectIdempotencyKey ?? false, source: "config" };
-}
+/**
+ * NO config surface (integration BUG-4): OpenClaw 2026.11.10 gives a standalone plugin file an empty config schema, so any
+ * `plugins.entries.basht-resume-guard.config` block is refused ("must not have additional properties") and would make the gateway
+ * config invalid. The plugin therefore always runs DEFAULT_CONFIG; other modes exist for tests and a future reviewed code change.
+ */
 
 export function isSensitive(config, toolName, params) {
   if (typeof toolName !== "string") return false;
@@ -121,10 +115,8 @@ export default {
   name: "BASHT resume guard",
   description: "Fresh owner approval for sensitive tools in runs the engine resumed after a restart (D-B4-9).",
   register(api) {
-    // api.pluginConfig (plugins.entries.basht-resume-guard.config) when the loader passes one; otherwise the closed defaults
-    const config = resolveConfig(api?.pluginConfig);
+    const config = DEFAULT_CONFIG; // never api.pluginConfig (see above)
     const log = (line) => api?.logger?.info?.(`[${PLUGIN_ID}] ${line}`);
-    if (config.source === "invalid") api?.logger?.warn?.(`[${PLUGIN_ID}] invalid config ignored; using the closed defaults`);
     const g = createGuard(config, log);
     api.on("before_agent_run", (event, ctx) => g.before_agent_run(event, ctx));
     api.on("before_tool_call", (event, ctx) => g.before_tool_call(event, ctx));

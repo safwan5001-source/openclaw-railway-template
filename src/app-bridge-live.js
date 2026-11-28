@@ -94,6 +94,7 @@ export function createLiveRoutes({ link, log, threads = false }) {
         for (const it of items) {
           const known = link.approvalThreadOf?.(it.id);
           it.thread = known && known !== "unknown" ? known : approvalThread(raw.get(it.id));
+          if (it.thread !== null && it.thread !== "unknown") it.session = "app"; // BUG-7: an app conversation's approval is the app's
         }
       }
       res.json({ ok: true, items });

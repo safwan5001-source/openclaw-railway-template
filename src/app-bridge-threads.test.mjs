@@ -110,6 +110,14 @@ async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWrite
     if (method === "sessions.search") return { results: params.sessionKeys.map((k, i) => ({ sessionKey: k, messageId: `msg00${i}x`, role: "user", timestamp: 5, snippet: "hello there" })) };
     throw new Error(`unexpected ${method}`);
   });
+  // like the engine: an accepted chat.send creates the conversation's session (seen by describe shortly after the ack)
+  const rawSend = writeLink.chatSend.bind(writeLink);
+  writeLink.chatSend = async (p) => {
+    const ack = await rawSend(p);
+    const q = `agent:main:${p.sessionKey}`;
+    if (link.autoSession !== false && !link.sessions[q]) link.sessions[q] = { key: q, sessionId: `sid-${p.sessionKey}` };
+    return ack;
+  };
   const router = createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://gw.invalid", gatewayToken: "synthetic-gateway-token-0123456789abcdef",
     configPath: "/nonexistent/openclaw.json", fetchImpl: httpGw.fetch, gatewayCall: gc, link, writeLink, env: threads ? { BASHT_THREADS: "on" } : {}, ...(recentAcceptMs === null ? {} : { recentAcceptMs }), ...(now ? { now } : {}) });
   const app = express(); app.use("/app/v1", router);
@@ -175,7 +183,8 @@ test("thread send: the bridge builds the UNQUALIFIED key from the tid, idempoten
   try {
     const r = await send(b, A, K1);
     assert.equal(r.status, 202, r.text);
-    assert.deepEqual(r.json, { ok: true, runId: K1, thread: A, ack: "started", boot: EPOCH, sessionSha256: null });
+    assert.deepEqual(r.json, { ok: true, runId: K1, thread: A, ack: "started", boot: EPOCH, sessionSha256: await sha(`sid-app:owner:${A}`) },
+      "a new conversation's session hash is captured after the ack (BUG-5)");
     assert.deepEqual(b.writeLink.sends, [{ sessionKey: `app:owner:${A}`, message: "hello", idempotencyKey: K1, attachments: [] }]);
     assert.ok(!b.link.requests.some((q) => q.method === "chat.send"), "never on the admin link");
     assert.deepEqual(b.link.requests.find((q) => q.method === "sessions.describe").params, { key: `agent:main:app:owner:${A}` }, "the pre-check uses the qualified key");
@@ -944,4 +953,136 @@ test("Codex: an OLDER turn behind a tool-heavy later turn is located by bounded 
     const u = await b.call("GET", `/threads/${A}/runs/${K1}`);
     assert.equal(u.status, 200); assert.equal(u.json.status, "unknown"); assert.equal(u.json.located, false); assert.equal(u.json.text, "");
   } finally { await b.close(); }
+});
+
+// ---------------------------------------------------------------- fix round 2: integration repro shapes (P2-B4-1-INTEGRATION) ----------
+const userRow = (K, id, t = 1) => ({ role: "user", idempotencyKey: `${K}:user`, content: "hello", timestamp: t, __openclaw: { id } });
+const replyRow = (K, id, text, t = 2, extra = {}) => ({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: t, __openclaw: { id, runId: K }, ...extra });
+
+test("BUG-1 (repro 1): a repeat send answered ack:\"ok\" after a restart (agent.wait times out) ends 'done' with the reply text, never 'running'", async () => {
+  const link = fakeLink();
+  const key = `agent:main:app:owner:${A}`;
+  link.sessions[key] = { key, sessionId: "sid-1" };
+  link.history[key] = { messages: [userRow(K1, "row0001"), replyRow(K1, "row0002", "the earlier reply")] };
+  const b = await bridge({ link }); // a fresh bridge, gateway restarted too: agent.wait K -> "timeout" (integration s3 full-restart)
+  try {
+    b.writeLink.behave = (p) => ({ runId: p.idempotencyKey, status: "ok" });
+    const s = await send(b, A, K1);
+    assert.equal(s.status, 202); assert.equal(s.json.ack, "ok");
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "the earlier reply");
+  } finally { await b.close(); }
+  // gateway still up (bridge-only restart): the engine already knows K -> refused before any write (m3), not a stuck "running"
+  link.waits[K1] = "ok";
+  const b2 = await bridge({ link });
+  try {
+    assert.deepEqual((await send(b2, A, K1)).json, { ok: false, error: "already_sent" });
+    assert.equal(b2.writeLink.sends.length, 0);
+    const r = await b2.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "the earlier reply");
+  } finally { await b2.close(); }
+});
+
+test("BUG-1 (repro 2): after ack_lost / ack_timeout the run that did execute ends 'done' from history even when agent.wait times out", async () => {
+  for (const code of ["ack_lost", "ack_timeout"]) {
+    const link = fakeLink();
+    const key = `agent:main:app:owner:${A}`;
+    const b = await bridge({ link });
+    try {
+      b.writeLink.behave = () => { throw Object.assign(new Error(code), { code }); };
+      assert.equal((await send(b, A, K1)).json.reason, code);
+      let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+      assert.equal(r.json.status, "running", "nothing known yet");
+      link.history[key] = { messages: [userRow(K1, "row0001"), replyRow(K1, "row0002", `ack ${code}`)] }; // the engine ran it
+      await sleep(1600); // the next engine check (at most every 1.5 s while running)
+      r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+      assert.equal(r.json.status, "done", code); assert.equal(r.json.text, `ack ${code}`);
+    } finally { await b.close(); }
+  }
+});
+
+test("BUG-1 (repro 3): a gateway crash while the bridge stays up: the resumed turn makes K 'unknown' + interrupted, not 'running' forever", async () => {
+  const link = fakeLink();
+  const key = `agent:main:app:owner:${A}`;
+  const b = await bridge({ link });
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    // SIGKILL lost the partial reply under K; the engine resumed the turn in a new run (integration s7c)
+    link.history[key] = { messages: [userRow(K1, "row0001"),
+      { role: "assistant", content: [{ type: "text", text: "RESUMED ack s7c" }], stopReason: "stop", timestamp: 5, __openclaw: { id: "row0005", runId: "1d963dd6-run", continuation: { source: "restart" } } }] };
+    await sleep(1600);
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "unknown"); assert.equal(r.json.interrupted, true);
+    assert.deepEqual(r.json.resumed, { runId: "1d963dd6-run", text: "RESUMED ack s7c" });
+    assert.equal(b.writeLink.sends.length, 1, "nothing re-sent");
+  } finally { await b.close(); }
+});
+
+test("F1/item 8: 'unavailable during gateway startup' (UNAVAILABLE, reason startup-sidecars) is the definite 503 engine_starting; no stuck record", async () => {
+  const b = await bridge();
+  try {
+    for (const message of ["chat.send unavailable during gateway startup", "Agent main has not completed startup inspection and preparation. Inspection and writable admission continue after the Gateway listener binds."]) {
+      b.writeLink.behave = () => { throw Object.assign(new Error(message), { code: "UNAVAILABLE", refused: true, reason: "startup-sidecars", retryAfterMs: 500 }); };
+      const K = (await import("node:crypto")).randomUUID();
+      const r = await send(b, A, K);
+      assert.equal(r.status, 503); assert.deepEqual(r.json, { ok: false, error: "engine_starting", retryAfterMs: 500 });
+      assert.ok(DEFINITE_REFUSALS.includes("engine_starting"));
+      assert.equal((await b.call("GET", `/threads/${A}/runs/${K}`)).status, 404, "no live record left behind");
+      await sleep(W + 10);
+    }
+    // another UNAVAILABLE (not the startup admission) stays unknown
+    assert.equal(classifySendError(Object.assign(new Error("x"), { code: "UNAVAILABLE", refused: true, reason: "other" })).error, "outcome_unknown");
+  } finally { await b.close(); }
+});
+
+test("BUG-2: a second final carrying an engine status notice never replaces the reply (either order); history agrees", async () => {
+  const b = await bridge();
+  try {
+    const key = `agent:main:app:owner:${A}`;
+    const notice = { role: "assistant", content: [{ type: "text", text: "↪️ Model Fallback: xai/grok-3-fast (selected xai/grok-3; selected model unavailable)", openclawStatusNotice: true }] };
+    assert.equal((await send(b, A, K1)).status, 202);
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 1, state: "delta", deltaText: "ack s2b4" });
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 2, state: "final", message: { role: "assistant", content: [{ type: "text", text: "ack s2b4" }] } });
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 3, state: "final", message: notice });
+    let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "ack s2b4");
+    await sleep(W + 20);
+    assert.equal((await send(b, A, K2)).status, 202);
+    b.writeLink.emit("chat", { runId: K2, sessionKey: key, seq: 1, state: "final", message: { role: "assistant", content: [{ type: "text", text: "⚠️ Exec failed", openclawStatusNotice: true }] } });
+    b.writeLink.emit("chat", { runId: K2, sessionKey: key, seq: 2, state: "final", message: { role: "assistant", content: [{ type: "text", text: "the reply" }] } });
+    r = await b.call("GET", `/threads/${A}/runs/${K2}`);
+    assert.equal(r.json.text, "the reply");
+  } finally { await b.close(); }
+});
+
+test("BUG-5: a new conversation's session hash is captured after the ack (bounded retries); resend of that message is already_received", async () => {
+  const link = fakeLink(); link.autoSession = false;
+  const key = `agent:main:app:owner:${A}`;
+  let describesAfterSend = 0;
+  const orig = link.request.bind(link);
+  link.request = async (m, p, o) => {
+    if (m === "sessions.describe" && b.writeLink.sends.length > 0 && ++describesAfterSend === 2) link.sessions[key] = { key, sessionId: "sid-new" };
+    return orig(m, p, o);
+  };
+  const b = await bridge({ link });
+  try {
+    const s = await send(b, A, K1);
+    assert.equal(s.status, 202);
+    assert.equal(s.json.sessionSha256, await sha("sid-new"), "the engine showed the session only on the 2nd describe after the ack");
+    link.history[key] = { messages: [userRow(K1, "row0001", Date.now())] };
+    await sleep(W + 20);
+    // the API had stored null at reservation (integration s3r a/b): reconcile decides, not a blanket session_changed
+    const r = await b.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: null });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "already_received" });
+  } finally { await b.close(); }
+  // a fresh bridge, null at reservation, a session now exists that does NOT hold K: still refused (cannot tell it from a replaced one)
+  const link2 = fakeLink();
+  link2.sessions[key] = { key, sessionId: "sid-other" };
+  link2.history[key] = { messages: [] };
+  const b2 = await bridge({ link: link2 });
+  try {
+    const r = await b2.call("POST", `/threads/${A}/sends/${K2}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: null });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "session_changed" });
+    assert.equal(b2.writeLink.sends.length, 0);
+  } finally { await b2.close(); }
 });

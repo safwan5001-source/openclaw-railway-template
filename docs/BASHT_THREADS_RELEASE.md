@@ -46,7 +46,7 @@ whitespace and format marks) is then the only barrier, and the owner cannot send
   not created. Conversations created meanwhile stay in the engine's SQLite; the legacy app never shows them. Sends left `unknown` in
   the API stay unknown until reconciled after re-enabling; nothing is retried in either direction.
 - **Code:** Railway rollback to the batch-3 deployment. No data is written by this step (no migration, no config write).
-- **Plugin:** see below; removing it from the config and reloading/restarting the gateway disables it.
+- **Plugin:** `plugins.entries.basht-resume-guard.enabled false`, keeping the load path (see below). Never remove the path as a rollback.
 
 ## Release gate (plan §11): operator-run only
 
@@ -57,34 +57,34 @@ engine container) or the owner reading the app's "System status" screen (`/app/v
 
 ```bash
 # Run by the OPERATOR in the engine container's shell (never from a BASHT session). Prints counts only. Paste the output verbatim.
-| L8 | `notifyOnCreate` | **ناجح**: لا أثر في `main` | — |
-| L9 | البوابة | **ناجح كما كُتب**. صفوف cron المضغوطة فيها `nextRunAtMs` في المستوى الأعلى فقط | §11 |
-| L10 | الاحتفاظ | **ناجح طوال حياة الجلسة**، ويسقط بالحذف | §4.3 |
-| D-B4-9 | التكرار بعد الانهيار | الرسائل لا تتكرر، والأدوات ممكن. الإضافة منعته | §9.4 |
-
-**الملفات:**
-- `src/gateway-link.js`:
-  - اتصال إرسال ثانٍ تُحدَّد صلاحياته بـ `writeLinkProfile` (A افتراضيًا).
-  - `WRITE_METHODS={chat.send, chat.abort}` ومدققاته، وحقن `suppressCommandInterpretation:true` في A.
-  - `rpc` خاصة برموز `not_written` و`ack_lost` و`ack_timeout`.
-  - قيم `hello-ok` (`maxPayload` و`maxImageBytes` و`attachments.maxBytes`).
-  - قراءات `chat.history` و`agent.wait` بمدققات مغلقة.
-  - `thread` على الموافقات (exec **وplugin**) والأحداث، وخريطة `approvalId → sessionKey`.
-- `src/app-bridge.js`:
-  - مسارات `/threads/*`، والقفل والسقف العام، والفحص المسبق (`{session:null}`)، وفحص الحجم.
-  - مرشح الأوامر حسب الخيار، ورموز الرد (ومنها `cold`)، والمحلل بحسب المسار.
-  - النص الحي من `deltaText`، ووسم الرد المستأنف، و`runIdOf` لصفوف `<K>:user`.
-- `src/app-bridge-live.js`: موافقات `kind:"plugin"` (القائمة والحسم).
-- `src/app-bridge-convo.js`: `threads/search`، و`legacy/reset`.
-- `src/app-bridge-status.js`: القدرات، و`writeLinkProfile` الفعلي، وحالة تحميل إضافة الحماية (قيمة منطقية فقط).
-- `src/server.js`: `validateSessionRpc`.
-- **جديد: إضافة الحماية** (مثلًا `plugins/basht-resume-guard/`) مع ملف قائمة الأدوات الحساسة ومطابقة `execute_tools` بالمعاملات (§9.4). تُحمَّل عبر `plugins.load.paths`، **لكن تفعيلها في الإنتاج كتابة إعداد منفصلة**.
-- `docs/BASHT_APP_BRIDGE.md`: حدود العزل (D-B4-1b)، وفرق الأدوات، و`[embed]`/`<details>`.
-
-**اختبارات تفشل بدون التغيير:**
+command -v openclaw >/dev/null || { echo "openclaw not on PATH"; echo NOT_IDLE_OR_UNKNOWN; exit 1; }
+node -e '
+const {execFileSync}=require("child_process");
+const run=(a)=>{try{return JSON.parse(execFileSync("openclaw",a,{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:30000}))}catch{return null}};
+const s=run(["gateway","call","sessions.list","--params",JSON.stringify({activeOnly:true,limit:1,includeGlobal:true,includeUnknown:true}),"--json"]);
+const a=run(["approvals","pending","--json"]);
+const c=run(["gateway","call","cron.list","--params",JSON.stringify({includeDisabled:true,limit:200,compact:true,includeDeliveryPreviews:false}),"--json"]);
+const now=Date.now();
+const active=Number.isInteger(s?.totalCount)?s.totalCount:null;
+const approvals=Array.isArray(a?.approvals)?a.approvals.length:null;
+const jobs=Array.isArray(c?.jobs)&&c.hasMore!==true?c.jobs:null;
+const cronRunning=jobs?jobs.filter(j=>typeof j.runningAtMs==="number"||typeof j?.state?.runningAtMs==="number").length:null;
+const enabled=jobs?jobs.filter(j=>j.enabled!==false):null;
+const nexts=enabled?enabled.map(j=>j.nextRunAtMs??j?.state?.nextRunAtMs):null;
+const nextOk=nexts!==null&&nexts.every(n=>typeof n==="number");      // a missing field is unknown, never "no job"
+const minToNextCron=nextOk?(nexts.length?Math.floor((Math.min(...nexts)-now)/60000):Infinity):null;
+const t=new Date(now), hm=t.getUTCHours()*60+t.getUTCMinutes();
+const inBlackout=hm>=23*60+45||hm<90;   // 23:45–01:30 UTC
+const out={at:t.toISOString(),activeSessions:active,pendingApprovals:approvals,cronRunning,minToNextCron:minToNextCron===Infinity?"none":minToNextCron,inBlackout};
+const nulls=Object.entries(out).filter(([,v])=>v===null).map(([k])=>k);
+console.log(JSON.stringify(out));
+if(nulls.length) console.log("UNKNOWN_INPUTS "+nulls.join(","));
+const ok=!nulls.length&&active===0&&approvals===0&&cronRunning===0&&(minToNextCron===Infinity||minToNextCron>=20)&&!inBlackout;
+console.log(ok?"IDLE":"NOT_IDLE_OR_UNKNOWN");'
 ```
 
-Lab-verified (L9) in a non-login clean-env shell: `IDLE`, `NOT_IDLE_OR_UNKNOWN` (busy, approval pending, cron < 20 min, gateway
+This is `lab/b4lab2/tools/gate-11.2.sh`, the plan §11.2 command run verbatim by the P2-B4-1 lab (only the first comment line is
+translated). Lab-verified (L9) in a non-login clean-env shell: `IDLE`, `NOT_IDLE_OR_UNKNOWN` (busy, approval pending, cron < 20 min, gateway
 down: `UNKNOWN_INPUTS …`) and `openclaw not on PATH`. Compact cron rows have only top-level `nextRunAtMs`. `openclaw` on PATH in the
 production container's non-login shell is supported by the Dockerfile only (not observed).
 
@@ -136,13 +136,27 @@ openclaw config set plugins.entries.basht-resume-guard '{"enabled":true,"hooks":
 openclaw plugins list   # must show basht-resume-guard enabled; add this check to the release gate while it is on
 ```
 
-Settings: the closed defaults (`mode: approve_on_resume`, both catalog entries, no key injection) apply unless the loader passes
-`plugins.entries.basht-resume-guard.config` as `api.pluginConfig` (`{mode: approve_on_resume|approve_sensitive|block_on_resume,
-sensitive: [ids], injectIdempotencyKey: bool}`; anything unknown ⇒ the defaults). Whether a standalone-file plugin may carry a
-`config` block is **unverified** (the gateway may require it to be empty); the defaults need none.
+Settings: **none.** The plugin always runs its built-in defaults: `approve_on_resume`, both catalog entries (Daftra
+`execute_tools` writes, outbound message tools), no idempotency-key injection. Do **not** add a
+`plugins.entries.basht-resume-guard.config` block: OpenClaw 2026.11.10 gives a standalone plugin file an empty config schema and
+refuses it (`must not have additional properties: "mode"`, integration BUG-4); a hand-edited block would make the whole config
+invalid (the BUG-3 outage class). Changing the mode means changing the code (`DEFAULT_CONFIG`) and a reviewed deploy.
 
-**Disable:** remove the path from `plugins.load.paths` (the same merge script in reverse: write the array without it), or set `plugins.entries.basht-resume-guard.enabled:false`, then
-`openclaw plugins reload basht-resume-guard` or a gated restart; `plugins list` must no longer show it.
+**Disable (the rollback): set `enabled:false` and KEEP the load path.**
+
+```bash
+openclaw config set plugins.entries.basht-resume-guard.enabled false --strict-json
+openclaw config validate          # must be valid
+openclaw plugins list             # basht-resume-guard: disabled
+```
+
+It hot-reloads (no restart) and a crash then behaves exactly as without the guard (integration `s10-disabled-by-flag`).
+**Never remove the path from `plugins.load.paths` while the entry exists** (and not "entry first, then path" either): the config
+becomes invalid (`plugin manifest not found`), every later `config set` is refused, and the next gateway restart exits with code 78;
+the wrapper's single auto-restart then fails and WhatsApp and the app stay down until a redeploy (integration BUG-3). The wrapper's
+boot runs `openclaw doctor --fix` before starting the gateway, which turns such an entry into "stale config entry ignored": full
+removal of the path and the entry is therefore done only together with a gated redeploy, never as a live rollback. (Wrapper
+hardening, e.g. `doctor --fix` before an auto-restart, is a separate lifecycle change outside this batch.)
 
 **Residual risk (owner acceptance, D-B4-9):** the ambiguity of a call cut mid-execution remains (the owner must check external state
 before approving); tools outside the catalog are not gated; hook firing on the `claude-cli` runtime is unverified; if the plugin

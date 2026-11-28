@@ -128,3 +128,38 @@ test("flag on: chat final/error events of every app conversation are tagged with
   for (const k of ["agent:main:whatsapp:direct:+966500000001", "agent:main:main", TKEY.toUpperCase(), `app:owner:${HEX}`]) assert.equal(normalizeEvent("chat", { sessionKey: k, state: "final", runId: "r" }, o), null, k);
   assert.equal(normalizeEvent("chat", { sessionKey: TKEY, state: "delta", runId: K }, o), null);
 });
+
+test("BUG-7: thread approvals are the app's own (session 'app', isApp true) with their thread; flag off keeps the old labels", async () => {
+  const v = approvalView(execReq("approval-t-1", TKEY), "exec", { threads: true });
+  assert.deepEqual([v.session, v.isApp, v.thread], ["app", true, HEX]);
+  const l = approvalView(execReq("approval-l-1", APP_SESSION_KEY), "exec", { threads: true });
+  assert.deepEqual([l.session, l.isApp, l.thread], ["app", true, "legacy"]);
+  const w = approvalView(execReq("approval-w-1", "agent:main:whatsapp:direct:+966500000001"), "exec", { threads: true });
+  assert.deepEqual([w.session, w.isApp, w.thread], ["whatsapp", false, null]);
+  const off = approvalView(execReq("approval-t-2", TKEY), "exec");
+  assert.deepEqual([off.session, off.isApp], ["other", false], "flag off: unchanged");
+  const p = approvalView(pluginReq(TKEY), "plugin", { threads: true });
+  assert.deepEqual([p.session, p.isApp, p.thread], ["app", true, HEX]);
+  const { gw, link } = await start(true);
+  gw.last().event("exec.approval.requested", execReq("approval-t-3", TKEY));
+  gw.last().event("exec.approval.resolved", { id: "approval-t-3", decision: "deny", request: { sessionKey: TKEY } });
+  await until(() => link.events(0).events.some((e) => e.type === "approval.resolved"));
+  const res = link.events(0).events.find((e) => e.type === "approval.resolved");
+  assert.deepEqual([res.session, res.thread], ["app", HEX]);
+  link.stop();
+});
+
+test("BUG-2: /events carries ONE chat.final per run even when the engine sends a second final (a status notice); flag off unchanged", async () => {
+  const { gw, link } = await start(true);
+  const fin = (n) => gw.last().event("chat", { sessionKey: TKEY, state: "final", runId: K, seq: n, message: { content: [{ type: "text", text: n === 1 ? "reply" : "notice", openclawStatusNotice: n !== 1 }] } });
+  fin(1); fin(2);
+  gw.last().event("chat", { sessionKey: TKEY, state: "final", runId: "22222222-2222-4222-8222-222222222222", seq: 1 });
+  await until(() => link.events(0).events.filter((e) => e.type === "chat.final").length >= 2);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(link.events(0).events.filter((e) => e.type === "chat.final").map((e) => e.runId), [K, "22222222-2222-4222-8222-222222222222"]);
+  link.stop();
+  const off = await start(false);
+  for (const n of [1, 2]) off.gw.last().event("chat", { sessionKey: APP_SESSION_KEY, state: "final", runId: "r", seq: n });
+  await until(() => off.link.events(0).events.filter((e) => e.type === "chat.final").length >= 2);
+  off.link.stop();
+});

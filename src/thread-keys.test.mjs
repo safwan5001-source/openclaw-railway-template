@@ -53,7 +53,7 @@ test("engine flag: ON only for exactly BASHT_THREADS=on; capability ids and the 
   for (const v of [undefined, "", "1", "true", "ON", "On", "on ", " on", "yes", "off", "0"]) assert.equal(threadsEnabled(v === undefined ? {} : { BASHT_THREADS: v }), false, JSON.stringify(v));
   assert.equal(threadsEnabled(undefined), false);
   assert.deepEqual([...THREAD_FEATURES], ["sessions.multi.v1", "send.ws.v1", "events.thread.v1"]);
-  assert.deepEqual([...DEFINITE_REFUSALS].sort(), ["archived", "bad_request", "busy", "busy_unknown", "cold", "command_not_allowed", "conflict", "not_written", "too_large"]);
+  assert.deepEqual([...DEFINITE_REFUSALS].sort(), ["archived", "bad_request", "busy", "busy_unknown", "cold", "command_not_allowed", "conflict", "engine_starting", "not_written", "too_large"]);
   for (const c of DEFINITE_REFUSALS) assert.match(c, /^[a-z][a-z0-9_]{0,31}$/, "fits the API's refusal column");
   assert.ok(!DEFINITE_REFUSALS.includes("outcome_unknown") && !DEFINITE_REFUSALS.includes("engine_unavailable"));
 });

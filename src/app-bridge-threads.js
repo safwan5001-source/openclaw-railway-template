@@ -45,6 +45,8 @@ const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{6,100}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const MIME_EXT = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/heic": "heic", "image/heif": "heif" };
 
+const SESSION_RETRY_MS = [100, 300, 600];
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const str = (v, max = 200) => (typeof v === "string" && v.trim() ? v.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max) : null);
 const intOr = (v, d) => { const n = Number.parseInt(String(v ?? ""), 10); return Number.isSafeInteger(n) ? n : d; };
@@ -58,6 +60,17 @@ export function userRowRunId(m) {
 }
 /** A reply row's run id when it is a chat.send run (= clientMsgId), else null (HTTP rows carry chatcmpl_… ids). */
 export const assistantRunId = (m) => (m?.role === "assistant" && typeof m.__openclaw?.runId === "string" && CLIENT_MSG_ID_RE.test(m.__openclaw.runId) ? m.__openclaw.runId : null);
+/** K's final reply row: an assistant row that stopped ("stop"/"end_turn") with no tool call still pending, not a notice. */
+export function isFinalReply(m) {
+  if (m?.role !== "assistant" || isStatusNotice(m)) return false;
+  const calls = Array.isArray(m.content) && m.content.some((p) => p?.type === "toolCall" || p?.type === "tool_use");
+  return !calls && (m.stopReason === "stop" || m.stopReason === "end_turn");
+}
+/** An engine status notice (not the model's reply): every content part is flagged `openclawStatusNotice` (integration BUG-2). */
+export function isStatusNotice(m) {
+  const c = m?.content;
+  return Array.isArray(c) && c.length > 0 && c.every((p) => p && typeof p === "object" && p.openclawStatusNotice === true);
+}
 /** The first reply row of a run the ENGINE resumed after a restart (lab L5): `continuation.source === "restart"`. */
 export const isResumedRow = (m) => m?.role === "assistant" && m.__openclaw?.continuation?.source === "restart";
 
@@ -77,6 +90,9 @@ export function classifySendError(err) {
     if (c === "INVALID_REQUEST" && /\bis archived\b/i.test(msg)) return { status: 409, error: "archived" };
     if (c === "UNAVAILABLE" && /\bTRANSCRIPT_COLD\b/.test(`${msg} ${err.reason ?? ""}`)) return { status: 409, error: "cold" };
     if (c === "INVALID_REQUEST" && /exceeds size limit/i.test(msg)) return { status: 413, error: "too_large", reason: "engine_limit" };
+    // the gateway's admission refused the send during its startup (details.reason "startup-sidecars", retryable): nothing was
+    // admitted, so nothing ran (integration F1: 0 model calls). Definite; the API may let the owner try again shortly.
+    if (c === "UNAVAILABLE" && err.reason === "startup-sidecars") return { status: 503, error: "engine_starting", ...(err.retryAfterMs ? { retryAfterMs: err.retryAfterMs } : {}) };
     return { status: 502, error: "outcome_unknown", reason: "engine_refused" };
   }
   return { status: 502, error: "outcome_unknown", reason: "exception" };
@@ -123,7 +139,13 @@ export function createThreadRuns({ writeLink, now = Date.now, messageText }) {
     if (!r || p.sessionKey !== r.qualified) return;
     if (p.state === "status") r.phase = str(p.phase, 40);
     else if (p.state === "delta" && typeof p.deltaText === "string") { r.firstTokenAt ??= now(); r.text = p.replace === true ? p.deltaText : r.text + p.deltaText; }
-    else if (p.state === "final") { r.status = "done"; r.finishedAt = now(); const t = p.message ? messageText(p.message) : ""; if (t) r.text = t; }
+    else if (p.state === "final") {
+      // BUG-2: the engine may send a SECOND final for one run, an engine status notice ("↪️ Model Fallback…", "⚠️ Exec failed",
+      // content parts with openclawStatusNotice). The first final reply text is kept; notices never replace it (history agrees).
+      if (r.status !== "done") { r.status = "done"; r.finishedAt = now(); }
+      const t = p.message && !isStatusNotice(p.message) ? messageText(p.message) : "";
+      if (t && !r.finalText) { r.text = t; r.finalText = true; }
+    }
     else if (p.state === "aborted") { r.status = "stopped"; r.finishedAt = now(); }
     else if (p.state === "error") {
       r.status = "error"; r.finishedAt = now();
@@ -295,14 +317,20 @@ export function registerThreadRoutes(router, ctx) {
       if (c.error === "outcome_unknown") gate.noteAccepted(k.tid); // it may be running: it counts for the one-run cap
       else if (!existed) runs.drop(K);
       log?.warn?.("app-bridge", `thread send: ${c.error}${c.reason ? ` (${c.reason})` : ""}`);
-      return reply(res, c.status, c.error, c.reason ? { reason: c.reason } : {});
+      return reply(res, c.status, c.error, { ...(c.reason ? { reason: c.reason } : {}), ...(c.retryAfterMs ? { retryAfterMs: c.retryAfterMs } : {}) });
     }
     try {
-      gate.noteAccepted(k.tid);
       const status = ["started", "in_flight", "ok"].includes(ack?.status) ? ack.status : null;
+      // BUG-1: "ok" = this id already ran to completion earlier (a repeat after a restart): nothing runs now, no final will come
+      if (status === "ok") { const r = runs.get(K); if (r && r.status === "running") { r.status = "done"; r.finishedAt = now(); } }
       let sha = sessionSha256;
-      if (!sha) { try { const s = await describe(k.qualified); sha = s?.sessionId ? sha256(s.sessionId) : null; } catch { sha = null; } }
+      // BUG-5: a new conversation's session appears shortly AFTER the ack: describe again, bounded (≤ ~1 s in all)
+      for (const wait of sha ? [] : SESSION_RETRY_MS) {
+        try { const s = await describe(k.qualified); if (s?.sessionId) { sha = sha256(s.sessionId); break; } } catch { /* try again */ }
+        await sleepMs(wait);
+      }
       remember(K, { tid: k.tid, at: sends.get(K)?.at ?? now(), sessionSha256: sha, bodySha256: body.bodySha256 });
+      gate.noteAccepted(k.tid); // the accept window starts at the answer (after any session read), never earlier
       if (!status) return reply(res, 502, "outcome_unknown", { reason: "unexpected_ack" });
       return res.status(202).json({ ok: true, runId: K, thread: k.tid, ack: status, boot: ctx.boot(), sessionSha256: sha, ...extra });
     } catch {
@@ -432,10 +460,14 @@ export function registerThreadRoutes(router, ctx) {
       // the bridge's OWN comparison (lab L10: the chat.send sessionId param does not guard): same engine session as at the original send
       const current = s?.sessionId ? sha256(s.sessionId) : null;
       const want = rec ? rec.sessionSha256 : expected;
-      if (current !== want) return notAllowed("session_changed");
+      // BUG-5: no session was known at the original send (a new conversation) and one exists now. Either the original created it
+      // (then "<K>:user" is in it: already_received) or it cannot be told apart from a replaced session: refused (session_changed).
+      const createdSince = want === null && current !== null;
+      if (current !== want && !createdSince) return notAllowed("session_changed");
       const r = await reconcile(link, k.qualified, K, at);
       if (!r.complete) return notAllowed("reconcile_incomplete");
       if (r.found || r.wait === "ok" || r.wait === "error") return notAllowed("already_received");
+      if (createdSince) return notAllowed("session_changed");
       return dispatch(res, k, K, body, current, { resent: true });
     });
   });
@@ -480,13 +512,23 @@ export function registerThreadRoutes(router, ctx) {
     const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: ctx.messageText(resumedRows.at(-1)) } : null;
     if (live && live.status === "running") {
       if (rows) live.steps = stepsFrom(after, 0);
-      if (wait === "ok" || wait === "error") {
-        live.status = wait === "ok" ? "done" : "error"; live.finishedAt = now();
-        if (own.length) live.text = ctx.messageText(own.at(-1));
+      // the engine's verdict when no final reached this bridge: agent.wait, else K's own final reply row in history (agent.wait can
+      // time out for an id the engine finished before a restart, integration BUG-1)
+      const finalRow = own.findLast((m) => isFinalReply(m));
+      if (wait === "ok" || wait === "error" || finalRow) {
+        live.status = wait === "error" ? "error" : "done"; live.finishedAt = now();
+        const t = (finalRow ?? own.filter((m) => !isStatusNotice(m)).at(-1)) ? ctx.messageText(finalRow ?? own.filter((m) => !isStatusNotice(m)).at(-1)) : "";
+        if (t) { live.text = t; live.finalText = true; }
       } else if (resumed) { live.status = "unknown"; live.finishedAt = now(); } // K was interrupted; the engine continued it in another run
     }
+    // a record that ended without its reply text (ack "ok", a notice-only final): the text of K's own reply row
+    if (live && live.status === "done" && !live.text && own.length) {
+      const last = own.filter((m) => !isStatusNotice(m)).at(-1);
+      if (last) { live.text = ctx.messageText(last); live.finalText = true; }
+    }
     const status = live ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : "unknown";
-    const text = live ? live.text : own.length ? ctx.messageText(own.at(-1)) : "";
+    const ownReply = own.filter((m) => !isStatusNotice(m)).at(-1);
+    const text = live ? live.text : ownReply ? ctx.messageText(ownReply) : "";
     res.json({ ok: true, runId: K, thread: k.tid, status, text: ctx.cleanLiveText(text, { streaming: status === "running" }), phase: live?.phase ?? null,
       steps: live ? live.steps : stepsFrom(after, 0), startedAt: live?.startedAt ?? null, finishedAt: live?.finishedAt ?? null,
       ...(live?.errorCode ? { errorCode: live.errorCode } : {}),

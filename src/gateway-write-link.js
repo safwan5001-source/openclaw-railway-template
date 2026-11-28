@@ -229,7 +229,7 @@ export function createGatewayWriteLink({ url, token, log, WebSocketImpl = global
         clearTimer(w.t); inflight.delete(f.id);
         if (f.ok) w.resolve(f.payload);
         else w.reject(Object.assign(new Error(str(f.error?.message, 300) ?? "gateway error"), { code: str(f.error?.code, 60) ?? "error", refused: true,
-          reason: str(f.error?.details?.reason, 60) }));
+          reason: str(f.error?.details?.reason, 60), retryAfterMs: Number.isSafeInteger(f.error?.retryAfterMs) && f.error.retryAfterMs >= 0 ? Math.min(f.error.retryAfterMs, 60_000) : null }));
         return;
       }
       if (f?.type !== "event") return;

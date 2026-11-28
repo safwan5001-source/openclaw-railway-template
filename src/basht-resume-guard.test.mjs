@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { test } from "node:test";
-import plugin, { DEFAULT_CONFIG, PLUGIN_ID, SENSITIVE_CATALOG, createGuard, daftraCallsAreReadOnly, idempotencyKeyFor, isSensitive, resolveConfig } from "./plugins/basht-resume-guard.mjs";
+import plugin, { DEFAULT_CONFIG, PLUGIN_ID, SENSITIVE_CATALOG, createGuard, daftraCallsAreReadOnly, idempotencyKeyFor, isSensitive } from "./plugins/basht-resume-guard.mjs";
 
 const NOTE = "Note: The previous agent run was interrupted. Review the transcript and current state, then continue the unfinished work in light of the latest user message. The Gateway restarted while you were working. Resume your work: …";
 const KEY = "agent:main:app:owner:0123456789abcdef0123456789abcdef";
@@ -14,8 +14,10 @@ const READ = { calls: [{ name: "list_invoices", arguments: {} }, { name: "daftra
 
 function harness(rawConfig) {
   const hooks = {};
-  plugin.register({ pluginConfig: rawConfig, on: (name, fn) => { hooks[name] = fn; }, logger: { info() {}, warn() {} } });
-  return hooks;
+  if (rawConfig === undefined) { plugin.register({ on: (name, fn) => { hooks[name] = fn; }, logger: { info() {}, warn() {} } }); return hooks; }
+  // other modes are internal (no config surface, BUG-4): exercised through createGuard directly
+  const g = createGuard({ ...DEFAULT_CONFIG, ...rawConfig });
+  return { before_agent_run: g.before_agent_run, before_tool_call: g.before_tool_call };
 }
 const resume = (h, runId = "r2", trigger = "event", prompt = NOTE) => h.before_agent_run({ prompt, messages: [{ role: "user", idempotencyKey: `${K}:user` }] }, { runId, trigger, sessionKey: KEY });
 const call = (h, toolName, params, runId = "r2") => h.before_tool_call({ toolName, params, toolCallId: "c1" }, { runId, sessionKey: KEY });
@@ -51,22 +53,22 @@ test("Daftra inspector: a call is a read ONLY when every inner name is a read ve
     { calls: [{ name: 5 }] }, { calls: [{ name: "listing_hack_create" }] }, { calls: [{ name: "list_and_delete_invoices" }] }, { calls: [{ name: "get_or_create_client" }] }]) {
     assert.equal(daftraCallsAreReadOnly(p), false, JSON.stringify(p));
   }
-  const cfg = resolveConfig(undefined);
+  const cfg = DEFAULT_CONFIG;
   for (const n of ["execute_tools", "daftra__execute_tools", "daftra-mcp__execute_tools", "mcp_daftra_execute_tools"]) assert.equal(isSensitive(cfg, n, WRITE), true, n);
   for (const n of ["execute_toolsx", "daftra_search_tools", "my_execute_tools_wrapper2"]) assert.equal(isSensitive(cfg, n, WRITE), false, n);
 });
 
-test("config is CLOSED: only catalog ids and the listed modes; anything unknown falls back to the defaults", () => {
+test("BUG-4: no config surface: the registered plugin always runs the built-in defaults, whatever pluginConfig says", () => {
   assert.deepEqual(Object.keys(SENSITIVE_CATALOG).sort(), ["daftra.execute_tools", "message.send"]);
-  assert.equal(resolveConfig(undefined).source, "default");
-  assert.equal(resolveConfig({}).source, "default");
-  const c = resolveConfig({ mode: "approve_sensitive", sensitive: ["daftra.execute_tools"], injectIdempotencyKey: true });
-  assert.deepEqual(c, { mode: "approve_sensitive", sensitive: ["daftra.execute_tools"], injectIdempotencyKey: true, source: "config" });
-  for (const bad of [{ mode: "off" }, { sensitive: ["exec"] }, { sensitive: [] }, { extra: 1 }, { injectIdempotencyKey: "yes" }, [], "x", 5]) {
-    const r = resolveConfig(bad);
-    assert.equal(r.source, "invalid", JSON.stringify(bad));
-    assert.deepEqual([r.mode, r.sensitive], [DEFAULT_CONFIG.mode, [...DEFAULT_CONFIG.sensitive]]);
-  }
+  assert.deepEqual({ ...DEFAULT_CONFIG, sensitive: [...DEFAULT_CONFIG.sensitive] }, { mode: "approve_on_resume", sensitive: ["daftra.execute_tools", "message.send"], injectIdempotencyKey: false });
+  const hooks = {};
+  plugin.register({ pluginConfig: { mode: "approve_sensitive", injectIdempotencyKey: true }, on: (n, fn) => { hooks[n] = fn; }, logger: { info() {}, warn() {} } });
+  assert.equal(call(hooks, "execute_tools", WRITE, "plain"), undefined, "not approve_sensitive: the config is ignored");
+  resume(hooks);
+  const r = call(hooks, "execute_tools", WRITE);
+  assert.ok(r.requireApproval); assert.equal(r.params, undefined, "no key injection");
+  const src = fs.readFileSync(new URL("./plugins/basht-resume-guard.mjs", import.meta.url), "utf8");
+  assert.ok(!/api\??\.pluginConfig\b/.test(src.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")), "pluginConfig is never read");
 });
 
 test("modes: approve_sensitive asks outside resumed runs too; block_on_resume refuses in resumed runs; idempotency key is stable", () => {
@@ -88,7 +90,7 @@ test("modes: approve_sensitive asks outside resumed runs too; block_on_resume re
 });
 
 test("the run marks are bounded (a long-lived gateway does not grow them without limit)", () => {
-  const g = createGuard(resolveConfig(undefined));
+  const g = createGuard(DEFAULT_CONFIG);
   for (let i = 0; i < 2000; i++) g.before_agent_run({ prompt: NOTE }, { runId: `r${i}`, trigger: "event" });
   assert.ok(g.resumed.size <= 500);
   assert.ok(g.resumed.has("r1999") && !g.resumed.has("r0"));

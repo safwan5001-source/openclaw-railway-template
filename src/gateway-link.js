@@ -126,6 +126,9 @@ export function sessionKind(key) {
   return k ? "other" : "unknown";
 }
 
+/** B4 (flag on): sessionKind, with every app conversation key (legacy or thread) labelled "app". */
+export const threadSessionKind = (key) => (threadOfKey(key) !== null ? "app" : sessionKind(key));
+
 /** A pending approval record (list item or `*.approval.requested` payload) in the bridge's fixed shape. Null if unusable. */
 /**
  * B4: the conversation an approval belongs to, from the engine's `request.sessionKey` AT REQUEST TIME: "legacy" or a tid for an app
@@ -147,7 +150,9 @@ export function approvalView(rec, kind, { threads = false } = {}) {
   const decisions = Array.isArray(r.allowedDecisions) ? r.allowedDecisions : ["allow-once", "deny"];
   return {
     id, kind, summary, title: str(r.title, 120), host: str(r.host, 20), agentId: str(r.agentId, 64),
-    session: sessionKind(r.sessionKey), isApp: r.sessionKey === APP_SESSION_KEY,
+    // B4 (flag on): every app conversation is the app's own (BUG-7); flag off: exactly as before
+    session: threads ? threadSessionKind(r.sessionKey) : sessionKind(r.sessionKey),
+    isApp: threads ? threadOfKey(r.sessionKey) !== null : r.sessionKey === APP_SESSION_KEY,
     warning: str(r.warningText, 200),
     createdAt: int(rec.createdAtMs), expiresAt: int(rec.expiresAtMs),
     // the app offers allow-once and deny only (allow-always would mint a standing grant)
@@ -177,7 +182,7 @@ export function normalizeEvent(name, p, { threads = false, threadOfApproval } = 
     const id = str(p.id, 128);
     if (!id) return null;
     const d = ["allow-once", "allow-always", "deny"].includes(p.decision) ? p.decision : null;
-    const out = { type: "approval.resolved", approvalId: id, kind: ap.kind, decision: d, session: sessionKind(p.request?.sessionKey) };
+    const out = { type: "approval.resolved", approvalId: id, kind: ap.kind, decision: d, session: (threads ? threadSessionKind : sessionKind)(p.request?.sessionKey) };
     // the resolved payload may lack the key: the one recorded when the approval was raised wins
     if (threads) out.thread = threadOfApproval?.(id) ?? approvalThread(p.request?.sessionKey);
     return out;
@@ -213,6 +218,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   const seenApprovals = new Set();
   // B4: approval id -> the session key it was raised for (kept after it is decided, bounded): approval.history has no key (E5)
   const approvalKeys = new Map();
+  const terminalRuns = new Set(); // B4: runIds whose chat.final/chat.error was already put in the ring (bounded)
   const noteApprovalKey = (id, key) => {
     if (!threads || typeof key !== "string" || !key) return;
     approvalKeys.delete(id); approvalKeys.set(id, key);
@@ -280,7 +286,15 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       const id = str(payload?.id, 128);
       if (id) pending.delete(id);
     }
-    push(normalizeEvent(name, payload, { threads, threadOfApproval }));
+    const rec = normalizeEvent(name, payload, { threads, threadOfApproval });
+    // B4 (flag on): the engine can emit a second `final` for one run (an engine status notice after the reply, BUG-2): one
+    // chat.final / chat.error per run on /events, so the app is told (and pushes) once
+    if (threads && rec && (rec.type === "chat.final" || rec.type === "chat.error") && rec.runId) {
+      if (terminalRuns.has(rec.runId)) return;
+      terminalRuns.add(rec.runId);
+      if (terminalRuns.size > SEEN_APPROVALS) terminalRuns.delete(terminalRuns.values().next().value);
+    }
+    push(rec);
   }
 
   const send = (frame) => { try { ws?.send(JSON.stringify(frame)); return true; } catch { return false; } };
