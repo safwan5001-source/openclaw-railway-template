@@ -38,8 +38,12 @@ export const MEDIA_TYPES = {
   ".mp3": ["audio/mpeg", false], ".m4a": ["audio/mp4", false], ".ogg": ["audio/ogg", false], ".wav": ["audio/wav", false],
   ".mp4": ["video/mp4", false],
 };
-const MIME_EXT = Object.fromEntries(Object.entries(MEDIA_TYPES).map(([ext, [mime]]) => [mime, ext]).reverse());
+const MIME_EXT = Object.assign(Object.create(null), Object.fromEntries(Object.entries(MEDIA_TYPES).map(([ext, [mime]]) => [mime, ext]).reverse()));
 const INLINE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+/** An inline image (decoded from the transcript row on every request) is capped below the CLI's output buffer of the anchored read (~8 MB of JSON). */
+export const MAX_INLINE_BYTES = 5 * 1024 * 1024;
+/** The mime of a declared type if it is one of the allowlisted ones (own keys only: "constructor" is not a type), else null. */
+const knownMime = (m) => (typeof m === "string" && Object.hasOwn(MIME_EXT, m) ? m : null);
 
 /** Does `buf` start like a file of `mime`? Unknown types (and text) are checked for what they must NOT be. */
 export function bytesMatch(mime, buf) {
@@ -116,24 +120,71 @@ export function splitMediaLines(text) {
   return { text: keep.join("\n").replace(/\n{3,}/g, "\n\n").trim(), sources: out };
 }
 
-const ATTACHED = /\[media attached(?: \d+\/\d+)?: ([^\]\n]{1,2048})\]/g;
+const MARKER_HEADER = /\[media attached(?: \d+\/\d+)?: /y;
+const MARKER_WINDOW = 8192; // a marker (path, type, URL and file name) is never searched for beyond this
+const MARKER_BODY_MAX = 2048;
+
 /**
- * What one `[media attached: …]` marker names. The engine writes `<path> (<content type>) | <url> "<file name>"` with every part
- * but the path optional (`media://inbound/<id>` replaces the path of a stored upload). The stored-upload URL wins when there is
- * one; else the path. The content type and the file name are never part of the source.
+ * Where the marker whose body starts at `b` ends: {body, next} (the text of its source part, the index after its `]`) or null.
+ * The engine writes `<path> (<type>) | <url> "<file name>"`, the name as a JSON string, so a name may hold `]`, `"` (escaped, or not
+ * when something else wrote it) and be long. The name starts at the first ` "` before the first `]`, and ends at the first
+ * unescaped `"` that is directly followed by `]`; without such a pair the marker ends at the first `]`. One bounded pass.
  */
-function attachedSource(raw) {
-  const s = String(raw).trim().replace(/\s+"[^"]{0,300}"$/, "");
-  const [first, ...more] = s.split(/\s+\|\s+/);
-  const strip = (v) => v.trim().replace(/\s+\([^()]*\)$/, "");
-  const url = more.map(strip).find((v) => /^media:\/\/inbound\//i.test(v));
-  return url ?? strip(first);
+function markerEnd(t, b) {
+  const win = t.slice(b, b + MARKER_WINDOW);
+  const nl = win.indexOf("\n");
+  const seg = nl < 0 ? win : win.slice(0, nl);
+  const first = seg.indexOf("]");
+  const q = seg.indexOf(' "');
+  if (q >= 0 && (first < 0 || q < first)) {
+    for (let i = q + 2; i < seg.length; i++) {
+      const c = seg.charCodeAt(i);
+      if (c === 92) { i++; continue; } // backslash escape
+      if (c === 34 && seg.charCodeAt(i + 1) === 93) return q >= 1 && q <= MARKER_BODY_MAX ? { body: seg.slice(0, q), next: b + i + 2 } : null;
+    }
+  }
+  return first >= 1 && first <= MARKER_BODY_MAX ? { body: seg.slice(0, first), next: b + first + 1 } : null;
+}
+
+/**
+ * What one `[media attached: …]` marker names (its body without the file name). The stored-upload URL (`media://inbound/<id>`,
+ * prefix only: what follows is not part of it) wins when there is one; else the path. The content type is never part of the source.
+ * Linear in the body: no pattern here can backtrack.
+ */
+function attachedSource(body) {
+  const stripType = (v) => {
+    const x = v.trim();
+    if (!x.endsWith(")")) return x;
+    const i = x.lastIndexOf(" (");
+    return i > 0 && !x.slice(i + 2, -1).includes("(") && !x.slice(i + 2, -1).includes(")") ? x.slice(0, i).trimEnd() : x;
+  };
+  const b = body.trim();
+  const sep = b.indexOf(" | ");
+  if (sep >= 0) {
+    const m = /^media:\/\/inbound\/[A-Za-z0-9._-]+/i.exec(b.slice(sep + 3).trimStart());
+    if (m) return m[0];
+  }
+  return stripType(sep >= 0 ? b.slice(0, sep) : b);
 }
 /** `[media attached: media://inbound/<id>]` markers the engine adds to a user message for a stored upload. */
 export function splitAttachedMarkers(text) {
+  const t = String(text ?? "");
   const sources = [];
-  const rest = String(text ?? "").replace(ATTACHED, (_m, src) => { sources.push(attachedSource(src)); return ""; });
-  return { text: rest.replace(/\n{3,}/g, "\n\n").trim(), sources };
+  let out = "";
+  let pos = 0;
+  for (;;) {
+    const i = t.indexOf("[media attached", pos);
+    if (i < 0) break;
+    MARKER_HEADER.lastIndex = i;
+    const h = MARKER_HEADER.exec(t);
+    const end = h ? markerEnd(t, i + h[0].length) : null;
+    if (!end) { out += t.slice(pos, i + 1); pos = i + 1; continue; } // not a marker: keep it
+    out += t.slice(pos, i);
+    sources.push(attachedSource(end.body));
+    pos = end.next;
+  }
+  out += t.slice(pos);
+  return { text: out.replace(/\n{3,}/g, "\n\n").trim(), sources };
 }
 
 const MEDIA_LINE_PREFIX = "MEDIA:";
@@ -182,7 +233,9 @@ export function cleanLiveText(text, { streaming = false } = {}) {
   return attached.text;
 }
 
-const typeOf = (name) => MEDIA_TYPES[path.extname(String(name)).toLowerCase()] ?? null;
+const typeOf = (name) => { const e = path.extname(String(name)).toLowerCase(); return Object.hasOwn(MEDIA_TYPES, e) ? MEDIA_TYPES[e] : null; };
+/** The type a file is served as: its extension's, else (an id without one) the image type the engine recorded for it, if inline-viewable. */
+const fileType = (real, hint) => typeOf(real) ?? (INLINE_MIMES.has(hint) ? [hint, true] : null);
 const baseName = (src) => {
   const s = String(src).replace(/^media:\/\/inbound\//i, "");
   try { return path.basename(decodeURIComponent(s)).slice(0, 120) || "file"; } catch { return path.basename(s).slice(0, 120) || "file"; }
@@ -225,7 +278,7 @@ function inlineData(p) {
  * (the whole payload is decoded, and checked again, when the bytes are asked for).
  */
 function inlineUsable(data, mime) {
-  if (!INLINE_MIMES.has(mime) || data.length < 8 || base64Bytes(data) > MAX_MEDIA_BYTES) return false;
+  if (!INLINE_MIMES.has(mime) || data.length < 8 || base64Bytes(data) > MAX_INLINE_BYTES) return false;
   const head = data.slice(0, Math.min(48, data.length - (data.length % 4)));
   return /^[A-Za-z0-9+/]+$/.test(head) && bytesMatch(mime, Buffer.from(head, "base64"));
 }
@@ -249,21 +302,22 @@ export function extractMedia(m, key, text = textOf(m)) {
   const blocks = [];
   content.forEach((p, ci) => {
     if (p?.type !== "image") return;
-    const mime = typeof p.mimeType === "string" && p.mimeType.length < 100 ? p.mimeType.toLowerCase() : "";
+    // declared type: `mimeType`, else the provider shape's `source.media_type`, else png. Only allowlisted types are ever published.
+    const declared = [p.mimeType, p.source?.media_type].find((v) => typeof v === "string" && v.length > 0 && v.length < 100);
+    const mime = declared === undefined ? "image/png" : knownMime(declared.toLowerCase());
+    const label = (m) => `image${m ? MIME_EXT[m] : ""}`;
     const size = Number.isFinite(p.bytes) ? p.bytes : null;
     if (typeof p.artifactId === "string" && p.artifactId && p.artifactId.length <= 2048) {
-      const mm = mime || "image/png";
-      blocks.push({ kind: INLINE_MIMES.has(mm) ? "image" : "file", artifact: p.artifactId, mime: mm, name: `image${MIME_EXT[mm] ?? ".png"}`, size, avail: true });
+      // served by artifacts.download for any allowlisted image type (a heic is a download, not an inline picture)
+      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", artifact: p.artifactId, mime, name: label(mime), size, avail: mime !== null && mime.startsWith("image/") });
       return;
     }
     const data = inlineData(p);
     if (data) {
-      const mm = mime || "image/png";
-      const ok = inlineUsable(data, mm);
-      blocks.push({ kind: INLINE_MIMES.has(mm) ? "image" : "file", inline: ci, mime: mm, name: `image${MIME_EXT[mm] ?? ".png"}`, size: base64Bytes(data), avail: ok });
+      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", inline: ci, mime, name: label(mime), size: base64Bytes(data), avail: inlineUsable(data, mime) });
       return;
     }
-    blocks.push({ kind: "image", missing: ci, mime: mime || null, name: `image${MIME_EXT[mime] ?? ""}`, size, avail: false });
+    blocks.push({ kind: "image", missing: ci, mime, name: label(mime), size, avail: false });
   });
 
   let rest = text;
@@ -272,20 +326,23 @@ export function extractMedia(m, key, text = textOf(m)) {
   const a = splitAttachedMarkers(rest); rest = a.text; files.push(...a.sources);
   // what the engine recorded for the stored uploads of this message (a marker may be missing; these are projected to media://inbound/<id>)
   const facts = m?.role === "user" && Array.isArray(m?.__openclaw?.media) ? m.__openclaw.media : [];
-  const hints = new Map(); // file reference -> the content type the engine recorded for it
+  const hints = new Map(); // same-file key -> the content type the engine recorded for it
   for (const f of facts) {
     const src = [f?.path, f?.url].find((v) => typeof v === "string" && /^media:\/\/inbound\/[^/\\]+$/i.test(v));
     if (!src) continue;
     files.push(src);
-    if (typeof f.contentType === "string") hints.set(src, f.contentType.toLowerCase());
+    if (typeof f.contentType === "string") hints.set(sameFileKey(src), f.contentType.toLowerCase());
   }
   const seenFiles = new Set();
   const refs = files.filter((src) => { const k = sameFileKey(src); if (seenFiles.has(k)) return false; seenFiles.add(k); return true; }).map((src) => {
     if (/^https:\/\//i.test(src)) return { kind: "link", url: src.slice(0, 2048), name: baseName(src.split("?")[0]) };
     const t = typeOf(src);
-    const hint = hints.get(src);
-    const image = t ? t[1] : INLINE_MIMES.has(hint); // an id without an extension: the recorded content type decides
-    return { kind: image ? "image" : "file", file: src, mime: t?.[0] ?? (INLINE_MIMES.has(hint) ? hint : null), name: baseName(src), size: null };
+    // an id without an extension: the content type the engine recorded for it decides (inline-viewable image types only; the bytes
+    // are still checked against it when served)
+    const hint = t ? null : (INLINE_MIMES.has(hints.get(sameFileKey(src))) ? hints.get(sameFileKey(src)) : null);
+    const name = baseName(src);
+    return { kind: t ? (t[1] ? "image" : "file") : hint ? "image" : "file", file: src, mime: t?.[0] ?? hint, ...(hint ? { hint } : {}),
+      name: hint && !path.extname(name) ? `${name}${MIME_EXT[hint]}` : name, size: null };
   });
 
   // each image block takes the next image file reference of the same message: it is that block's file (used only when the block
@@ -316,9 +373,9 @@ export function inlineImageBytes(m, item) {
   const p = Array.isArray(m?.content) ? m.content[item.inline] : null;
   const data = p?.type === "image" ? inlineData(p) : "";
   if (!data || !INLINE_MIMES.has(item.mime)) return { error: "not_found" };
-  if (base64Bytes(data) > MAX_MEDIA_BYTES) return { error: "too_large" };
+  if (base64Bytes(data) > MAX_INLINE_BYTES) return { error: "too_large" };
   const bytes = Buffer.from(data, "base64");
-  if (bytes.length > MAX_MEDIA_BYTES) return { error: "too_large" };
+  if (bytes.length > MAX_INLINE_BYTES) return { error: "too_large" };
   if (!bytesMatch(item.mime, bytes.subarray(0, 64))) return { error: "unsupported" };
   return { bytes };
 }
@@ -355,16 +412,17 @@ export function resolveSource(src, { workspaceDir, stateDir }) {
 }
 
 /**
- * The file behind a reference, only if: its real path is a regular file inside one of `roots`, its extension is allowlisted, it is
- * not larger than MAX_MEDIA_BYTES and its first bytes match the type. Else {error: "unavailable" | "too_large" | "unsupported"}.
+ * The file behind a reference, only if: its real path is a regular file inside one of `roots`, its type is allowlisted (by extension,
+ * else the recorded inline-viewable image type `hint`), it is not larger than MAX_MEDIA_BYTES and its first bytes match the type.
+ * Else {error: "unavailable" | "too_large" | "unsupported"}. `checkMediaFile` applies exactly the same rules without keeping it open.
  */
-export async function openMediaFile(src, { workspaceDir, stateDir, roots }) {
+export async function openMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
   const abs = resolveSource(src, { workspaceDir, stateDir });
   if (!abs) return { error: "unavailable" };
   let real;
   try { real = await fs.promises.realpath(abs); } catch { return { error: "unavailable" }; }
   if (!rootList(roots).some((r) => real.startsWith(r + path.sep))) return { error: "unavailable" };
-  const t = typeOf(real);
+  const t = fileType(real, hint);
   if (!t) return { error: "unsupported" };
   let fh;
   try {
@@ -382,10 +440,29 @@ export async function openMediaFile(src, { workspaceDir, stateDir, roots }) {
   }
 }
 
+/** Would `openMediaFile` serve this reference? The same steps, synchronously, for listing: {ok: true, size} or {ok: false}. */
+export function checkMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
+  const abs = resolveSource(src, { workspaceDir, stateDir });
+  if (!abs) return { ok: false };
+  let fd;
+  try {
+    const real = fs.realpathSync(abs);
+    if (!rootList(roots).some((r) => real.startsWith(r + path.sep))) return { ok: false };
+    const t = fileType(real, hint);
+    if (!t) return { ok: false };
+    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_MEDIA_BYTES) return { ok: false };
+    const head = Buffer.alloc(Math.min(4096, st.size));
+    fs.readSync(fd, head, 0, head.length, 0);
+    return bytesMatch(t[0], head) ? { ok: true, size: st.size } : { ok: false };
+  } catch { return { ok: false }; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
+}
+
 /** What the app sees of one media item: never a path, an artifact id or a URL other than a public https link. */
 export function publicMedia(it, available) {
   if (it.kind === "link") return { kind: "link", name: it.name, url: it.url };
-  return { ref: it.ref, kind: it.kind, name: it.name, mime: it.mime, size: it.size ?? null, available: available !== false };
+  return { ref: it.ref, kind: it.kind, name: it.name, mime: knownMime(it.mime), size: it.size ?? null, available: available !== false };
 }
 
 /** Bounded memory of refs the bridge has handed out: ref -> {key, messageId, item}. Lets /media skip a transcript re-read. */
@@ -438,12 +515,12 @@ export function registerMediaRoute(router, ctx) {
         const d = await ctx.gatewayCall("artifacts.download", { sessionKey: key, artifactId: it.artifact });
         const mime = String(d?.artifact?.mimeType ?? "").toLowerCase();
         const data = d?.encoding === "base64" && typeof d.data === "string" ? Buffer.from(d.data, "base64") : null;
-        if (!data || !MIME_EXT[mime] || !mime.startsWith("image/")) return res.status(415).json({ ok: false, error: "unsupported" });
+        if (!data || !knownMime(mime) || !mime.startsWith("image/")) return res.status(415).json({ ok: false, error: "unsupported" });
         if (data.length > MAX_MEDIA_BYTES) return res.status(413).json({ ok: false, error: "too_large" });
         if (!bytesMatch(mime, data.subarray(0, 64))) return res.status(415).json({ ok: false, error: "unsupported" });
         return send(res, mime, `image${MIME_EXT[mime]}`, data.length, (out) => out.end(data));
       }
-      const f = await openMediaFile(it.file, ctx);
+      const f = await openMediaFile(it.file, { ...ctx, hint: it.hint });
       if (f.error) return res.status(f.error === "too_large" ? 413 : f.error === "unsupported" ? 415 : 404).json({ ok: false, error: f.error === "unavailable" ? "not_found" : f.error });
       return send(res, f.mime, f.name, f.size, (out) => {
         const stream = f.fh.createReadStream({ start: 0, end: Math.max(f.size - 1, 0), autoClose: true });

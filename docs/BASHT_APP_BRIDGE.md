@@ -51,7 +51,7 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 
 `/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. When a turn ends in
 `status: "error"`, `error` stays the opaque `engine_error`; an additive `errorCode` is present only when the failure is a known kind:
-`rate_limited` (the provider answered HTTP 429, `usage_limit_reached`, "rate limit" or "too many requests"; lab: the gateway reports
+`rate_limited` (the failure text shows an HTTP status 429 (`HTTP 429`, `status 429`, `chat 429`, or a message that begins with `429`), `usage_limit_reached`, "rate limit" or "too many requests"; a bare number such as `429ms` or a pid is not one; lab: the gateway reports
 "429 The usage limit has been reached" on the stream). The provider's own text never leaves the bridge. Other failures carry no `errorCode`.
 That is the only place the bridge sees such a failure: when an image-generation tool fails inside a turn that otherwise completes, the
 failure is only in the model's reply text (and in the tool result, which the bridge never reads), so there is nothing to map. Its `text` (while
@@ -340,13 +340,15 @@ buffer. Every call is built by the bridge with the app session key or a key that
   | Block the bridge sees | When | Entry |
   |---|---|---|
   | `{type: "image", mimeType, artifactId, omitted: true, bytes}` | every stored image: an app photo (vision model), a WhatsApp photo. The engine replaces `data` by an artifact id and adds the decoded size | served with `artifacts.download` |
-  | `{type: "image", data, mimeType}` (or `source.data`) | never seen in the lab through either read (the engine's projection removes `data`); handled if a row ever carries it | decoded from that block on demand, only if type is png/jpeg/gif/webp, size ≤ 20 MB and the first bytes match; the base64 is never copied into a cache or a response |
-  | `{type: "image", mimeType, omitted: true, bytes}` (no `artifactId`) | the stored block has no payload left | the file facts of the message (`__openclaw.media` → `media://inbound/<id>`), if any, are served through the engine-owned roots; else `available: false` |
+  | `{type: "image", data, mimeType}` (or `source.data`) | never seen in the lab through either read (the engine's projection removes `data`); handled if a row ever carries it | decoded from that block on demand, only if type is png/jpeg/gif/webp, size ≤ **5 MiB** decoded and the first bytes match (above that: kept, `available: false`, `/media` 413); the base64 is never copied into a cache or a response. The cap is below the 20 MB file cap because every request re-reads the row with `chat.history` through the CLI, whose output buffer is 8 MB of JSON |
+  | `{type: "image", mimeType, omitted: true, bytes}` (no `artifactId`) | the stored block has no payload left | the file facts of the message (`__openclaw.media` → `media://inbound/<id>`), if any, are served through the engine-owned roots; else `available: false`. An id with no file extension is typed by the image type the engine recorded for it (png/jpeg/gif/webp only); the bytes must still match it |
   | no image block, text `User sent image(s) with no text.` | a turn of images only on a model without image input (the engine drops the image) | one `available: false` image entry |
 
   `User sent image(s) with no text.` is the engine's own sentence for an image-only turn; in a user row it is not shown as text.
   A WhatsApp photo has the block, the marker `[media attached: <path> (<type>) | media://inbound/<id>]` and the file fact: they name
-  one picture and give one entry (the marker's stored-upload URL, or else its path, is the source; the type and file name are not).
+  one picture and give one entry (the marker's stored-upload URL, or else its path, is the source; the type and file name are not). The file name is a quoted JSON string that may hold `]`, quotes and be long; it is parsed in one bounded linear pass and never leaves debris in `text`.
+  A listed entry means `/media` will serve it: the listing applies the same rules as serving (engine-owned roots, type by extension or recorded image type, 20 MB cap, magic bytes). Only allowlisted mime types are published (`mime` is `null` otherwise). An artifact block of a non-inline image type (heic/heif) is listed as `kind: "file"` and downloaded; an inline block of such a type is `available: false`.
+  **Refs change once:** a WhatsApp photo used to list two entries (artifact + marker file); it is now one, so its position-based `ref` is different. A `ref` the app already holds for such a row answers 404 until `/history` is read again (the app re-reads it).
   An entry that cannot be served is `available: false` and `/media` answers 404/413/415, as for files. Not provable in the lab: what
   a CLI-backed model runtime writes for a photo (a mock vision model was used), and which of these shapes the production rows actually have.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored

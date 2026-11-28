@@ -55,7 +55,7 @@ import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStat
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createRunsProbe } from "./app-bridge-runs.js";
 import { createAppControl } from "./app-control.js";
-import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
+import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, checkMediaFile, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
 
 export const APP_SESSION = "app:owner";
@@ -234,7 +234,9 @@ export function messageText(m) {
  */
 export function runErrorCode(err) {
   const s = String(err?.message ?? err ?? "").slice(0, 2000);
-  return /usage[_ ]limit|rate[_ ]?limit|too many requests|(?:^|\D)429(?:\D|$)/i.test(s) ? "rate_limited" : null;
+  // anchored to what a limit looks like: an HTTP status ("HTTP 429", "status 429", "chat 429", a message that starts with it), the
+  // provider's own `usage_limit_reached`, "rate limit", "too many requests". A bare 429 elsewhere ("after 429ms", a pid, an id) is not one.
+  return /\b(?:HTTP(?:\/[\d.]+)?|status|chat)\s*:?\s*429\b|^\s*429\b|usage_limit_reached|rate[_ ]?limit|too many requests/i.test(s) ? "rate_limited" : null;
 }
 
 function sessionLabel(row) {
@@ -457,9 +459,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const pub = media.map((it) => {
       if (it.kind === "link") return publicMedia(it, true);
       if (it.avail !== undefined) return publicMedia(it, it.avail); // an image block: served from the transcript, or unavailable (never dropped)
-      const abs = resolveSource(it.file, mediaCtx);
-      let size = null; let ok = false;
-      try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots().some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }
+      const c = checkMediaFile(it.file, { ...mediaCtx, hint: it.hint }); // the very rules /media serves by
+      const ok = c.ok; const size = ok ? c.size : null;
       return publicMedia({ ...it, size }, ok);
     });
     return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(m.role === "assistant" ? assistantMeta(m) : {}) };

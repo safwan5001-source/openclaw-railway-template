@@ -10,7 +10,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { APP_SESSION_KEY, createAppBridge, runErrorCode } from "./app-bridge.js";
-import { IMAGE_ONLY_PLACEHOLDER, MAX_MEDIA_BYTES, extractMedia, inlineImageBytes, splitAttachedMarkers } from "./app-bridge-media.js";
+import { IMAGE_ONLY_PLACEHOLDER, MAX_INLINE_BYTES, MAX_MEDIA_BYTES, checkMediaFile, cleanLiveText, extractMedia, inlineImageBytes, mediaRoots, openMediaFile, publicMedia, splitAttachedMarkers } from "./app-bridge-media.js";
 
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
 const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
@@ -20,6 +20,10 @@ const PNG_B64 = PNG.toString("base64");
 const JPEG_B64 = JPEG.toString("base64");
 const BIG = Buffer.concat([PNG, Buffer.alloc(MAX_MEDIA_BYTES + 1024)]); // just over the cap, still a PNG
 const BIG_B64 = BIG.toString("base64");
+const HEIC = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic", "latin1"), Buffer.alloc(40, 3)]);
+const MID = Buffer.concat([PNG, Buffer.alloc(6 * 1024 * 1024)]); // a PNG above the inline cap (5 MiB) and below the file cap
+const MID_B64 = MID.toString("base64");
+const PDF_BYTES = Buffer.from("%PDF-1.4\n%%EOF\n");
 const HTML_B64 = Buffer.from("<html><script>alert(1)</script></html>").toString("base64");
 
 let dir, ws, stateDir, gateway, server, base;
@@ -34,6 +38,7 @@ async function fakeGatewayCall(method, params) {
   rpc.push({ method, params });
   if (method === "chat.history") return { sessionKey: params.sessionKey, messages: rows.filter((m) => m.__openclaw.id === params.messageId) };
   if (method === "artifacts.download") {
+    if (params.artifactId === "artifact_heic") return { artifact: { mimeType: "image/heic" }, encoding: "base64", data: HEIC.toString("base64") };
     if (params.artifactId === "artifact_jpeg") return { artifact: { mimeType: "image/jpeg" }, encoding: "base64", data: JPEG_B64 };
     const e = new Error("gone"); e.refused = true; throw e;
   }
@@ -45,6 +50,11 @@ before(async () => {
   ws = path.join(dir, "workspace"); stateDir = path.join(dir, "state");
   fs.mkdirSync(ws, { recursive: true }); fs.mkdirSync(path.join(stateDir, "media", "inbound"), { recursive: true });
   fs.writeFileSync(path.join(stateDir, "media", "inbound", "wa-photo---11.jpg"), JPEG);
+  const inbound = path.join(stateDir, "media", "inbound");
+  fs.writeFileSync(path.join(inbound, "abc123"), JPEG); // an upload with no extension in its id
+  fs.writeFileSync(path.join(inbound, "abc124"), "<html><script>1</script></html>"); // not what its recorded type says
+  fs.writeFileSync(path.join(inbound, "abc125"), PDF_BYTES);
+  fs.writeFileSync(path.join(inbound, "abc126"), JPEG);
   fs.writeFileSync(path.join(dir, "openclaw.json"), "{}");
   const abs = `${stateDir}/media/inbound/wa-photo---11.jpg`;
   rows = [
@@ -55,7 +65,7 @@ before(async () => {
     // raw transcript shape: the payload inline
     row("msg-inl-0001", "user", [{ type: "text", text: "صورة مضمنة" }, { type: "image", data: PNG_B64, mimeType: "image/png" }], 12),
     row("msg-inl-0002", "user", [{ type: "image", data: PNG_B64, mimeType: "image/png" }], 13), // image only, nothing else: used to vanish
-    row("msg-inl-0003", "user", [{ type: "text", text: "شكل المزوّد" }, { type: "image", source: { type: "base64", media_type: "image/png", data: PNG_B64 }, mimeType: "image/png" }], 14),
+    row("msg-inl-0003", "user", [{ type: "text", text: "شكل المزوّد" }, { type: "image", source: { type: "base64", media_type: "image/jpeg", data: JPEG_B64 } }], 14),
     // nothing left to read from the block
     row("msg-gone-001", "user", [{ type: "image", mimeType: "image/jpeg", omitted: true, bytes: 970 }], 15),
     // ... but the engine recorded the stored upload for the message
@@ -70,6 +80,16 @@ before(async () => {
     row("msg-bad-0002", "user", [{ type: "image", data: BIG_B64, mimeType: "image/png" }], 19), // over the size cap
     row("msg-bad-0003", "user", [{ type: "image", data: PNG_B64, mimeType: "image/svg+xml" }], 20), // a document, never inline
     row("msg-bad-0004", "user", [{ type: "image", data: PNG_B64, mimeType: "image/heic" }], 21), // not shown inline
+    row("msg-bad-0005", "user", [{ type: "image", data: HEIC.toString("base64"), mimeType: "image/heic" }], 24), // real heic bytes: still not inline
+    row("msg-bad-0006", "user", [{ type: "image", data: MID_B64, mimeType: "image/png" }], 25), // above the inline cap
+    row("msg-bad-0007", "user", [{ type: "image", data: PNG_B64, mimeType: "constructor" }], 26),
+    row("msg-bad-0008", "user", [{ type: "image", mimeType: "__proto__", artifactId: "artifact_jpeg" }], 27),
+    row("msg-bad-0009", "user", [{ type: "image", mimeType: "image/svg+xml", artifactId: "artifact_jpeg" }], 28),
+    row("msg-heic-001", "user", [{ type: "image", mimeType: "image/heic", artifactId: "artifact_heic" }], 29),
+    row("msg-ext-0001", "user", [{ type: "image", mimeType: "image/jpeg", omitted: true, bytes: 10 }], 30, { facts: [{ path: "media://inbound/abc123", url: "media://inbound/abc123", contentType: "image/jpeg", kind: "image" }] }),
+    row("msg-ext-0002", "user", [{ type: "image", mimeType: "image/jpeg", omitted: true, bytes: 10 }], 31, { facts: [{ path: "media://inbound/abc124", url: "media://inbound/abc124", contentType: "image/jpeg", kind: "image" }] }),
+    row("msg-ext-0003", "user", "ملف [media attached: media://inbound/abc125]", 32, { facts: [{ path: "media://inbound/abc125", url: "media://inbound/abc125", contentType: "application/pdf", kind: "document" }] }),
+    row("msg-ext-0004", "user", "صورة [media attached: /x/media/inbound/abc126 (image/jpeg) | media://inbound/abc126]", 33, { facts: [{ path: "media://inbound/abc126", url: "media://inbound/abc126", contentType: "image/jpeg", kind: "image" }] }),
     row("msg-empty-01", "user", [{ type: "text", text: "   " }], 22), // truly empty: still dropped
     row("msg-text-001", "user", "نص فقط", 23),
   ];
@@ -121,7 +141,7 @@ test("extractMedia: every image block yields one item; its bytes are served from
   const inl = extractMedia(rows[2], k);
   assert.deepEqual(inl.media.map((m) => [m.kind, m.mime, m.avail, m.inline, m.size]), [["image", "image/png", true, 1, PNG.length]]);
   assert.ok(!JSON.stringify(inl.media).includes(PNG_B64), "the payload is not kept on the item");
-  assert.equal(extractMedia(rows[4], k).media[0].avail, true, "provider shape: source.data");
+  assert.deepEqual(extractMedia(rows[4], k).media.map((m) => [m.avail, m.mime, m.name]), [[true, "image/jpeg", "image.jpg"]], "provider shape: source.data + source.media_type");
   const gone = extractMedia(rows[5], k);
   assert.deepEqual(gone.media.map((m) => [m.kind, m.avail, m.size, m.missing !== undefined]), [["image", false, 970, true]]);
   const fact = extractMedia(rows[6], k);
@@ -213,7 +233,8 @@ test("media: inline images are decoded on demand with the same headers as every 
   assert.match(r.headers.get("content-disposition"), /^attachment; filename\*=UTF-8''image\.png$/);
   assert.equal(r.headers.get("content-length"), String(PNG.length));
   // the provider shape, and an image-only message
-  assert.ok((await getMedia("msg-inl-0003", media(h, "msg-inl-0003").media[0].ref)).bytes.equals(PNG));
+  const prov = await getMedia("msg-inl-0003", media(h, "msg-inl-0003").media[0].ref);
+  assert.ok(prov.bytes.equals(JPEG)); assert.equal(prov.headers.get("content-type"), "image/jpeg", "source.media_type is the declared type when mimeType is absent");
   assert.ok((await getMedia("msg-inl-0002", media(h, "msg-inl-0002").media[0].ref)).bytes.equals(PNG));
   // artifact and stored-upload files go the way they always did
   assert.ok((await getMedia("msg-art-0002", media(h, "msg-art-0002").media[0].ref)).bytes.equals(JPEG));
@@ -265,7 +286,9 @@ test("runErrorCode: only a provider limit has a code", () => {
   for (const msg of ["429 The usage limit has been reached", "usage_limit_reached", "Rate limit reached for requests", "rate_limit_exceeded", "HTTP 429", "Too Many Requests", "chat 429"]) {
     assert.equal(runErrorCode(new Error(msg)), "rate_limited", msg);
   }
-  for (const msg of ["provider exploded", "chat 500", "fetch failed", "port 14290 refused", ""]) assert.equal(runErrorCode(new Error(msg)), null, msg);
+  for (const msg of ["provider exploded", "chat 500", "fetch failed", "port 14290 refused", "", "after 429ms", "request id 429-abcd", "pid 429", "listening on :429",
+    "context usage limit", "memory usage limit exceeded", "took 1429 ms"]) assert.equal(runErrorCode(new Error(msg)), null, msg);
+  for (const msg of ["HTTP/1.1 429 Too", "status: 429", "429"]) assert.equal(runErrorCode(new Error(msg)), "rate_limited", msg);
   assert.equal(runErrorCode(null), null);
 });
 
@@ -294,4 +317,116 @@ test("extractMedia: two images in a user row pair with their own files, in order
     { type: "image", mimeType: "image/jpeg", omitted: true, bytes: 5 }, { type: "image", mimeType: "image/jpeg", artifactId: "artifact_jpeg" }], 1);
   const { media: items } = extractMedia(m, APP_SESSION_KEY);
   assert.deepEqual(items.map((i) => i.artifact ?? i.file), ["media://inbound/a.jpg", "artifact_jpeg", "media://inbound/c.pdf"]);
+});
+
+// ------------------------------------------------------------------ review round: listing = serving, hostile names, limits -----------
+
+test("an upload whose id has no extension is served by the image type the engine recorded for it, and only if the bytes agree", async () => {
+  const h = await hist();
+  const ok = media(h, "msg-ext-0001").media[0];
+  assert.deepEqual([ok.kind, ok.mime, ok.available, ok.size, ok.name], ["image", "image/jpeg", true, JPEG.length, "abc123.jpg"]);
+  const r = await getMedia("msg-ext-0001", ok.ref);
+  assert.equal(r.status, 200); assert.ok(r.bytes.equals(JPEG)); assert.equal(r.headers.get("content-type"), "image/jpeg");
+  // recorded as a JPEG, but the bytes are HTML: listed unavailable AND refused (415)
+  const bad = media(h, "msg-ext-0002").media[0];
+  assert.equal(bad.available, false);
+  assert.equal((await getMedia("msg-ext-0002", bad.ref)).status, 415);
+  // a recorded type that is not an inline-viewable image gives no type to an id with no extension
+  const pdf = media(h, "msg-ext-0003").media[0];
+  assert.deepEqual([pdf.kind, pdf.mime, pdf.available], ["file", null, false]);
+  assert.equal((await getMedia("msg-ext-0003", pdf.ref)).status, 415);
+  // marker + fact name one upload (the hint reaches the file the marker named)
+  const wa = media(h, "msg-ext-0004");
+  assert.equal(wa.media.length, 1); assert.equal(wa.media[0].available, true);
+  assert.equal((await getMedia("msg-ext-0004", wa.media[0].ref)).status, 200);
+});
+
+test("listing and serving never disagree: checkMediaFile answers what openMediaFile does", async () => {
+  const d = path.join(ws, "agree"); fs.mkdirSync(d, { recursive: true });
+  const w = (n, b) => fs.writeFileSync(path.join(d, n), b);
+  w("ok.png", PNG); w("fake.png", "<html>"); w("big.png", Buffer.concat([PNG, Buffer.alloc(MAX_MEDIA_BYTES)])); w("noext", JPEG); w("empty.png", ""); w("script.sh", "#!/bin/sh");
+  fs.mkdirSync(path.join(d, "dir.png"));
+  const ctx = { workspaceDir: ws, stateDir, roots: mediaRoots(ws, stateDir) };
+  for (const [src, hint] of [["agree/ok.png"], ["agree/fake.png"], ["agree/big.png"], ["agree/noext"], ["agree/noext", "image/jpeg"], ["agree/noext", "image/png"], ["agree/noext", "application/pdf"],
+    ["agree/empty.png"], ["agree/script.sh"], ["agree/dir.png"], ["agree/missing.png"], ["/etc/passwd"], ["media://inbound/abc123", "image/jpeg"], ["media://inbound/abc124", "image/jpeg"], ["media://inbound/abc123"]]) {
+    const o = await openMediaFile(src, { ...ctx, hint });
+    const listed = checkMediaFile(src, { ...ctx, hint });
+    await o.fh?.close();
+    assert.equal(listed.ok, !o.error, `${src} ${hint ?? ""}`);
+    if (listed.ok) assert.equal(listed.size, o.size);
+  }
+});
+
+test("attachment markers with hostile file names leave no debris and no extra entry", () => {
+  const url = "media://inbound/x.jpg";
+  const names = ['photo [1].jpg', 'a "quoted" name.jpg', 'ends with ] and "', "x".repeat(5000), "q".repeat(300) + '"]' , 'back\\slash \\" end', ' "', "[media attached: nested]"];
+  for (const name of names) {
+    // the engine writes the name as a JSON string; a name quoted raw (quotes unescaped) is tolerated unless it holds `"]` itself
+    for (const quoted of [JSON.stringify(name), ...(name.includes('"]') ? [] : [`"${name}"`])]) {
+      const t = `قبل [media attached: /d/media/inbound/x.jpg (image/jpeg) | ${url} ${quoted}] بعد`;
+      const r = splitAttachedMarkers(t);
+      assert.deepEqual(r.sources, [url], `sources for ${name.slice(0, 30)}`);
+      assert.equal(r.text, "قبل  بعد", `text for ${name.slice(0, 30)}`);
+    }
+  }
+  const m = row("msg-name-001", "user", `[media attached: /d/media/inbound/x.jpg (image/jpeg) | ${url} "photo [1].jpg"]`, 1);
+  const { text, media: items } = extractMedia(m, APP_SESSION_KEY);
+  assert.equal(text, ""); assert.equal(items.length, 1); assert.equal(items[0].file, url);
+  // two markers, one hostile: both found, text between kept
+  const two = splitAttachedMarkers(`a [media attached 1/2: ${url} "p [1].jpg"] b [media attached 2/2: media://inbound/y.png (image/png)] c`);
+  assert.deepEqual(two.sources, [url, "media://inbound/y.png"]); assert.equal(two.text, "a  b  c");
+  // not a marker: left as it is
+  assert.equal(splitAttachedMarkers("see [media attached: and no end").text, "see [media attached: and no end");
+  assert.equal(splitAttachedMarkers("[media attached: ]").sources.length, 0);
+  // only the stored-upload URL's own characters are the source
+  assert.deepEqual(splitAttachedMarkers(`[media attached: /p/x.jpg | ${url}"junk /etc/passwd]`).sources, [url]);
+});
+
+test("marker parsing is linear: many markers with long runs of spaces are cheap, also on the live-text path", () => {
+  const hostile = [
+    "[media attached: /p/a.jpg" + " ".repeat(2000) + " | y ",
+    "[media attached: /p/a.jpg (image/jpeg)" + " ".repeat(2000) + '"x ] ',
+    '[media attached: /p/a.jpg | media://inbound/a.jpg "' + 'a\\"'.repeat(1500) + " ",
+  ].map((unit) => unit.repeat(500));
+  const t0 = Date.now();
+  for (const h of hostile) { splitAttachedMarkers(h); cleanLiveText(h, { streaming: true }); }
+  assert.ok(Date.now() - t0 < 1500, `took ${Date.now() - t0} ms`);
+});
+
+test("inline images above 5 MiB decoded are listed unavailable and refused (the re-read of the row is bounded by the CLI buffer)", async () => {
+  assert.equal(MAX_INLINE_BYTES, 5 * 1024 * 1024);
+  const h = await hist();
+  const it = media(h, "msg-bad-0006").media[0];
+  assert.deepEqual([it.available, it.size, it.mime], [false, MID.length, "image/png"]);
+  assert.equal((await getMedia("msg-bad-0006", it.ref)).status, 413);
+});
+
+test("only allowlisted types are ever published; a type named like an object property is no type", async () => {
+  const h = await hist();
+  for (const id of ["msg-bad-0007", "msg-bad-0008"]) {
+    const it = media(h, id).media[0];
+    assert.deepEqual([it.mime, it.name, it.available], [null, "image", false], id);
+  }
+  assert.equal(media(h, "msg-bad-0009").media[0].available, false, "svg is no image type");
+  assert.equal(media(h, "msg-bad-0009").media[0].mime, null);
+  for (const m of h.messages) for (const it of m.media) assert.ok(it.mime === null || /^[a-z]+\/[a-z0-9.+-]+$/.test(it.mime));
+});
+
+test("heic: a real payload is never listed available inline; as an artifact it is a download (kind file), consistently with /media", async () => {
+  const h = await hist();
+  const inl = media(h, "msg-bad-0005").media[0];
+  assert.deepEqual([inl.kind, inl.mime, inl.available], ["file", "image/heic", false]);
+  assert.equal((await getMedia("msg-bad-0005", inl.ref)).status, 404);
+  const art = media(h, "msg-heic-001").media[0];
+  assert.deepEqual([art.kind, art.mime, art.available], ["file", "image/heic", true]);
+  const r = await getMedia("msg-heic-001", art.ref);
+  assert.equal(r.status, 200); assert.equal(r.headers.get("content-type"), "image/heic");
+});
+
+test("publicMedia publishes an allowlisted mime or null, whatever the item carries", () => {
+  const base = { ref: "a".repeat(32), kind: "file", name: "n", size: 1 };
+  assert.equal(publicMedia({ ...base, mime: "constructor" }, true).mime, null);
+  assert.equal(publicMedia({ ...base, mime: "__proto__" }, true).mime, null);
+  assert.equal(publicMedia({ ...base, mime: "text/html" }, true).mime, null);
+  assert.equal(publicMedia({ ...base, mime: "image/png" }, true).mime, "image/png");
 });
