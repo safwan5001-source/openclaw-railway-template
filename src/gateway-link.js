@@ -19,6 +19,7 @@
 //
 // Ring records carry fixed, trimmed fields only (no commands beyond a short preview, no paths, no env, no raw payloads).
 import crypto from "node:crypto";
+import { CLIENT_MSG_ID_RE, QUALIFIED_THREAD_KEY_RE, threadOfKey } from "./thread-keys.js";
 
 export const APP_SESSION_KEY = "agent:main:app:owner";
 export const LINK_SCOPES = Object.freeze(["operator.read", "operator.approvals", "operator.admin"]);
@@ -42,6 +43,16 @@ export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
 /** The ONLY params the link sends for the two counting reads (exact match, nothing else): active sessions (one row, we read `totalCount`) and compact cron jobs. */
 export const SESSIONS_ACTIVE_PARAMS = Object.freeze({ activeOnly: true, limit: 1, includeGlobal: true, includeUnknown: true });
 export const CRON_RUNNING_PARAMS = Object.freeze({ includeDisabled: true, limit: 200, compact: true, includeDeliveryPreviews: false });
+/**
+ * B4 (threads flag on only): the ONE read of the global one-run cap (plan N1). Every active session, up to 200 rows, so the bridge
+ * can count the app's own keys. Its own closed validator: SESSIONS_ACTIVE_PARAMS (limit 1) stays exactly as it was.
+ */
+export const SESSIONS_CAP_PARAMS = Object.freeze({ activeOnly: true, limit: 200, includeGlobal: true, includeUnknown: true });
+/** B4 (threads flag on only): reads the thread routes need, each with a closed validator below. Not in LINK_METHODS. */
+export const THREAD_LINK_METHODS = Object.freeze(new Set(["chat.history", "agent.wait"]));
+export const CHAT_HISTORY_MAX = 200;
+export const AGENT_WAIT_MAX_MS = 2000;
+const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{6,100}$/;
 // Own data properties only (an accessor could answer one value to this check and another to the serializer).
 const sameParams = (expected) => {
   const want = Object.entries(expected);
@@ -50,8 +61,24 @@ const sameParams = (expected) => {
     return d !== undefined && "value" in d && d.value === v;
   });
 };
+const ownData = (p) => Object.values(Object.getOwnPropertyDescriptors(p)).every((d) => "value" in d);
+const exactKeys = (p, required, optional = []) => {
+  if (!isPlainObject(p) || !ownData(p)) return false;
+  const ks = Object.keys(p);
+  return required.every((k) => ks.includes(k)) && ks.every((k) => required.includes(k) || optional.includes(k));
+};
+const isCapList = sameParams(SESSIONS_CAP_PARAMS); // separate from the counting read on purpose: never widened by it
+/** Closed params of the thread reads (only reachable with the threads flag on). Keys are the QUALIFIED form (§3.2). */
+const THREAD_VALIDATORS = Object.freeze({
+  "chat.history": (p) => exactKeys(p, ["sessionKey", "limit"], ["messageId"]) && typeof p.sessionKey === "string" && QUALIFIED_THREAD_KEY_RE.test(p.sessionKey)
+    && Number.isSafeInteger(p.limit) && p.limit >= 1 && p.limit <= CHAT_HISTORY_MAX && (p.messageId === undefined || (typeof p.messageId === "string" && MESSAGE_ID_RE.test(p.messageId))),
+  "agent.wait": (p) => exactKeys(p, ["runId", "timeoutMs"]) && typeof p.runId === "string" && CLIENT_MSG_ID_RE.test(p.runId)
+    && Number.isSafeInteger(p.timeoutMs) && p.timeoutMs >= 0 && p.timeoutMs <= AGENT_WAIT_MAX_MS,
+});
 const PARAM_VALIDATORS = Object.freeze({
   "sessions.list": sameParams(SESSIONS_ACTIVE_PARAMS),
+  // the bridge only ever describes an app key (qualified, exact): any other key is refused at the link (wrapper-level key check)
+  "sessions.describe": (p) => exactKeys(p, ["key"]) && typeof p.key === "string" && QUALIFIED_THREAD_KEY_RE.test(p.key),
   "cron.list": sameParams(CRON_RUNNING_PARAMS),
   "tts.speak": (p) => isPlainObject(p) && Object.keys(p).length === 1 && typeof p.text === "string" && p.text.length >= 1 && p.text.length <= TTS_SPEAK_MAX_CHARS,
 });
@@ -87,7 +114,17 @@ export function sessionKind(key) {
 }
 
 /** A pending approval record (list item or `*.approval.requested` payload) in the bridge's fixed shape. Null if unusable. */
-export function approvalView(rec, kind) {
+/**
+ * B4: the conversation an approval belongs to, from the engine's `request.sessionKey` AT REQUEST TIME: "legacy" or a tid for an app
+ * key, null for any other known session (WhatsApp, main, cron: not an app thread), "unknown" when the key is absent (approval.get /
+ * approval.history rows carry none, lab E5). Never guessed as the legacy conversation.
+ */
+export function approvalThread(sessionKey) {
+  if (typeof sessionKey !== "string" || !sessionKey) return "unknown";
+  return threadOfKey(sessionKey);
+}
+
+export function approvalView(rec, kind, { threads = false } = {}) {
   const id = str(rec?.id, 128);
   if (!id || !Object.values(APPROVAL_KINDS).includes(kind)) return null;
   const r = rec.request && typeof rec.request === "object" ? rec.request : {};
@@ -102,6 +139,8 @@ export function approvalView(rec, kind) {
     createdAt: int(rec.createdAtMs), expiresAt: int(rec.expiresAtMs),
     // the app offers allow-once and deny only (allow-always would mint a standing grant)
     decisions: ["allow-once", "deny"].filter((d) => decisions.includes(d)),
+    // B4, threads flag on only (flag off: the shape is exactly as before)
+    ...(threads ? { thread: approvalThread(r.sessionKey), severity: str(r.severity, 20), toolName: str(r.toolName, 64) } : {}),
   };
 }
 
@@ -114,21 +153,29 @@ const kindOfEvent = (name) => {
  * One gateway event as a ring record without id/at, or null when the app does not need it.
  * Fixed fields only. `chat.*` is reported for the app session alone.
  */
-export function normalizeEvent(name, p) {
+export function normalizeEvent(name, p, { threads = false, threadOfApproval } = {}) {
   if (!p || typeof p !== "object") return null;
   const ap = kindOfEvent(name);
   if (ap?.phase === "requested") {
-    const v = approvalView(p, ap.kind);
+    const v = approvalView(p, ap.kind, { threads });
     return v ? { type: "approval.requested", approval: v } : null;
   }
   if (ap?.phase === "resolved") {
     const id = str(p.id, 128);
     if (!id) return null;
     const d = ["allow-once", "allow-always", "deny"].includes(p.decision) ? p.decision : null;
-    return { type: "approval.resolved", approvalId: id, kind: ap.kind, decision: d, session: sessionKind(p.request?.sessionKey) };
+    const out = { type: "approval.resolved", approvalId: id, kind: ap.kind, decision: d, session: sessionKind(p.request?.sessionKey) };
+    // the resolved payload may lack the key: the one recorded when the approval was raised wins
+    if (threads) out.thread = threadOfApproval?.(id) ?? approvalThread(p.request?.sessionKey);
+    return out;
   }
-  if (name === "chat" && p.sessionKey === APP_SESSION_KEY && (p.state === "final" || p.state === "error")) {
+  if (name === "chat" && p.sessionKey === APP_SESSION_KEY && (p.state === "final" || p.state === "error") && !threads) {
     return { type: p.state === "final" ? "chat.final" : "chat.error", session: "app", runId: str(p.runId, 100) };
+  }
+  // B4 (flag on): every app conversation's final/error, tagged with its thread ("legacy" or the tid); `session` stays "app"
+  if (threads && name === "chat" && (p.state === "final" || p.state === "error")) {
+    const thread = threadOfKey(p.sessionKey);
+    if (thread !== null) return { type: p.state === "final" ? "chat.final" : "chat.error", session: "app", runId: str(p.runId, 100), thread };
   }
   if (name === "cron" && p.action === "finished") {
     const job = p.job && typeof p.job === "object" ? p.job : {};
@@ -144,13 +191,21 @@ export function normalizeEvent(name, p) {
  *           clientVersion?: string, setTimer?: typeof setTimeout, clearTimer?: typeof clearTimeout, random?: () => number }} o
  */
 export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.WebSocket, now = Date.now, ringSize = RING_SIZE,
-  clientVersion = "basht-bridge/1", setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random }) {
+  clientVersion = "basht-bridge/1", setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random, threads = false }) {
   const epoch = crypto.randomBytes(6).toString("hex");
   let nextId = now(); // ids keep increasing across wrapper restarts (seeded with the boot time), the epoch says "new ring"
   const ring = [];
   const waiters = new Set();
   const pending = new Map(); // approval id -> { kind, sessionKey, expiresAt }
   const seenApprovals = new Set();
+  // B4: approval id -> the session key it was raised for (kept after it is decided, bounded): approval.history has no key (E5)
+  const approvalKeys = new Map();
+  const noteApprovalKey = (id, key) => {
+    if (!threads || typeof key !== "string" || !key) return;
+    approvalKeys.delete(id); approvalKeys.set(id, key);
+    if (approvalKeys.size > SEEN_APPROVALS) approvalKeys.delete(approvalKeys.keys().next().value);
+  };
+  const threadOfApproval = (id) => (approvalKeys.has(id) ? approvalThread(approvalKeys.get(id)) : null);
   let decorate = (e) => e;
 
   let ws = null;
@@ -195,6 +250,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
 
   function trackApproval(view, sessionKey) {
     pending.set(view.id, { kind: view.kind, sessionKey: sessionKey ?? null, expiresAt: view.expiresAt });
+    noteApprovalKey(view.id, sessionKey);
     if (seenApprovals.has(view.id)) return;
     remember(view.id);
     push({ type: "approval.requested", approval: view });
@@ -203,7 +259,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   function onEvent(name, payload) {
     const ap = kindOfEvent(name);
     if (ap?.phase === "requested") {
-      const v = approvalView(payload, ap.kind);
+      const v = approvalView(payload, ap.kind, { threads });
       if (v) trackApproval(v, payload.request?.sessionKey);
       return;
     }
@@ -211,7 +267,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       const id = str(payload?.id, 128);
       if (id) pending.delete(id);
     }
-    push(normalizeEvent(name, payload));
+    push(normalizeEvent(name, payload, { threads, threadOfApproval }));
   }
 
   const send = (frame) => { try { ws?.send(JSON.stringify(frame)); return true; } catch { return false; } };
@@ -251,7 +307,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       try { rows = await rpc(method, {}); } catch { continue; }
       read.add(kind);
       for (const r of Array.isArray(rows) ? rows : []) {
-        const v = approvalView(r, kind);
+        const v = approvalView(r, kind, { threads });
         if (!v) continue;
         seen.add(v.id);
         trackApproval(v, r.request?.sessionKey);
@@ -382,8 +438,12 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
      * retry a call that costs money.
      */
     request(method, params, { timeoutMs } = {}) {
-      if (!LINK_METHODS.has(method)) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
-      if (PARAM_VALIDATORS[method] && !PARAM_VALIDATORS[method](params)) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
+      const threadRead = threads && THREAD_LINK_METHODS.has(method);
+      if (!LINK_METHODS.has(method) && !threadRead) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
+      const ok = threadRead ? THREAD_VALIDATORS[method](params)
+        : method === "sessions.list" && threads ? (PARAM_VALIDATORS[method](params) || isCapList(params))
+          : !PARAM_VALIDATORS[method] || PARAM_VALIDATORS[method](params);
+      if (!ok) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
       if (state !== "up") return Promise.reject(Object.assign(new Error("link_down"), { code: "link_down" }));
       const t = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, MAX_REQUEST_TIMEOUT_MS) : REQUEST_TIMEOUT_MS;
       return rpc(method, params, t);
@@ -414,6 +474,9 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
     },
     /** Kind of a pending approval this link has seen (exec / plugin / system-agent), or null. */
     pendingKind: (id) => pending.get(id)?.kind ?? null,
+    /** B4: the thread an approval was raised in (from its request.sessionKey at that time), or "unknown". Flag off: always null. */
+    approvalThreadOf: (id) => (threads ? threadOfApproval(id) ?? "unknown" : null),
+    threads,
     forgetApproval: (id) => { pending.delete(id); },
     /** The bridge adds facts only it knows (e.g. whether the app was watching when a reply finished). */
     setDecorator(fn) { decorate = typeof fn === "function" ? fn : (e) => e; },

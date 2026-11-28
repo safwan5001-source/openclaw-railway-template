@@ -636,8 +636,16 @@ const MSG_RE = /^[A-Za-z0-9_-]{6,100}$/;
  *        stateDir, log }
  */
 export function registerMediaRoute(router, ctx) {
-  router.get("/media", async (req, res) => {
-    const key = String(req.query.key ?? ""); const ref = String(req.query.ref ?? ""); const msg = String(req.query.msg ?? "");
+  router.get("/media", mediaHandler(ctx));
+}
+
+/**
+ * The GET handler of one media item. `keyOf(req)` gives the conversation key: the `key` query parameter for the legacy /media
+ * route, the key the bridge BUILT from a validated tid for /threads/:tid/media (B4). `ctx.readable(key)` decides as before.
+ */
+export function mediaHandler(ctx, keyOf = (req) => String(req.query.key ?? "")) {
+  return async (req, res) => {
+    const key = keyOf(req); const ref = String(req.query.ref ?? ""); const msg = String(req.query.msg ?? "");
     if (!REF_RE.test(ref) || !MSG_RE.test(msg) || key.length > 300) return res.status(400).json({ ok: false, error: "bad_request" });
     const gone = () => res.status(404).json({ ok: false, error: "not_found" });
     try {
@@ -686,7 +694,7 @@ export function registerMediaRoute(router, ctx) {
       if (err?.refused) return gone(); // the engine said no (artifact gone, no access)
       return res.status(502).json({ ok: false, error: "engine_unavailable" });
     }
-  });
+  };
 }
 
 function send(res, mime, name, size, write) {

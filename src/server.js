@@ -25,6 +25,9 @@ import { applyAgentDefaults, seedPersonaFiles } from "./agent-persona.js";
 import { createAppBridge, parseTranscribeOutput } from "./app-bridge.js";
 import { CONTROL_READ_RPC, CONTROL_WRITE_RPC, validateControlRpc } from "./app-control.js";
 import { createGatewayLink } from "./gateway-link.js";
+import { createGatewayWriteLink } from "./gateway-write-link.js";
+import { validateSessionRpc } from "./session-rpc-guard.js";
+import { threadsEnabled } from "./thread-keys.js";
 import { signingConfigFromEnv } from "./app-bridge-signing.js";
 import { registerBackupRoute } from "./backup.js";
 import { recoverRestoredGatewayLock } from "./gateway-lock-recovery.js";
@@ -612,6 +615,7 @@ async function restartGateway() {
   await ensureAppChatEndpoint();
   const started = await ensureGatewayRunning();
   gatewayLink?.kick();
+  gatewayWriteLink?.kick();
   return started;
 }
 
@@ -666,6 +670,8 @@ let gatewayLink = null;
 function appBridgeGatewayCall(method, params) {
   if (!APP_BRIDGE_RPC.has(method)) return Promise.reject(new Error(`gateway call ${method} is not allowed`));
   if (!validateControlRpc(method, params)) return Promise.reject(new Error(`gateway call ${method}: params not allowed`));
+  // wrapper-level session-key check (B4 §3.2): only key shapes the bridge can build, exact, never normalised; closed session writes
+  if (!validateSessionRpc(method, params)) return Promise.reject(new Error(`gateway call ${method}: session key not allowed`));
   if (gatewayLink?.isUp() && APP_BRIDGE_LINK_READS.has(method)) {
     return gatewayLink.request(method, params ?? {}).catch((err) => {
       if (err?.code === "link_down" || err?.code === "timeout") return appBridgeCliCall(method, params);
@@ -731,7 +737,13 @@ async function appBridgeTranscribe(filePath) {
 
 // BASHT app bridge (C2/C4): off unless BASHT_APP_TOKEN is set. See src/app-bridge.js for the trust model.
 // B0: with the bridge on, one persistent loopback operator link to the gateway (src/gateway-link.js); it reconnects on its own.
-const pendingLink = createGatewayLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log });
+// B4 (BASHT_THREADS=on only): thread fields on approvals/events, the thread reads on this link, and a SEPARATE write link for
+// chat.send / chat.abort (src/gateway-write-link.js; its scopes are WRITE_LINK_CONFIG, PENDING OWNER DECISION D-B4-10).
+// Flag off: no write link is created and the admin link behaves exactly as before.
+const BASHT_THREADS_ON = threadsEnabled(process.env);
+const pendingLink = createGatewayLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log, threads: BASHT_THREADS_ON });
+const pendingWriteLink = BASHT_THREADS_ON ? createGatewayWriteLink({ url: `ws://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`, token: OPENCLAW_GATEWAY_TOKEN, log }) : null;
+let gatewayWriteLink = null;
 const appBridge = createAppBridge({
   token: process.env.BASHT_APP_TOKEN,
   gatewayUrl: GATEWAY_TARGET,
@@ -740,6 +752,7 @@ const appBridge = createAppBridge({
   log,
   gatewayCall: appBridgeGatewayCall,
   link: pendingLink,
+  writeLink: pendingWriteLink,
   stateDir: STATE_DIR,
   workspaceDir: WORKSPACE_DIR,
   transcribe: appBridgeTranscribe,
@@ -747,6 +760,7 @@ const appBridge = createAppBridge({
   signing: signingConfigFromEnv(process.env, (msg) => log.warn("app-bridge", msg)),
 });
 if (appBridge) { gatewayLink = pendingLink; gatewayLink.start(); }
+if (appBridge && pendingWriteLink) { gatewayWriteLink = pendingWriteLink; gatewayWriteLink.start(); }
 delete process.env.BASHT_APP_TOKEN; // like SETUP_PASSWORD: never inherited by the gateway, its tools or CLI children
 delete process.env.BASHT_BRIDGE_SIGNING_SECRET; // same for the signing secrets
 delete process.env.BASHT_BRIDGE_SIGNING_SECRET_PREVIOUS;
@@ -2104,6 +2118,7 @@ const server = app.listen(PORT, () => {
       await ensureAppChatEndpoint();
       await ensureGatewayRunning();
       gatewayLink?.kick();
+      gatewayWriteLink?.kick();
     })().catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     }).finally(() => {
@@ -2147,6 +2162,7 @@ async function gracefulShutdown(signal) {
 
   clearInterval(setupLimiterSweep);
   gatewayLink?.stop();
+  gatewayWriteLink?.stop();
 
   server.close();
 

@@ -8,7 +8,7 @@
 // Everything goes through the persistent gateway link (src/gateway-link.js). When the link is not up, these routes say so
 // (503 link_down) instead of guessing; nothing falls back to answering on the owner's behalf.
 import express from "express";
-import { APP_SESSION_KEY, APPROVAL_KINDS, MAX_SUMMARY, approvalView, sessionKind } from "./gateway-link.js";
+import { APP_SESSION_KEY, APPROVAL_KINDS, MAX_SUMMARY, approvalThread, approvalView, sessionKind } from "./gateway-link.js";
 
 export const DECISIONS = Object.freeze(["allow-once", "deny"]); // never "allow-always": that would mint a standing grant
 export const APPROVAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
@@ -43,7 +43,7 @@ export function decidedView(a) {
 /**
  * @param {{ link: ReturnType<import("./gateway-link.js").createGatewayLink> | null | undefined, log?: any }} o
  */
-export function createLiveRoutes({ link, log }) {
+export function createLiveRoutes({ link, log, threads = false }) {
   const router = express.Router();
   const linkStatus = () => (link ? link.status() : { state: "off" });
   const linkDown = (res) => res.status(503).json({ ok: false, error: link ? "link_down" : "not_available", link: linkStatus() });
@@ -76,7 +76,7 @@ export function createLiveRoutes({ link, log }) {
     const approvals = [];
     results.forEach((r, i) => {
       if (r.status !== "fulfilled" || !Array.isArray(r.value)) return;
-      for (const row of r.value) { const v = approvalView(row, LIST[i][1]); if (v) approvals.push(v); }
+      for (const row of r.value) { const v = approvalView(row, LIST[i][1], { threads }); if (v) approvals.push(v); }
     });
     approvals.sort((x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0));
     res.json({ ok: true, approvals, partial: results.some((r) => r.status === "rejected"), link: linkStatus() });
@@ -88,6 +88,14 @@ export function createLiveRoutes({ link, log }) {
     try {
       const h = await link.request("approval.history", {});
       const items = (Array.isArray(h?.items) ? h.items : []).map(decidedView).filter(Boolean).slice(0, limit);
+      // B4 (flag on): history rows carry no session key (lab E5): the key recorded when the approval was raised, else "unknown"
+      if (threads) {
+        const raw = new Map((Array.isArray(h?.items) ? h.items : []).map((a) => [a?.id, a?.source?.sessionKey]));
+        for (const it of items) {
+          const known = link.approvalThreadOf?.(it.id);
+          it.thread = known && known !== "unknown" ? known : approvalThread(raw.get(it.id));
+        }
+      }
       res.json({ ok: true, items });
     } catch (err) { fail(res, err, "approval history"); }
   });
