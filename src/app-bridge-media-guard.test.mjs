@@ -56,7 +56,7 @@ before(() => {
     ["AGENTS.md", TEXT], ["TOOLS.md", TEXT], ["HEARTBEAT.md", TEXT], ["BOOTSTRAP.md", TEXT], ["DREAMS.md", TEXT], ["nested/deep/soul.md", TEXT],
     ["my-token.json", "{}"], ["db_password.txt", TEXT], ["API_KEY.txt", TEXT], ["my.apikey.md", TEXT], ["private-key.md", TEXT], ["private_key.txt", TEXT], ["privatekey.txt", TEXT],
     ["the secret plan.md", TEXT], ["tokens.csv", TEXT], ["credential.txt", TEXT], ["auth-profile.md", TEXT], ["passwords.md", TEXT], ["Secret.TXT", TEXT],
-    ["pem-note.txt", PEM], ["head.md", `# notes\nkey: sk-ant-api03-${"A".repeat(40)}\n`], ["openai.txt", `sk-${"a1B2".repeat(10)}`], ["gh.json", `{"t":"ghp_${"a".repeat(36)}"}`],
+    ["pem-note.txt", PEM], ["head.md", `# notes\nkey: sk-ant-api03-${"A".repeat(40)}\n`], ["ant-short.md", `sk-ant-${"Z9".repeat(11)}`], ["openai.txt", `sk-${"a1B2".repeat(10)}`], ["gh.json", `{"t":"ghp_${"a".repeat(36)}"}`],
     ["pat.txt", `github_pat_${"A1_".repeat(20)}`], ["aws.csv", "id,AKIAABCDEFGHIJKLMNOP"], ["slack.md", `xoxb-${"1".repeat(12)}-${"a".repeat(12)}`],
     ["jwt.txt", `Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk`]]) w(n, b);
   w("memory-store/x.md", TEXT); // `memory-store` is not the directory `memory`: allowed, see the test
@@ -147,7 +147,7 @@ test("protected files are refused by listing AND serving, however the reference 
     ".git/config.txt", ".openclaw/openclaw.json", "openclaw.json", "auth-profiles.json", "auth.json", "credentials.json", "credentials/x.json", "secrets.json", "secrets/a.md", "auth/a.md",
     "backups/a.md", "node_modules/p/readme.md", "config.json", "settings.json", "SOUL.md", "USER.md", "IDENTITY.md", "AGENTS.md", "TOOLS.md", "HEARTBEAT.md", "BOOTSTRAP.md", "DREAMS.md",
     "nested/deep/soul.md", "my-token.json", "db_password.txt", "API_KEY.txt", "my.apikey.md", "private-key.md", "private_key.txt", "privatekey.txt", "the secret plan.md", "tokens.csv",
-    "credential.txt", "auth-profile.md", "passwords.md", "Secret.TXT", "pem-note.txt", "head.md", "openai.txt", "gh.json", "pat.txt", "aws.csv", "slack.md", "jwt.txt",
+    "credential.txt", "auth-profile.md", "passwords.md", "Secret.TXT", "pem-note.txt", "head.md", "ant-short.md", "openai.txt", "gh.json", "pat.txt", "aws.csv", "slack.md", "jwt.txt",
     // links: the real path is what counts
     "innocent.md", "linkdir/2026-11-28.md", "settings-copy.json", "readme-link.txt",
     // not a protected-path matter, but still never served
