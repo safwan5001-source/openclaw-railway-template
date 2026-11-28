@@ -145,6 +145,7 @@ export function registerConvoRoutes(router, ctx) {
       ctx.fail(res, err, "search");
     }
   });
+  return { reset };
 }
 
 /** A cursor for earlier rows: "<resetId>" (a reset this bridge made) or "<messageId>.<resetId>" (older than that message, inside

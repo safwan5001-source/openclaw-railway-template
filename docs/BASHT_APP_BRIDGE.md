@@ -1,4 +1,4 @@
-# BASHT app bridge (C2 + C4 + M + B0/B3 + voice + B1/B2 + B5–B7)
+# BASHT app bridge (C2 + C4 + M + B0/B3 + voice + B1/B2 + B5–B7 + B4 threads)
 
 How the BASHT app (`safwan-smart-assistant`) reads the owner's conversations and chats with BASHT live. The code is in
 `src/app-bridge.js` and the tests are in `src/app-bridge.test.mjs`. Voice identity guard: `src/app-bridge-voice.js`. Request signing:
@@ -450,6 +450,175 @@ buffer. Every call is built by the bridge with the app session key or a key that
   again, toolResult hits are dropped, and snippets lose `MEDIA:` lines, markers and absolute paths.
 - **Not offered.** Documents/PDFs to BASHT (they need `chat.send` attachments: over the CLI argv cap; waits for a WebSocket
   client). No edit or rewind (admin, branches). No parallel app sessions.
+
+## B4: independent conversations (`/app/v1/threads/*`), engine contract P2-B4-1
+
+**Off by default.** Everything in this section exists only while the engine has `BASHT_THREADS=on` (exactly `on`; any other
+value or unset is off). With it off the engine is byte-for-byte the batch-3 engine: no write link is created, `/threads/*` answers
+`404 {ok:false, error:"not_found"}` (the same as an old engine), `/status` advertises no thread capability, approvals and events
+keep their old shape, and legacy `/send` does not do the cap read. Release, rollback and the gate: `docs/BASHT_THREADS_RELEASE.md`.
+Code: `src/thread-keys.js`, `src/gateway-write-link.js`, `src/app-bridge-threads.js`, `src/session-rpc-guard.js`; tests:
+`src/thread-keys.test.mjs`, `src/gateway-write-link.test.mjs`, `src/app-bridge-threads.test.mjs`, `src/gateway-link-threads.test.mjs`.
+
+### Keys: rejected, never normalised
+
+`tid` is `legacy` (the existing app conversation) or exactly 32 lowercase hex. `clientMsgId` is a lowercase UUID. Anything else is
+`400 bad_request` (`reason: bad_tid | bad_client_msg_id`) before anything is sent; nothing is lowercased, trimmed or decoded (a
+percent-encoded tid in the path is refused, not decoded) (the
+engine lowercases unqualified keys and merges conversations; an uppercase qualified key hangs the request, lab E1). The bridge builds
+both key forms from the tid and never forwards a key it was given:
+
+| Method | Form sent | Checked by |
+|---|---|---|
+| `chat.send`, `chat.abort` (write link) | unqualified `app:owner` / `app:owner:<tid>` | write-link closed validator `^app:owner(?::[0-9a-f]{32})?$` |
+| `chat.history`, `sessions.describe`, `sessions.patch`, `sessions.list` rows, `models.list`, `sessions.search` | qualified `agent:main:app:owner` / `agent:main:app:owner:<tid>` | link validators and the wrapper guard `^agent:main:app:owner(?::[0-9a-f]{32})?$` |
+| `agent.wait` | `runId` only (= `clientMsgId`) | link validator (UUID, `timeoutMs` 0..2000) |
+
+**Wrapper-level key check (new, always on):** `server.js appBridgeGatewayCall` runs `validateSessionRpc` (`src/session-rpc-guard.js`)
+on every bridge RPC, before the link or the CLI. Writes and per-session reads take a qualified app key only; `chat.history`,
+`sessions.search` and `artifacts.download` also take the main key and the owner-direct WhatsApp key *shape* (ownership stays with
+`isReadable`); `sessions.reset` only `{key: agent:main:app:owner, reason: "new"}`; `sessions.patch` exactly one change from
+`{thinkingLevel}`, `{fastMode}`, `{model}` or `{archived:false, expectedSessionId}`. Every legacy call the bridge makes passes it.
+The admin link now also closes `sessions.describe` to `{key: <qualified app key>}`.
+
+### Routes
+
+| Route | Behaviour |
+|---|---|
+| `POST /threads/:tid/send {message, images?, clientMsgId}` | Command filter, size checks, then **under the send mutex**: the global cap, a `sessions.describe` pre-check (archived ⇒ `409 archived`; `session:null` = a new conversation), then **one** `chat.send {sessionKey (unqualified), message, idempotencyKey: clientMsgId, suppressCommandInterpretation: true, attachments?}` over the **write link**. `202 {ok, runId (= clientMsgId), thread, ack (started\|in_flight\|ok), boot, sessionSha256}`. `ack:"ok"` means the engine already ran this id to completion earlier (a repeat after a restart): nothing runs now, and the run view ends `done` with the earlier reply. `sessionSha256` of a NEW conversation is read after the ack (bounded retries, ≤ ~1 s), since the engine creates the session then; it can still be `null`. A clientMsgId that was already used is never sent again from this route: `409 already_sent` when this bridge saw it, or when the ENGINE knows it (`agent.wait {runId:K, timeoutMs:0}` is `ok`/`error`; this also catches reuse in ANOTHER conversation after a bridge restart). `already_sent` is **not** a definite refusal: the id may well have been sent; the API must reconcile, never mark it unsent. The API must keep clientMsgId globally unique (the engine runId is K, across all conversations). That engine check is bounded (3 s): no answer ⇒ `503 not_written, reason precheck_failed`; an engine REFUSAL of the call (unknown method, scope) ⇒ `503 not_written, reason precheck_refused`, logged loudly, because it would block every thread send (nothing sent in both cases) |
+| `GET /threads/:tid/sends/:clientMsgId?since=<ms>` | Read-only reconciliation: pages `chat.history` back past `since − 15 min` (a skew margin: `since` may be the API's clock, which can be ahead of the engine's row times) looking for the user row tag `"<K>:user"`, then `agent.wait {runId:K, timeoutMs:0}`; a page with no `anchor.hasOlder`, a failed read or an agent.wait with no answer is `complete:false`. `{found, complete, wait, boot}`; `wait` is reported only when K was found in THIS conversation (agent.wait is engine-global) |
+| `POST /threads/:tid/sends/:clientMsgId/resend {message, images?, originalAt, sessionSha256, previousRefusal?}` | The owner's "send now" button only, **same** id. Refused with `409 resend_not_allowed {reason}` unless ALL hold: `previousRefusal` is not `conflict\|command_not_allowed\|bad_request\|too_large` (`refusal_final`); within 24 h of the original (`window`); the engine session is the same as at the original send, by the bridge's own `describe().sessionId` hash, the bridge's own record winning over the caller's (`session_changed`; the `chat.send.sessionId` param does not guard, lab L10; when NO session was known at the original send and one exists now, the reconciliation decides: `"<K>:user"` in it ⇒ `already_received`, else `session_changed`); a fresh reconciliation completed (`reconcile_incomplete` when it failed or could not page back far enough) and found neither `"<K>:user"` nor a run (`already_received`). Then the cap and one `chat.send` with the same K |
+| `GET /threads/:tid/runs/:runId` | Live text (`deltaText` of the write link's `chat` events, filtered by qualified key and runId; the live record exists before the write, so events that arrive before an ack or after an ack timeout are kept), `phase`, `steps`. The engine is asked too (history + bounded `agent.wait {timeoutMs:0}`, at most every 1.5 s while running), so a run whose terminal event was missed (write-link drop/reconnect) still ends `done`/`error` with the final text. Rows are bounded to K's own turn (K's user row up to the next user row). `interrupted:true` and `resumed:{runId, text}` only when THIS turn was continued by the engine in a new run after a restart (`continuation.source === "restart"`, lab L5; only that run's rows): shown, never re-executed; K's own status is then `unknown`. Without a live record, a run is reported only when K's user row is in this conversation (else 404). See "Run outcome" below for how the status and text are decided. Cost: an id the bridge holds no record of can take up to 12 link reads on its first poll (agent.wait, one history page, up to 10 pages back); the paging result is cached 5 s per (conversation, id), so later polls cost 2. `status: running\|done\|error\|stopped\|unknown` |
+| `POST /threads/:tid/runs/:runId/abort` | `chat.abort {sessionKey (unqualified), runId}` on the write link. `{ok, aborted}` |
+| `GET /threads/:tid/history?limit=&before=` | `limit` ≤ 100 (with `before`, the anchored request is `min(2·limit+1, 200)`, within the link's closed cap). For `legacy` the paging crosses resets exactly like legacy `/history`: after a reset the default view starts at the reset row and `earlier` is that reset's id (when this bridge recorded it in its ledger); `before=` takes the ledger cursor (`<resetId>`, `<messageId>.<resetId>` or an id) through the same `anchoredPage()`. `chat.history` over the link (qualified key; cold and archived sessions are readable without restoring, L4). Rows as `/history`, with `runId` from `"<K>:user"` / `__openclaw.runId` and `resumed:true` on the restart-continued reply. The resume input is already hidden by the engine |
+| `GET /threads/:tid/media?msg=&ref=` | One image/file of one message of that conversation (the `/media` rules, key built from the tid) |
+| `GET/POST /threads/:tid/model`, `…/thinking`, `…/fast` | Per conversation: `sessions.describe` / `sessions.patch` on that key only; `models.list` with that key. A never-used conversation is `started:false` and refuses writes with `409 not_started` (it runs on the default model). Active run ⇒ `409 busy` |
+| `GET /threads/state?tids=a,b` (≤ 100) | Engine state per conversation from `sessions.describe` over the link (works on archived keys, E7): `{exists, archived, archiveReason, lastActivityAt, hasActiveRun}`, `{exists:false}`, or `{unknown:true}` when it could not be read (never "not archived") |
+| `POST /threads/:tid/restore` | Explicit owner action: `sessions.patch {key, archived:false, expectedSessionId}` (restore needs it, lab P3; pinning does not). `{restored}` |
+| `POST /threads/legacy/reset` | The explicit reset of the legacy conversation (the API refuses legacy `/new` while threads are on, F-I9): the same reset as `/new` (`sessions.reset {key: agent:main:app:owner, reason:"new"}`, nothing deleted, the earlier-rows ledger), under the send mutex and the global cap (`409 busy` with `busyThread` while any app conversation runs) and in the legacy settings queue. Only `legacy` |
+| `POST /threads/search {q, tids[≤500]}` | `sessions.search` in batches of 100 qualified keys; results carry `tid`, never a key; `truncated` |
+
+Settings of the `legacy` tid share the legacy routes' one queue (and forget the legacy describe cache); a thread send to `legacy`
+is `409 busy` while legacy `/new` is under way. An unavailable model is `400 model_unavailable`, as on the legacy route.
+
+**Known limits (review notes):** the always-on guard accepts thinking levels matching `^[a-z0-9_-]{1,40}$` only (stricter than
+`levelIds`; every 2026.11.10 level passes); `chat.send` carries no `deliver` field (the lab-verified frame; plan §3.3 lists
+`deliver:false`); `/threads/state` is at most 20 rounds of 5 describes (15 s timeout each) in the worst case.
+
+### Run outcome (`GET /threads/:tid/runs/:K`): one pure function, `runOutcome()` in `src/app-bridge-threads.js`
+
+Inputs: the live record (from the write link's chat events; *settled* once the first non-notice final reply event arrived), the
+`agent.wait {runId:K, timeoutMs:0}` answer (read FIRST: `ok`, `error`, `timeout`/`pending`, or none), and K's **user-turn segment**:
+the rows after K's user row up to the next user row, located in the newest 50 rows or, whenever the run is not settled (cached or
+not, whatever `agent.wait` said), by the bounded paging (10 × 200 rows, cached 5 s per conversation and id): `found`, `absent`
+(the whole history read, K is not in this conversation) or `unreachable` (paging could not tell).
+
+Terms: a **final row** is an assistant row of that run with a terminal `stopReason` (`stop`, `end_turn`, `length`, `error`,
+`aborted`, `timeout`, `cancelled`), no pending tool call, and not an engine status notice (`toolUse`, `restart` or none are never
+final). A **continuation** is a row with `continuation.source:"restart"` and another runId inside the segment; the **latest** one
+is the resumed reply (a later user turn is outside the segment, so its continuations never count).
+
+| # | Live record | Segment | Engine | → status | text | textPending |
+|---|---|---|---|---|---|---|
+| 1 | settled (final reply event) | any | (not read) | the event's (`done`/`error`/`stopped`) | the event's reply | no |
+| 2 | none | absent | any | **404 not_found** | — | — |
+| 3 | none, or not settled | unreachable | any | `unknown` (`located:false`); a live terminal event keeps its status | `""` | only with a live terminal event |
+| 4 | not settled | absent (not visible yet) | `ok` / `error` | `done` / `error` | `""` | yes |
+| 5 | not settled | absent | other | the live status (`running`) | the live stream | no |
+| 6 | any, not settled | found, K's final row | `error` / other | `error` / `done` | K's final row | no |
+| 7 | any, not settled | found, no final row | `ok` / `error` | `done` / `error` | `""` | **yes** (re-read on every poll) |
+| 8 | any, not settled | found, no final row, a continuation | other | `unknown` (K was interrupted) | `""` | no |
+| 9 | live running | found, no final row, no continuation | other | `running` | the live stream | no |
+| 10 | none | found, no final row, no continuation | other | `unknown` | `""` | no |
+
+In every `found` row: `interrupted` = a continuation exists; `resumed` = `{runId, text, textPending}` of the LATEST continuation, its
+`text` from that run's final row only (else `""` and `textPending:true`). A live terminal event that is not settled (a notice-only
+final) keeps its status and takes the text from rule 6, else stays `textPending`. The bridge persists only a terminal status and a
+final row's text into its live record (never `unknown`, never a preamble), so a settled run is not re-read. Covered by
+`src/app-bridge-threads-matrix.test.mjs` (the 576-scenario cross-product: cached/uncached × agent.wait ok/timeout/error/none ×
+segment within 50 rows/beyond/unreachable × 0/1/2 continuations × trailing notice × final row/preamble only × later turn).
+
+**Unchanged:** `isReadable`, `/sessions`, `/history?key`, `/media?key`, `/search`, `/new`, `/model`. A thread key is 404 on the legacy
+routes, and `/sessions` output is byte-identical after threads exist (tested).
+
+### The write link (`src/gateway-write-link.js`) — PENDING OWNER DECISION D-B4-10
+
+A second loopback WebSocket, **only** for `chat.send` and `chat.abort`; `chat.send` is never sent on the admin link (whose allowlist
+is unchanged). Its scopes and connect params are ONE object, `WRITE_LINK_CONFIG`: `[operator.write, operator.admin, operator.approvals]`,
+`client {id: "gateway-client", mode: "backend"}`, `caps: []`, and `suppressCommandInterpretation: true` on every `chat.send`.
+This is the lab's Option A (P2-B4-1-LAB L1-alt): the only configuration with owner identity (`senderIsOwner:true`), trusted memory
+provenance, working exec approvals AND engine-side command neutralisation. It contradicts the approved §4.4 ("no `chat.send` on the
+admin link") and is therefore **pending the owner's decision D-B4-10**. Option B (write+approvals plus a production
+`commands.ownerAllowFrom += "gateway-client"` write) is the only non-admin alternative; it leaves `/status`, `/model`, `/think`,
+`/compact` executable and relies on the bridge filter alone. Write-only links are rejected (untrusted, sticky memory quarantine).
+
+Failure semantics (never `failInflight("link_down")`):
+
+| Code | When | Meaning |
+|---|---|---|
+| `not_written` | link not up, socket not OPEN, `send()` threw | definite: nothing reached the engine |
+| `too_large` | an image above hello `policy.attachments.maxImageBytes`, the images above `maxBytes`, or the frame above `policy.maxPayload` (an oversize frame would close the socket with 1009 and no answer, L2) — checked before writing | definite |
+| `ack_lost` | written, then the socket closed before the answer | unknown (the run may complete, lab l1-acklost) |
+| `ack_timeout` | written, no answer in 15 s | unknown |
+
+No retry, no re-send on reconnect, no CLI fallback.
+
+### Send answers: the closed list
+
+Definite refusals (published in `/status threads.definiteRefusals`): `busy` (409, `busyThread`), `busy_unknown` (503), `archived`
+(409), `conflict` (409, engine `chat-request-conflict`, or a resend whose body differs from the original), `cold` (409, engine `UNAVAILABLE
+TRANSCRIPT_COLD`, nothing ran, L10), `engine_starting` (503, the gateway's startup admission refused it: `UNAVAILABLE`, `details.reason:"startup-sidecars"`,
+retryable, nothing admitted; `retryAfterMs` passed through), `not_written` (503), `bad_request` (400, `reason`), `command_not_allowed` (400), `too_large`
+(413). `409 already_sent` is deliberately NOT in this list (see the send route). **Everything else is unknown** — `502 outcome_unknown {reason: ack_lost|ack_timeout|engine_refused|exception|unexpected_ack}`,
+any other status or body, or no answer — and must never be retried automatically.
+
+### The global one-run cap
+
+One mutex around check-then-send on **every** send path: thread send, resend, and (flag on) the legacy HTTP `/send` (same path and
+HTTP behaviour, plus this check; its busy answer gains `busyThread`). Inside it: a legacy HTTP turn this bridge holds ⇒ `busy
+legacy`; a send accepted < 3 s ago ⇒ `busy`; then ONE `sessions.list {activeOnly:true, limit:200, includeGlobal:true,
+includeUnknown:true}` (its own closed validator on the link; the counting read stays `limit:1`) counting **app keys only**
+(cron/WhatsApp never count). A failed or incomplete read (`totalCount` above the rows, `hasMore`) ⇒ `503 busy_unknown`.
+
+### Command filter (defence in depth)
+
+Leading JS whitespace (incl. NBSP, BOM) and every `\p{Cf}` mark (RLM, LRM, ALM, ZWJ, ZWNJ, ZWSP, WJ) are stripped; then a leading `/`
+or a leading `!` followed by **anything** (`!مهم` included: the gateway takes it as bash, lab L1(g)) is `400 command_not_allowed`.
+App-local commands (`/مهمة`, `/متصفح`) never reach the server. Deviation from plan v2.2 §3.3 (which accepts `!مهم` under
+profile A): the coordinator's brief requires refusing `!` + anything under both profiles, so the filter does not depend on D-B4-10.
+
+### Isolation limits and differences on the `chat.send` path (lab L1(a), L7)
+
+- The agent can still read another conversation **when asked explicitly** (`sessions_history`/`sessions_search` tools, D-B4-1b,
+  `tools.sessions.visibility` default `all`); nothing crosses automatically (recall is `session-ineligible` for app keys).
+- Tools: the write link's turns see `skill_library` in addition to `skill_workshop` (60 tools vs 59 on HTTP); the owner tier is the same.
+- Both paths are `channel=webchat`; the `chat.send` system prompt adds the webchat surface sections, so replies may contain
+  `[embed …]` and `<details>` markup. The app renderer must ignore or strip them.
+
+### Images
+
+Same body (`images: [{mime, data}]`, ≤ 8) and parser as `/send`; sent as `chat.send attachments [{type:"image", mimeType, fileName,
+content}]`; checked against the write link's hello limits before writing (production defaults: 6 MiB per image, 18.56 MiB total
+raw, 25 MiB frame). History keeps `media://inbound/…` references.
+
+### Approvals and events (flag on)
+
+Every app conversation's approval (legacy or thread) is labelled `session:"app"`, `isApp:true`; flag off keeps the old labels.
+Approval rows and `approval.requested` events gain `thread` (from `request.sessionKey` **when raised**; `"legacy"` or the tid; `null`
+for a non-app session; `"unknown"` when no key is known), `severity` and `toolName` (plugin approvals, `plugin:<uuid>`, resolved with
+`kind: "plugin"`). `approval.resolved` and `/approvals/history` use the key recorded when the approval was raised (history rows carry
+none, E5); otherwise `"unknown"`, never the legacy conversation. `chat.final`/`chat.error` events are emitted for every app
+conversation with `thread`; `session` stays `"app"`; **one per run**: the engine can send a second `final` for a run (an engine
+status notice such as "↪️ Model Fallback…" or "⚠️ Exec failed", content parts flagged `openclawStatusNotice`), which is dropped. The
+run view likewise keeps the first final reply text; a notice never replaces it (history shows the reply). `approvalDeadline(<qualified key>)` works per conversation.
+
+### `/status` (flag on only)
+
+`features` gains `sessions.multi.v1`, `send.ws.v1`, `events.thread.v1`; `writeLinkProfile` (`"A"` today, D-B4-10); `threads:
+{writeLink: "up"|"down"|…, definiteRefusals: [...], resumeGuard: {configured: true|false|null}}` (`configured` = the D-B4-9 guard
+is in the gateway config with its entry enabled and conversation access granted; a boolean read of the config file only;
+"configured" is not "loaded": `openclaw plugins list` stays the gate check).
+An app that sees none of these must treat threads as unsupported (the routes are 404).
 
 ## App control (B5–B7): `src/app-control.js`
 

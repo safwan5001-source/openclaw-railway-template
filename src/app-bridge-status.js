@@ -1,5 +1,6 @@
 // BASHT app bridge: the additive, cheap, read-only pieces of GET /app/v1/status that are not voice (batch 3).
-// Nothing here calls the gateway, writes, or reads anything but the one environment value named below.
+// Nothing here calls the gateway or writes; it reads the one environment value named below and (B4, flag on) the gateway config file.
+import fs from "node:fs";
 import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_IMAGES_TOTAL_BYTES, MAX_INLINE_BYTES, MAX_MEDIA_BYTES } from "./app-bridge-media.js";
 
 /**
@@ -13,6 +14,21 @@ export const EXTRA_FEATURES = Object.freeze([
   "runs.runId.v1", // additive runId on user rows of /history
   "errorCode.rate_limited.v1", // additive errorCode "rate_limited" on a failed run
 ]);
+
+const GUARD_ID = "basht-resume-guard";
+/**
+ * B4 (flag on only): is the D-B4-9 resume guard CONFIGURED in the gateway config (a load path ending in the guard file, its entry
+ * enabled, conversation access granted)? A boolean read of the config file, nothing else (no path or setting is returned); null when
+ * the config cannot be read. "Configured" is not "loaded": `openclaw plugins list` stays the release-gate check.
+ */
+export function resumeGuardConfigured(configPath) {
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(configPath, "utf8")); } catch { return null; }
+  const paths = cfg?.plugins?.load?.paths;
+  const entry = cfg?.plugins?.entries?.[GUARD_ID];
+  return Array.isArray(paths) && paths.some((p) => typeof p === "string" && p.endsWith(`/${GUARD_ID}.mjs`))
+    && entry?.enabled === true && entry?.hooks?.allowConversationAccess === true && cfg?.plugins?.enabled !== false;
+}
 
 const COMMIT_RE = /^[0-9a-f]{7,40}$/;
 

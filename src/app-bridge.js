@@ -24,6 +24,7 @@
 //   GET  /app/v1/search?q=         -> sessions.search over the readable conversations only
 //   GET  /app/v1/media?key&msg&ref -> one image/file of one message of a readable conversation (engine-owned files only)
 //   /app/v1/automations*, /usage, /memory/*, /capabilities -> src/app-control.js (B5–B7: read-mostly views, two cron switches)
+//   /app/v1/threads/*              -> src/app-bridge-threads.js (B4 independent conversations) ONLY while BASHT_THREADS=on; else 404
 //
 // Trust model
 // - Off unless BASHT_APP_TOKEN (>= 32 chars) is set. The app holds only that token; it never sees OPENCLAW_GATEWAY_TOKEN
@@ -54,10 +55,12 @@ import { createLiveRoutes } from "./app-bridge-live.js";
 import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createRunsProbe } from "./app-bridge-runs.js";
-import { EXTRA_FEATURES, attachmentLimits, wrapperCommit } from "./app-bridge-status.js";
+import { EXTRA_FEATURES, attachmentLimits, resumeGuardConfigured, wrapperCommit } from "./app-bridge-status.js";
 import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, checkMediaFile, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, turnContent } from "./app-bridge-media.js";
-import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
+import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, cleanSnippet, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
+import { DEFINITE_REFUSALS, THREAD_FEATURES, threadsEnabled } from "./thread-keys.js";
+import { assistantRunId, createSendGate, isResumedRow, registerThreadRoutes, userRowRunId } from "./app-bridge-threads.js";
 
 export const APP_SESSION = "app:owner";
 export const APP_SESSION_KEY = "agent:main:app:owner";
@@ -308,14 +311,18 @@ async function readCompletionStream(body, onText, onEngineRunId) {
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
 export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall, link,
-  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing, env = process.env }) {
+  writeLink, stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing, env = process.env, recentAcceptMs }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
+  // B4: independent conversations. OFF unless BASHT_THREADS=on: then nothing below behaves differently from before batch 4.
+  const threads = threadsEnabled(env);
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
   const router = express.Router();
   const resetState = { active: false }; // B1: shared by /new and /send (see app-bridge-convo.js)
   const runLinks = new Map(); // engine run id -> runId of /send (this process only)
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
+  // B4: the mutex + global one-run cap shared by EVERY send path (only used while the flag is on)
+  const gate = createSendGate({ link, now, recentAcceptMs, legacyRunning: () => [...runs.values()].some((r) => r.status === "running") });
   let failures = { windowStart: 0, count: 0 };
   // B4: a reply that finishes while the app was not polling (phone locked / app closed) is worth a push; /events is the server's
   // own poller, never the app on screen, so it does not count.
@@ -379,7 +386,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const jsonBody = express.json({ limit: "64kb", verify: keepRaw });
   const sendBody = express.json({ limit: SEND_BODY_LIMIT, verify: keepRaw }); // photos ride on the turn (B2); every other JSON route keeps 64 kB
   // /transcribe takes raw audio only (its own express.raw, 10 MiB, inside the route); /send takes the bigger JSON body
-  router.use((req, res, next) => (req.path === "/transcribe" ? next() : (req.path === "/send" ? sendBody : jsonBody)(req, res, next)));
+  // B4 (flag on only): the thread send/resend routes take the photo-sized body too (plan F-I12); with the flag off the choice is unchanged
+  const THREAD_SEND_PATH = /^\/threads\/[^/]+\/(?:send|sends\/[^/]+\/resend)$/;
+  const bigBody = (p) => p === "/send" || (threads && THREAD_SEND_PATH.test(p));
+  router.use((req, res, next) => (req.path === "/transcribe" ? next() : (bigBody(req.path) ? sendBody : jsonBody)(req, res, next)));
   router.use((req, res, next) => (req.path === "/transcribe" || bodyMatchesSignature(req, res) ? next() : signatureRejected(res, "body")));
 
   const gatewayHeaders = { authorization: `Bearer ${gatewayToken}`, "content-type": "application/json" };
@@ -430,7 +440,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     res.json({
       ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" },
       // FEATURES is the shared voice contract with the app (src/fixtures/voice-contract.json); EXTRA_FEATURES are the non-voice ids after it
-      features: [...FEATURES, ...EXTRA_FEATURES],
+      features: [...FEATURES, ...EXTRA_FEATURES, ...(threads ? THREAD_FEATURES : [])],
       wrapper: { commit: wrapperCommit(env) }, // 12 hex characters of the build's commit, or null; nothing else from the environment
       attachments: attachmentLimits(), // the limits /send and /media enforce (bytes), from the real constants
       voice: { ...speakStatus(guard, { linkUp: link?.isUp?.() === true, toolPath: !!speechDir }), warnings: guard.warnings },
@@ -440,6 +450,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       // (in memory + boot fence: NOT durable), and the last signature this bridge did not accept: a reason and a time
       signing: { ...verifier.status(), ...(lastRejected ? { lastRejected } : {}) },
       ...(version ? { engine: { version } } : {}),
+      // B4 (flag on only): the write link's state and the CLOSED list of definite send refusals (everything else is unknown)
+      ...(threads ? { writeLinkProfile: writeLink?.config?.profile ?? null,
+        threads: { writeLink: writeLink ? writeLink.status().state : "off", definiteRefusals: [...DEFINITE_REFUSALS],
+          resumeGuard: { configured: resumeGuardConfigured(configPath) } } } : {}),
     });
   });
 
@@ -480,7 +494,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (typeof engineId !== "string" || !(Number(next.timestamp) >= Number(list[i].timestamp))) return null;
     return runLinks.get(engineId) ?? null;
   };
-  const mapRows = (key, rows, complete = false) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
+  // B4: `thread` rows (a /threads read) take their runId from the engine's own tags (user "<K>:user", reply __openclaw.runId = K)
+  // and mark the reply the engine resumed after a restart (`resumed`); legacy reads are unchanged.
+  const mapRows = (key, rows, complete = false, { thread = false } = {}) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
     if (isResetRow(m)) return { role: "system", kind: "reset", text: "", at: Number(m.timestamp) || 0, id: rowId(m), media: [] };
     const { text, media, messageId } = extractMedia(m, key, messageText(m));
     for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
@@ -491,8 +507,9 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const ok = c.ok; const size = ok ? c.size : null;
       return publicMedia({ ...it, size }, ok);
     });
-    const runId = runIdOf(key, list, i, complete);
-    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(runId ? { runId } : {}), ...(m.role === "assistant" ? assistantMeta(m) : {}) };
+    const runId = thread ? (userRowRunId(m) ?? assistantRunId(m)) : runIdOf(key, list, i, complete);
+    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(runId ? { runId } : {}), ...(m.role === "assistant" ? assistantMeta(m) : {}),
+      ...(thread && isResumedRow(m) ? { resumed: true } : {}) };
   }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0); };
 
   router.get("/history", async (req, res) => {
@@ -531,7 +548,19 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     if (pics.error) return res.status(400).json({ ok: false, error: pics.error });
     if ((!message && !pics.images.length) || message.length > MAX_MESSAGE_CHARS) return res.status(400).json({ ok: false, error: "bad_request" });
     if ([...runs.values()].some((r) => r.status === "running")) return res.status(409).json({ ok: false, error: "busy" });
+    if (!threads) return startLegacyTurn(res, message, pics);
+    // B4 (flag on): the global one-run cap, under the same mutex as every thread send (path and HTTP behaviour otherwise unchanged)
+    return gate.exclusive(async () => {
+      const c = await gate.check();
+      if (!c.ok) return res.status(c.status).json({ ok: false, error: c.error, ...(c.busyThread ? { busyThread: c.busyThread } : {}) });
+      if (resetState.active || turnRunning()) return res.status(409).json({ ok: false, error: "busy", busyThread: "legacy" });
+      startLegacyTurn(res, message, pics);
+      gate.noteAccepted("legacy");
+      return undefined;
+    });
+  });
 
+  function startLegacyTurn(res, message, pics) {
     const id = crypto.randomUUID();
     const ctl = new AbortController();
     const run = { id, status: "running", text: "", error: null, startedAt: now(), firstTokenAt: null, finishedAt: null, abort: () => ctl.abort(),
@@ -566,12 +595,14 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         run.status = ctl.signal.aborted ? "stopped" : "error";
         run.error = run.status === "error" ? "engine_error" : null;
         if (run.status === "error") run.errorCode = runErrorCode(err);
+        // B4 (flag on): the engine's in-stream "Session is archived" (lab P3) becomes a typed code; flag off: unchanged
+        if (threads && run.status === "error" && /\bsession is archived\b|\bis archived\b/i.test(String(err?.message ?? ""))) run.errorCode = "archived";
         if (run.status === "error") log?.warn?.("app-bridge", `run failed: ${err?.message ?? err}`);
       })
       .finally(() => { clearTimeout(timer); run.finishedAt = now(); forgetDescribe(); }); // the turn saved the session: a cached describe is stale
 
     res.status(202).json({ ok: true, runId: id });
-  });
+  }
 
   const latency = (r) => ({
     firstTokenMs: r.firstTokenAt == null ? null : r.firstTokenAt - r.startedAt,
@@ -973,7 +1004,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       return new Promise((resolve) => { res.locals.resetSettled = resolve; next(); });
     });
   });
-  registerConvoRoutes(router, convoCtx);
+  const convo = registerConvoRoutes(router, convoCtx);
   registerMediaRoute(router, { ...mediaCtx, readable: readableKey, gatewayCall, cache: refs, log,
     findMessage: async (key, messageId) => {
       if (!gatewayCall) return null;
@@ -981,7 +1012,35 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       return (Array.isArray(r?.messages) ? r.messages : []).find((m) => rowId(m) === messageId) ?? null;
     } });
 
-  router.use(createLiveRoutes({ link, log }));
+  if (threads) {
+    // POST /threads/legacy/reset (plan §3.4, review I5): the explicit reset of the legacy conversation once the API refuses legacy /new.
+    // The same reset as /new (sessions.reset, nothing deleted, the ledger for earlier rows), plus the global one-run cap under the
+    // send mutex: no reset while ANY app conversation runs, and no send starts while it is under way. Same settings queue as /new.
+    router.post("/threads/legacy/reset", (req, res) => {
+      let gone = false;
+      res.once("close", () => { gone = true; });
+      return gate.exclusive(async () => {
+        const c = await gate.check();
+        if (!c.ok) return res.status(c.status).json({ ok: false, error: c.error, ...(c.busyThread ? { busyThread: c.busyThread } : {}) });
+        return serial(() => (gone || res.destroyed || res.writableEnded ? undefined : convo.reset(res)));
+      });
+    });
+    registerThreadRoutes(router, { link, writeLink, gatewayCall, now, log, gate, legacySerial: serial, legacyResetActive: () => resetState.active,
+      // the legacy conversation's paging across resets: the same ledger cursor and anchoredPage() as legacy /history (Codex f0b6276)
+      legacyHistory: {
+        page: (cursor) => (gatewayCall ? anchoredPage(convoCtx, APP_SESSION_KEY, cursor, "before") : Promise.reject(Object.assign(new Error("no gatewayCall"), { code: "link_down" }))),
+        earlierOf: (rows) => {
+          const first = rows.find((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m)));
+          return first && isResetRow(first) && ledger.anchorFor(rowId(first)) ? rowId(first) : null;
+        },
+      },
+      boot: () => link?.epoch ?? writeLink?.epoch ?? null,
+      mapRows: (key, rows) => mapRows(key, rows, false, { thread: true }),
+      messageText, cleanLiveText, cleanSnippet,
+      models: { mapModel, modelRef, levelIds },
+      media: { ...mediaCtx, gatewayCall, cache: refs, log } });
+  }
+  router.use(createLiveRoutes({ link, log, threads }));
   // B5–B7: automations, usage, memory (read-only) and capabilities — same token gate, own fixed shapes (src/app-control.js)
   router.use(createAppControl({ gatewayCall, appSessionKey: APP_SESSION_KEY, now, log }));
 
