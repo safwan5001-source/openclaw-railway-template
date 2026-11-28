@@ -357,11 +357,20 @@ buffer. Every call is built by the bridge with the app session key or a key that
   (the endpoint reads no idempotency header or body field, and the stream's `id` is a different one, `chatcmpl_<uuid>`). The stream
   `id` is, however, what the engine writes as `__openclaw.runId` on the reply rows of that turn. The bridge links that id to the
   `runId` it returned (in memory, last 500 turns) and gives a user row the `runId` of the reply row right after it, when: the key is
-  the app session, the next row is an assistant row whose engine run id was linked in this process, and that row is not older than
-  the user row. So there is no `runId` for: rows of any other conversation (WhatsApp), turns started by another client, turns before
-  the last bridge restart, a turn that failed or was stopped before a reply row existed (the id is also unknown until the first
-  stream chunk), and rows whose reply is outside the page that was read. Only the bridge's own uuid is ever published: no engine run
-  id, idempotency key, row id of another row, session key or internal id.
+  the app session, the next row is an assistant row whose engine run id was linked in this process and which is not older than the
+  user row, **and it is the only user row of that turn**: the row before it is an assistant row or a reset row, or the page starts
+  at it and nothing older can exist (a default page, no `offset`, `hasMore: false`). Two user rows in a row before one reply
+  (a turn that was stopped, then another) get no `runId` at all, because the first turn's reply could still be written after the
+  second row. So there is no `runId` for: rows of any other conversation (WhatsApp), turns started by another client, turns before
+  the last bridge restart, a turn that failed or was stopped before a reply row existed, the turn sent right after a stopped one (its
+  row follows the stopped turn's orphan user row), the first row of a cut page, and rows whose reply is outside the page that was
+  read. Only the bridge's own uuid is ever published: no engine run id, idempotency key, row id of another row, session key or internal id.
+  Lab (stop and re-send): aborting the bridge's request to the chat endpoint (the stop button, the 15-minute timeout) **does stop the
+  engine's run**: its user row stays with no reply, the next turn's user row follows it, and no late reply for the stopped turn was
+  written in 40 s. Two requests to the endpoint at once are **serialized by the engine** (the second user row is written after the
+  first reply). So the sequence user A, user B, reply A was not seen; the strict rule above makes sure a late reply could never
+  hand A's id to B if it happened. The bridge's busy check still looks only at its own turns (it can start a turn right after a stop
+  while the engine winds the stopped one down); that is documented, not changed.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
   - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the

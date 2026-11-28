@@ -33,6 +33,7 @@ let chatMode = "ok"; // ok | limit | boom
 let engineId = null; // the id the fake engine gives the next turn on its stream chunks
 const OWNER_KEY = "agent:main:whatsapp:direct:+966500000001";
 let ownerRows = [];
+let page = null; // { rows, hasMore }: what sessions_history returns for the app session instead of `rows`
 const rpc = [];
 
 const row = (id, role, content, ts, fields = {}) => ({ role, content, timestamp: ts, __openclaw: { id, ...(fields.facts ? { media: fields.facts } : {}) } });
@@ -104,7 +105,7 @@ before(async () => {
       if (req.url === "/tools/invoke") {
         res.writeHead(200, { "content-type": "application/json" });
         const { tool } = JSON.parse(body);
-        if (tool === "sessions_history") { const { args } = JSON.parse(body); return res.end(JSON.stringify({ ok: true, result: { details: { sessionKey: args.sessionKey, hasMore: false, messages: args.sessionKey === OWNER_KEY ? ownerRows : rows } } })); }
+        if (tool === "sessions_history") { const { args } = JSON.parse(body); return res.end(JSON.stringify({ ok: true, result: { details: { sessionKey: args.sessionKey, hasMore: false, messages: args.sessionKey === OWNER_KEY ? ownerRows : page ? page.rows : rows, hasMore: page?.hasMore === true } } })); }
         if (tool === "sessions_list") return res.end(JSON.stringify({ ok: true, result: { details: { sessions: [{ key: APP_SESSION_KEY }, { key: OWNER_KEY }], hasMore: false } } }));
         return res.end(JSON.stringify({ ok: false }));
       }
@@ -472,24 +473,60 @@ test("history: the user row of a turn /send started carries that turn's runId (v
   const sent = await call("/send", { method: "POST", body: { message: "سؤال" } });
   assert.equal((await waitRun(sent.json.runId)).status, "done");
   engineId = null;
-  rows.push(userRow("msg-run-user-1", 1000), replyRow("msg-run-asst-1", 1001, ENGINE_A));
+  const sep = (n) => replyRow(`msg-run-sep-${n}`, 900 + n); // the reply that ends the previous turn
+  rows.push(sep(1), userRow("msg-run-user-1", 1000), replyRow("msg-run-asst-1", 1001, ENGINE_A));
   // a turn this process did not start (other client, an earlier process): no runId, whatever its reply carries
   rows.push(userRow("msg-run-user-2", 2000), replyRow("msg-run-asst-2", 2001, ENGINE_B));
-  // no reply yet / a user row followed by another user row / a reply older than the row / a reply with no run id
-  rows.push(userRow("msg-run-user-3", 3000), userRow("msg-run-user-4", 3001), replyRow("msg-run-asst-4", 3002, ENGINE_A));
-  rows.push(userRow("msg-run-user-5", 4000), replyRow("msg-run-asst-5", 3999, ENGINE_A));
+  // no reply yet / a reply older than the row / a reply with no run id
+  rows.push(userRow("msg-run-user-3", 3000));
+  rows.push(sep(4), userRow("msg-run-user-5", 4000), replyRow("msg-run-asst-5", 3999, ENGINE_A));
   rows.push(userRow("msg-run-user-6", 5000), replyRow("msg-run-asst-6", 5001));
   const h = await hist();
   const ids = runIdsOf(h);
   assert.equal(ids["msg-run-user-1"], sent.json.runId);
   assert.match(sent.json.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   for (const id of ["msg-run-user-2", "msg-run-user-3", "msg-run-user-5", "msg-run-user-6"]) assert.equal(ids[id], undefined, id);
-  assert.equal(ids["msg-run-user-4"], sent.json.runId, "the user row right before the reply is the turn's own (user-3 had no reply of its own)");
   for (const m of h.messages.filter((x) => x.role === "assistant")) assert.ok(!("runId" in m), "assistant rows carry no runId");
-  for (const m of h.messages.filter((x) => x.id !== "msg-run-user-1" && x.id !== "msg-run-user-4")) assert.ok(!("runId" in m), m.id);
+  for (const m of h.messages.filter((x) => x.id !== "msg-run-user-1")) assert.ok(!("runId" in m), m.id);
   // no engine id, internal idempotency key or other id in the public JSON
   const text = JSON.stringify(h);
   for (const secret of [ENGINE_A, ENGINE_B, "chatcmpl_", "internal-", ":user", "idempotency"]) assert.ok(!text.includes(secret), `leaked: ${secret}`);
+});
+
+test("history: two user rows before one reply are ambiguous (a stopped turn, then another): neither gets a runId, whatever the engine does with the first", async () => {
+  engineId = "chatcmpl_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const sent = await call("/send", { method: "POST", body: { message: "الثانية" } });
+  assert.equal((await waitRun(sent.json.runId)).status, "done");
+  engineId = null;
+  // turn A was stopped (user row, no reply); turn B was sent at once; the engine may still be finishing A when B's reply is written
+  rows.push(replyRow("msg-stop-sep-01", 7000), userRow("msg-stop-userA", 7001), userRow("msg-stop-userB", 7002), replyRow("msg-stop-reply", 7003, "chatcmpl_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+  let ids = runIdsOf(await hist());
+  assert.equal(ids["msg-stop-userA"], undefined); assert.equal(ids["msg-stop-userB"], undefined);
+  // the engine finishing A while B waits: A's reply, then B's user row, then B's reply: B is alone before its reply again
+  rows.push(userRow("msg-stop-userC", 7004), replyRow("msg-stop-reply2", 7005, "chatcmpl_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+  ids = runIdsOf(await hist());
+  assert.equal(ids["msg-stop-userC"], sent.json.runId, "alone between the previous reply and its own: still exact");
+  // userA, userB, replyA (the engine kept running A): B must not get A's id
+  rows.push(userRow("msg-stop-userD", 7006), userRow("msg-stop-userE", 7007), replyRow("msg-stop-reply3", 7008, "chatcmpl_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+  ids = runIdsOf(await hist());
+  assert.equal(ids["msg-stop-userD"], undefined); assert.equal(ids["msg-stop-userE"], undefined);
+});
+
+test("history: at the start of a page a user row is assigned only when nothing older can exist", async () => {
+  engineId = "chatcmpl_12121212-3434-4565-8787-989898989898";
+  const sent = await call("/send", { method: "POST", body: { message: "حافة" } });
+  assert.equal((await waitRun(sent.json.runId)).status, "done");
+  engineId = null;
+  const turn = [userRow("msg-edge-user", 8000), replyRow("msg-edge-reply", 8001, "chatcmpl_12121212-3434-4565-8787-989898989898")];
+  try {
+    page = { rows: turn, hasMore: true }; // the page is cut: an older user row may sit just before
+    assert.equal(runIdsOf(await hist())["msg-edge-user"], undefined);
+    page = { rows: turn, hasMore: false }; // the whole conversation
+    assert.equal(runIdsOf(await hist())["msg-edge-user"], sent.json.runId);
+    assert.equal(runIdsOf((await call("/history?limit=10&offset=0")).json)["msg-edge-user"], undefined, "an offset page: the newest rows are not on it");
+    page = { rows: [userRow("msg-edge-a", 8100), ...turn.map((m) => ({ ...m, timestamp: m.timestamp + 200 }))], hasMore: false };
+    assert.equal(runIdsOf(await hist())["msg-edge-user"], undefined, "two user rows from the start of the page");
+  } finally { page = null; }
 });
 
 test("history: a conversation other than the app session never carries a runId, even if its reply carries an id this process linked", async () => {
