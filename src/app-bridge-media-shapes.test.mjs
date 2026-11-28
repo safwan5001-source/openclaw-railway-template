@@ -430,3 +430,28 @@ test("publicMedia publishes an allowlisted mime or null, whatever the item carri
   assert.equal(publicMedia({ ...base, mime: "text/html" }, true).mime, null);
   assert.equal(publicMedia({ ...base, mime: "image/png" }, true).mime, "image/png");
 });
+
+// Codex P2: a named pipe with an allowlisted name in the workspace must never block the open (the listing check is synchronous, so a
+// blocking open would freeze the whole wrapper until some process opened the other end of the pipe).
+test("a FIFO with an allowlisted name is refused at once, by the listing check and by serving", async (t) => {
+  const { execFileSync } = await import("node:child_process");
+  const fifoDir = fs.mkdtempSync(path.join(os.tmpdir(), "app-bridge-fifo-"));
+  const fifo = path.join(fifoDir, "result.txt");
+  try { execFileSync("mkfifo", [fifo]); } catch { t.skip("mkfifo is not available here"); fs.rmSync(fifoDir, { recursive: true, force: true }); return; }
+  try {
+    const roots = mediaRoots(fifoDir, null);
+    const ctx = { workspaceDir: fifoDir, stateDir: null, roots };
+    // run in a child process so that a regression (a blocking open) fails by timeout instead of hanging this test process
+    const script = `import("${new URL("./app-bridge-media.js", import.meta.url).href}").then(async (m) => {
+      const roots = m.mediaRoots(${JSON.stringify(fifoDir)}, null);
+      const ctx = { workspaceDir: ${JSON.stringify(fifoDir)}, stateDir: null, roots };
+      const a = m.checkMediaFile("result.txt", ctx);
+      const b = await m.openMediaFile("result.txt", ctx);
+      console.log(JSON.stringify({ ok: a.ok, err: b.error ?? null }));
+      process.exit(0);
+    });`;
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], { timeout: 5000 }).toString().trim();
+    assert.deepEqual(JSON.parse(out), { ok: false, err: "unavailable" });
+    void ctx;
+  } finally { fs.rmSync(fifoDir, { recursive: true, force: true }); }
+});

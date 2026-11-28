@@ -416,6 +416,11 @@ export function resolveSource(src, { workspaceDir, stateDir }) {
  * else the recorded inline-viewable image type `hint`), it is not larger than MAX_MEDIA_BYTES and its first bytes match the type.
  * Else {error: "unavailable" | "too_large" | "unsupported"}. `checkMediaFile` applies exactly the same rules without keeping it open.
  */
+// Read-only, never follow a final symlink, and NEVER wait for a writer: a named pipe (FIFO) with an allowlisted name would otherwise
+// block the open() (the whole event loop for the synchronous listing check) until some process opens its other end. With O_NONBLOCK the
+// open returns at once and the regular-file check that follows refuses it.
+const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
 export async function openMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
   const abs = resolveSource(src, { workspaceDir, stateDir });
   if (!abs) return { error: "unavailable" };
@@ -426,7 +431,7 @@ export async function openMediaFile(src, { workspaceDir, stateDir, roots, hint }
   if (!t) return { error: "unsupported" };
   let fh;
   try {
-    fh = await fs.promises.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    fh = await fs.promises.open(real, OPEN_FLAGS);
     const st = await fh.stat();
     if (!st.isFile()) { await fh.close(); return { error: "unavailable" }; }
     if (st.size > MAX_MEDIA_BYTES) { await fh.close(); return { error: "too_large" }; }
@@ -450,7 +455,7 @@ export function checkMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
     if (!rootList(roots).some((r) => real.startsWith(r + path.sep))) return { ok: false };
     const t = fileType(real, hint);
     if (!t) return { ok: false };
-    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    fd = fs.openSync(real, OPEN_FLAGS);
     const st = fs.fstatSync(fd);
     if (!st.isFile() || st.size > MAX_MEDIA_BYTES) return { ok: false };
     const head = Buffer.alloc(Math.min(4096, st.size));
