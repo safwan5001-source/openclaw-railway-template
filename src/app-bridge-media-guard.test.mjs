@@ -10,7 +10,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { APP_SESSION_KEY, createAppBridge } from "./app-bridge.js";
-import { MAX_MEDIA_BYTES, MEDIA_TYPES, PROTECTED_DIRS, PROTECTED_FILES, PROTECTED_WORDS, checkMediaFile, extractMedia, isProtectedRelPath, mediaRoots, openMediaFile } from "./app-bridge-media.js";
+import { MAX_MEDIA_BYTES, MEDIA_TYPES, PROTECTED_DIRS, PROTECTED_FILES, PROTECTED_STEMS, PROTECTED_WORDS, SECRET_SCAN_BYTES, _testHooks, checkMediaFile, cleanLiveText, extractMedia, isProtectedRelPath, mediaRoots, openMediaFile, splitAttachedMarkers, splitMediaLines } from "./app-bridge-media.js";
 
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
 const GW_TOKEN = "synthetic-gateway-token-0123456789abcdef";
@@ -106,8 +106,10 @@ test("pin: the type allowlist (extension -> content type, inline-viewable) is ex
 
 test("pin: the protected-path lists", () => {
   assert.deepEqual([...PROTECTED_DIRS], ["memory", "memories", "dreams", "dreaming", "credentials", "secrets", "auth", "backups", "node_modules", ".openclaw"]);
-  assert.deepEqual([...PROTECTED_FILES], ["memory.md", "soul.md", "user.md", "identity.md", "agents.md", "tools.md", "heartbeat.md", "bootstrap.md", "dreams.md",
+  assert.deepEqual([...PROTECTED_FILES], ["memory.md", "soul.md", "user.md", "identity.md", "agents.md", "tools.md", "heartbeat.md", "bootstrap.md", "boot.md", "dreams.md",
     "openclaw.json", "auth.json", "auth-profiles.json", "credentials.json", "secrets.json", "config.json", "settings.json"]);
+  assert.deepEqual([...PROTECTED_STEMS], ["env", "dotenv", "cookies", "wallet", "keys", "session", "id_rsa", "id_ed25519", "passwd"]);
+  assert.equal(SECRET_SCAN_BYTES, 64 * 1024);
   assert.deepEqual([...PROTECTED_WORDS], ["secret", "secrets", "credential", "credentials", "token", "tokens", "password", "passwords", "apikey", "api-key", "api_key",
     "privatekey", "private-key", "private_key", "auth-profile", "auth-profiles"]);
 });
@@ -168,8 +170,9 @@ test("protected files are refused by listing AND serving, however the reference 
 });
 
 test("isProtectedRelPath: segments, names and whole words", () => {
-  for (const p of ["a/.b", ".a", "MEMORY.MD", "x/Memory/y.md", "a/AUTH/b.txt", "api-key.txt", "x_token_y.json", "TOKEN.md", "my token.md", "Credentials.JSON", "private_key.pem.txt"]) assert.equal(isProtectedRelPath(p), true, p);
-  for (const p of ["tokenizer-notes.md", "secretary.md", "mytoken.json", "passwordless.txt", "authors.md", "memory-store/x.md", "memoryless.md", "usermanual.md", "a/b.png", "out/report-2026.json"]) assert.equal(isProtectedRelPath(p), false, p);
+  for (const p of ["a/.b", ".a", "MEMORY.MD", "x/Memory/y.md", "a/AUTH/b.txt", "api-key.txt", "x_token_y.json", "TOKEN.md", "my token.md", "Credentials.JSON", "private_key.pem.txt", "MEMORY.md.txt", "memory.md.bak.txt", "x.soul.md.old", "boot.md", "env.txt", "ID_RSA.md", "id_ed25519.pub.txt", "Session.JSON", "wallet.json", "keys.csv", "cookies.txt", "passwd.txt",
+    "accesstoken.txt", "accessToken.json", "gatewaytoken.txt", "apiKey.json", "MyToken.json", "mytoken.json", "db-secret1.txt"]) assert.equal(isProtectedRelPath(p), true, p);
+  for (const p of ["tokenizer-notes.md", "secretary.md", "passwordless.txt", "authors.md", "memory-store/x.md", "memoryless.md", "usermanual.md", "a/b.png", "out/report-2026.json"]) assert.equal(isProtectedRelPath(p), false, p);
   assert.equal(isProtectedRelPath(""), true);
 });
 
@@ -216,4 +219,153 @@ test("an assistant reply that names protected files gets entries marked unavaila
     await r.arrayBuffer();
   }
   assert.ok(!JSON.stringify(h).includes(ws), "no path in the public JSON");
+});
+
+// ------------------------------------------------------------------ review round -------------------------------------------------------
+
+/** A layout of the engine's folders under a fresh temp dir: { ws, state }, with the same sample files everywhere. */
+function layout(name, wsRel, stateRel) {
+  const root = path.join(base, name);
+  const ws = path.join(root, wsRel); const state = path.join(root, stateRel);
+  const lw = (p, d) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, d); };
+  fs.mkdirSync(ws, { recursive: true }); fs.mkdirSync(path.join(state, "media", "inbound"), { recursive: true });
+  const real = { ws: fs.realpathSync(ws), state: fs.realpathSync(state) };
+  const stateFiles = ["identity/device-auth.json", "devices/paired.json", "devices/pending.json", "nodes/paired.json", "agents/main/agent/models.json", "agents/main/sessions/sessions.json",
+    "cron/jobs.json", "exec-approvals.json", "subagents/runs.json", "telegram/update-offset-default.json", "update-check.json", "app-bridge/reset-ledger.json", "gateway.json", "logs/audit.txt"];
+  for (const f of stateFiles) lw(path.join(real.state, f), f.endsWith(".txt") ? "log line\n" : '{"x":1}');
+  lw(path.join(real.state, "media", "inbound", "up---1.png"), PNG); lw(path.join(real.state, "media", "outbound", "gen.png"), PNG); lw(path.join(real.state, "media", "tool-speech-synthesis", "voice---1.mp3"), MP3);
+  lw(path.join(real.ws, "report.md"), TEXT); lw(path.join(real.ws, "out", "chart.png"), PNG);
+  return { ...real, ctx: { workspaceDir: real.ws, stateDir: real.state, roots: mediaRoots(real.ws, real.state) }, stateFiles };
+}
+const servedIn = async (ctxx, src, hint) => {
+  const o = await openMediaFile(src, { ...ctxx, hint }); const c = checkMediaFile(src, { ...ctxx, hint }); await o.fh?.close();
+  assert.equal(c.ok, !o.error, `listing and serving disagree for ${src}`);
+  return !o.error;
+};
+
+test("the state dir is never served, except <stateDir>/media: workspace == state, workspace above the state, production and default layouts", async () => {
+  const layouts = [
+    ["same", layout("L-same", "state", "state"), "state"],                      // OPENCLAW_WORKSPACE_DIR == OPENCLAW_STATE_DIR
+    ["parent", layout("L-parent", ".", "state"), "parent"],                       // the workspace is the parent of a non-hidden state dir (/data + /data/state)
+    ["production", layout("L-prod", "workspace", ".openclaw"), "production"],    // /data/workspace + /data/.openclaw
+    ["default", layout("L-default", ".openclaw/workspace", ".openclaw"), "default"], // the workspace lives below the state dir
+  ];
+  for (const [name, L] of layouts) {
+    for (const f of L.stateFiles) {
+      assert.equal(await servedIn(L.ctx, path.join(L.state, f)), false, `${name}: absolute ${f}`);
+      assert.equal(await servedIn(L.ctx, path.relative(L.ws, path.join(L.state, f))), false, `${name}: relative ${f}`);
+    }
+    for (const f of ["up---1.png", "outbound/gen.png", "tool-speech-synthesis/voice---1.mp3"]) {
+      const p = f.startsWith("up") ? path.join(L.state, "media", "inbound", f) : path.join(L.state, "media", f);
+      assert.equal(await servedIn(L.ctx, p), true, `${name}: media ${f}`);
+    }
+    assert.equal(await servedIn(L.ctx, "media://inbound/up---1.png"), true, `${name}: media://inbound`);
+    if (name !== "same") { // in `same` the "workspace" IS the state dir: only its media folder is a download
+      assert.equal(await servedIn(L.ctx, path.join(L.ws, "report.md")), true, `${name}: workspace file`);
+      assert.equal(await servedIn(L.ctx, path.join(L.ws, "out", "chart.png")), true, `${name}: workspace subdir`);
+    }
+  }
+  // a symlink out of the workspace into the state dir (and the other way) is judged by its real path
+  const P = layouts[2][1]; fs.symlinkSync(path.join(P.state, "cron"), path.join(P.ws, "c")); fs.symlinkSync(path.join(P.state, "media"), path.join(P.ws, "m"));
+  assert.equal(await servedIn(P.ctx, "c/jobs.json"), false);
+  assert.equal(await servedIn(P.ctx, "m/outbound/gen.png"), true, "a link INTO the media store is that media file by its real path");
+});
+
+test("TOCTOU: a directory swapped for a symlink between the check and the open is caught by judging the opened file", async () => {
+  const L = layout("L-race", "workspace", ".openclaw");
+  const agent = path.join(L.state, "agents", "main", "agent");
+  fs.mkdirSync(path.join(L.ws, "memory"), { recursive: true }); fs.writeFileSync(path.join(L.ws, "memory", "report.md"), "PRIVATE DAILY MEMORY\n");
+  const attempts = [["models.json", agent, '{"providers":{"x":{"note":"harmless"}}}'], ["report.md", path.join(L.ws, "memory"), "innocent\n"], ["notes.md", L.state, "x"]];
+  try {
+    for (const [name, target, innocent] of attempts) {
+      for (const mode of ["open", "check"]) {
+        fs.rmSync(path.join(L.ws, "d"), { recursive: true, force: true }); fs.mkdirSync(path.join(L.ws, "d"));
+        fs.writeFileSync(path.join(L.ws, "d", name), innocent);
+        fs.writeFileSync(path.join(target, name), "REAL PRIVATE CONTENT\n");
+        let swapped = 0;
+        _testHooks.afterRealpath = () => { swapped++; fs.rmSync(path.join(L.ws, "d"), { recursive: true }); fs.symlinkSync(target, path.join(L.ws, "d")); };
+        const src = `d/${name}`;
+        if (mode === "open") { const o = await openMediaFile(src, L.ctx); assert.equal(o.fh, undefined, `${name}: served after the swap`); assert.equal(o.error, "unavailable"); await o.fh?.close(); }
+        else assert.equal(checkMediaFile(src, L.ctx).ok, false, `${name}: listed after the swap`);
+        assert.equal(swapped, 1, "the race hook ran between the realpath and the open");
+        _testHooks.afterRealpath = null;
+        assert.equal(await servedIn(L.ctx, src), false, "and the swapped path stays refused afterwards");
+      }
+    }
+    // no swap: the same names in a plain directory are served
+    fs.rmSync(path.join(L.ws, "d"), { recursive: true, force: true }); fs.mkdirSync(path.join(L.ws, "d")); fs.writeFileSync(path.join(L.ws, "d", "ok.md"), "fine\n");
+    assert.equal(await servedIn(L.ctx, "d/ok.md"), true);
+  } finally { _testHooks.afterRealpath = null; }
+});
+
+test("deny-list gaps: boot.md, env-like names, key/cookie/wallet/session names, every dot-separated part, joined and camelCase words", async () => {
+  const L = layout("L-gaps", "workspace", ".openclaw");
+  const wr = (n, d) => { const f = path.join(L.ws, n); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, d); };
+  const refused = { "BOOT.md": TEXT, "notes/Soul.Md": TEXT, "MEMORY.md.txt": TEXT, "memory.md.bak.txt": TEXT, "USER.MD.old.txt": TEXT, "env.txt": TEXT, "dotenv.txt": TEXT, "id_rsa.md": TEXT, "id_ed25519.txt": TEXT,
+    "wallet.json": "{}", "session.json": "{}", "cookies.txt": TEXT, "keys.json": "{}", "passwd.txt": TEXT, "gateway-token.txt": TEXT, "gatewaytoken.txt": TEXT, "accesstoken.txt": TEXT,
+    "accessToken.json": "{}", "apiKey.json": "{}", "MyToken.json": "{}", "db_password.txt": TEXT };
+  for (const [n, d] of Object.entries(refused)) wr(n, d);
+  const allowed = { "tokenizer-notes.md": TEXT, "secretary.md": TEXT, "passwordless.txt": TEXT, "environment.txt": TEXT, "keyboard.md": TEXT, "sessions-overview.md": TEXT, "walletless.txt": TEXT, "monkeys.txt": TEXT };
+  for (const [n, d] of Object.entries(allowed)) wr(n, d);
+  for (const n of Object.keys(refused)) assert.equal(await servedIn(L.ctx, n), false, n);
+  for (const n of Object.keys(allowed)) assert.equal(await servedIn(L.ctx, n), true, n);
+});
+
+test("content: KEY=VALUE secrets, escaped hyphens, and a head of 64 KiB, the same for listing and serving; ordinary text passes", async () => {
+  const L = layout("L-content", "workspace", ".openclaw");
+  const wr = (n, d) => { const f = path.join(L.ws, n); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, d); };
+  const secret = { "kv1.txt": "OPENCLAW_GATEWAY_TOKEN=4f1c2e9a7b3d8e6f0a1b2c3d4e5f6071\n", "kv2.md": "TELEGRAM_BOT_TOKEN: 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5\n", "kv3.csv": "name,v\nSETUP_PASSWORD=hunter2hunter2hunter2\n",
+    "kv4.json": '{"apiKey":"or-v1-0123456789abcdef0123456789abcdef"}', "kv5.txt": "db_passwd = 0123456789abcdef0123", "kv6.txt": "my.api-key: 0123456789abcdef0123456789", "kv7.txt": "client_secret=\"0123456789abcdef0123\"",
+    "jsonesc.json": JSON.stringify({ k: `sk-ant-api03-${"C".repeat(40)}` }).replace("sk-", "sk\\u002d"), "esc2.txt": `sk\\-ant-api03-${"D".repeat(40)}`,
+    "late-60k.md": `${"x".repeat(60000)}\nsk-ant-api03-${"A".repeat(60)}\n`, "late-5k.md": `${"x".repeat(5000)}\nsk-ant-api03-${"A".repeat(60)}\n`, "late-4100.json": JSON.stringify({ pad: "y".repeat(4100), key: `sk-proj-${"B".repeat(48)}` }) };
+  for (const [n, d] of Object.entries(secret)) wr(n, d);
+  const fine = { "p1.txt": "The token: please ask the owner\npassword policy: change it often\nsecret: none\n", "p2.md": `${"lorem ipsum dolor ".repeat(4000)}\nkey=short\n`, "p3.json": '{"tokens_used": 12345, "token": "abc", "name": "x"}',
+    "p4.txt": "task-force-alpha-bravo-charlie-delta-echo-foxtrot sk-learn is a library", "p5.csv": "id,secretary\n1,Ann\n" };
+  for (const [n, d] of Object.entries(fine)) wr(n, d);
+  wr("beyond.md", `${"x".repeat(SECRET_SCAN_BYTES + 100)}\nsk-ant-api03-${"A".repeat(60)}\n`); // best effort: past the head it is not seen
+  for (const n of Object.keys(secret)) assert.equal(await servedIn(L.ctx, n), false, n);
+  for (const n of Object.keys(fine)) assert.equal(await servedIn(L.ctx, n), true, n);
+  assert.equal(await servedIn(L.ctx, "beyond.md"), true, "documented limit: only the first 64 KiB is looked at");
+});
+
+test("owner uploads keep their file names: only the secret-word rule is skipped under <stateDir>/media/inbound", async () => {
+  const L = layout("L-inbound", "workspace", ".openclaw");
+  const inb = path.join(L.state, "media", "inbound");
+  for (const [n, d] of [["my-password-screen---3f2a.png", PNG], ["token-photo---1.jpg", JPEG], ["secret-santa---2.pdf", PDF], ["keys.json", "{}"], ["MEMORY.md", TEXT], ["session.json", "{}"], [".hidden---1.png", PNG], ["cfg---3.txt", `SETUP_PASSWORD=hunter2hunter2hunter2`]]) fs.writeFileSync(path.join(inb, n), d);
+  for (const n of ["my-password-screen---3f2a.png", "token-photo---1.jpg", "secret-santa---2.pdf"]) assert.equal(await servedIn(L.ctx, `media://inbound/${n}`), true, n);
+  for (const n of ["keys.json", "MEMORY.md", "session.json", ".hidden---1.png", "cfg---3.txt"]) assert.equal(await servedIn(L.ctx, `media://inbound/${n}`), false, n);
+  // the same names anywhere else are still refused by the word rule
+  fs.mkdirSync(path.join(L.state, "media", "outbound"), { recursive: true });
+  fs.writeFileSync(path.join(L.state, "media", "outbound", "my-password-screen.png"), PNG); fs.writeFileSync(path.join(L.ws, "my-password-screen.png"), PNG);
+  assert.equal(await servedIn(L.ctx, path.join(L.state, "media", "outbound", "my-password-screen.png")), false);
+  assert.equal(await servedIn(L.ctx, "my-password-screen.png"), false);
+});
+
+test("known false positives are refused on purpose (documented): the guard is a deny-list", async () => {
+  const L = layout("L-fp", "workspace", ".openclaw");
+  const wr = (n, d) => { const f = path.join(L.ws, n); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, d); };
+  const names = { "design-tokens.json": "{}", "password-policy.pdf": PDF, "secret-santa.xlsx": ZIP, "backups/q3-report.pdf": PDF, "clients/auth/letter.pdf": PDF, "Memory/photo.png": PNG, "agents.md": TEXT, "tools.md": TEXT,
+    "user.md": TEXT, "config.json": "{}", "reports/.cache/chart.png": PNG, "exports/customer-credentials-checklist.pdf": PDF,
+    "api-guide.md": "# API\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdEFGH\n", "howto.md": `set OPENAI_API_KEY=sk-${"x".repeat(40)}\n` };
+  for (const [n, d] of Object.entries(names)) { wr(n, d); assert.equal(await servedIn(L.ctx, n), false, n); }
+});
+
+// ------------------------------------------------------------------ linear time ---------------------------------------------------------
+
+test("no input makes the marker, MEDIA: line or secret scans slow", async () => {
+  const t = (label, fn, ms) => { const t0 = Date.now(); fn(); const d = Date.now() - t0; assert.ok(d < ms, `${label}: ${d} ms`); };
+  t("1 MB of unclosed marker headers", () => splitAttachedMarkers("[media attached: ".repeat(60000)), 150);
+  t("unclosed headers through the live text", () => cleanLiveText("[media attached: x \"".repeat(50000), { streaming: true }), 250);
+  t("a header per line, no bracket", () => splitAttachedMarkers("[media attached: a\n".repeat(50000)), 250);
+  t("MEDIA: line, 60k spaces", () => splitMediaLines(`MEDIA:a${" ".repeat(60000)}b`), 100);
+  t("MEDIA: line, 60k spaces, live text", () => cleanLiveText(`MEDIA:a${" ".repeat(60000)}b`, { streaming: true }), 100);
+  // the MEDIA: rule itself is unchanged
+  assert.deepEqual(splitMediaLines("a\nMEDIA:/x/a.png\n   MEDIA: \"./b c.pdf\"\n    MEDIA:/code.png\nMEDIA:\nMEDIA:a\rb").sources, ["/x/a.png", "./b c.pdf"]);
+  const L = layout("L-time", "workspace", ".openclaw");
+  const hostile = { "a.txt": "a".repeat(SECRET_SCAN_BYTES), "b.txt": "token=".repeat(10000), "c.txt": "sk-".repeat(20000), "d.txt": "-----BEGIN ".repeat(5000), "e.txt": `Bearer${" ".repeat(60000)}x`,
+    "f.txt": "tokentokentoken".repeat(4000), "g.txt": ":".repeat(SECRET_SCAN_BYTES), "h.txt": "password".repeat(8000), "i.txt": `${"=".repeat(30000)}token${"0".repeat(30000)}` };
+  for (const [n, d] of Object.entries(hostile)) fs.writeFileSync(path.join(L.ws, n), d);
+  const t0 = Date.now();
+  for (const n of Object.keys(hostile)) { const o = await openMediaFile(n, L.ctx); await o.fh?.close(); checkMediaFile(n, L.ctx); }
+  assert.ok(Date.now() - t0 < 1500, `secret scans took ${Date.now() - t0} ms`);
 });

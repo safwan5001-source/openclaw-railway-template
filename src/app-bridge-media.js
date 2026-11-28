@@ -109,7 +109,10 @@ export function splitMediaLines(text) {
   for (const line of String(text ?? "").split("\n")) {
     const f = FENCE.exec(line);
     if (f) { fence = fence === null ? f[1] : fence === f[1] ? null : fence; keep.push(line); continue; }
-    const m = fence === null && /^ {0,3}MEDIA:\s*(.+?)\s*$/.exec(line);
+    // `<= 3 leading spaces, MEDIA:, then the rest of the line trimmed` (no pattern with two open-ended parts: linear on any line)
+    const head = fence === null ? /^ {0,3}MEDIA:/.exec(line) : null;
+    const rest = head ? line.slice(head[0].length).trim() : "";
+    const m = head && rest !== "" && !/[\r\u2028\u2029]/.test(rest) ? [line, rest] : null;
     if (m) {
       let src = m[1];
       if (src.length > 1 && src.startsWith('"') && src.endsWith('"')) src = src.slice(1, -1);
@@ -130,20 +133,22 @@ const MARKER_BODY_MAX = 2048;
  * when something else wrote it) and be long. The name starts at the first ` "` before the first `]`, and ends at the first
  * unescaped `"` that is directly followed by `]`; without such a pair the marker ends at the first `]`. One bounded pass.
  */
-function markerEnd(t, b) {
-  const win = t.slice(b, b + MARKER_WINDOW);
-  const nl = win.indexOf("\n");
-  const seg = nl < 0 ? win : win.slice(0, nl);
-  const first = seg.indexOf("]");
+function markerEnd(t, b, next) {
+  // the first `]` and the first line end after the header, found once per stretch of text (see splitAttachedMarkers): a header with no
+  // `]` in its line or in reach costs nothing, so a long run of unclosed headers is linear
+  const first = next.bracket(b);
+  const nl = next.newline(b);
+  if (first < 0 || first - b > MARKER_WINDOW || (nl >= 0 && nl < first)) return null;
+  const seg = t.slice(b, nl >= 0 ? Math.min(nl, b + MARKER_WINDOW) : b + MARKER_WINDOW);
   const q = seg.indexOf(' "');
-  if (q >= 0 && (first < 0 || q < first)) {
+  if (q >= 0 && q < first - b) {
     for (let i = q + 2; i < seg.length; i++) {
       const c = seg.charCodeAt(i);
       if (c === 92) { i++; continue; } // backslash escape
       if (c === 34 && seg.charCodeAt(i + 1) === 93) return q >= 1 && q <= MARKER_BODY_MAX ? { body: seg.slice(0, q), next: b + i + 2 } : null;
     }
   }
-  return first >= 1 && first <= MARKER_BODY_MAX ? { body: seg.slice(0, first), next: b + first + 1 } : null;
+  return first - b >= 1 && first - b <= MARKER_BODY_MAX ? { body: seg.slice(0, first - b), next: first + 1 } : null;
 }
 
 /**
@@ -172,12 +177,16 @@ export function splitAttachedMarkers(text) {
   const sources = [];
   let out = "";
   let pos = 0;
+  // next `]` / next newline at or after an index, each searched again only once the previous answer lies behind the index
+  const cache = { "]": -2, "\n": -2 };
+  const find = (ch) => (from) => { if (cache[ch] !== -1 && cache[ch] < from) cache[ch] = t.indexOf(ch, from); return cache[ch]; };
+  const next = { bracket: find("]"), newline: find("\n") };
   for (;;) {
     const i = t.indexOf("[media attached", pos);
     if (i < 0) break;
     MARKER_HEADER.lastIndex = i;
     const h = MARKER_HEADER.exec(t);
-    const end = h ? markerEnd(t, i + h[0].length) : null;
+    const end = h ? markerEnd(t, i + h[0].length, next) : null;
     if (!end) { out += t.slice(pos, i + 1); pos = i + 1; continue; } // not a marker: keep it
     out += t.slice(pos, i);
     sources.push(attachedSource(end.body));
@@ -431,21 +440,25 @@ export function resolveSource(src, { workspaceDir, stateDir }) {
 // What the app can download is "a file inside an engine-owned root with an allowlisted type" (docs: "What the app can download"). That
 // alone would let a reply steered by prompt injection name `MEDIA:MEMORY.md` or a credentials `.json`. This is the INITIAL guard against
 // that, one shared place for BOTH listing (checkMediaFile) and serving (openMediaFile). It is evaluated on the REAL path (after
-// realpath: a symlink or a case trick cannot hide a protected file) relative to the root the file is under (the root's own location,
-// e.g. a state dir named `.openclaw`, is not looked at). A refused file is simply "unavailable": the app is never told why.
-// It is a deny-list on purpose and NOT a substitute for the allow-listed outbox (Batch 7); hard links are out of scope (a hard link is
-// a second name for the same bytes: realpath cannot tell). The lists are constants, not configuration.
+// realpath: a symlink or a case trick cannot hide a protected file) relative to the deepest root the file is under (the root's own
+// location, e.g. a state dir named `.openclaw`, is not looked at), and AGAIN on the real path of the opened file (a directory swapped for
+// a symlink between the check and the open is caught). A refused file is simply "unavailable": the app is never told why.
+// It is a deny-list on purpose and NOT a substitute for the allow-listed outbox (Batch 7): hard links and a copy of a protected file
+// under a new name are out of scope. The lists are constants, not configuration.
 /** Directory names (case-insensitive, any depth below the root) whose files are never served. */
 export const PROTECTED_DIRS = Object.freeze(["memory", "memories", "dreams", "dreaming", "credentials", "secrets", "auth", "backups", "node_modules", ".openclaw"]);
-/** File names (case-insensitive) that are never served, wherever they are. */
-export const PROTECTED_FILES = Object.freeze(["memory.md", "soul.md", "user.md", "identity.md", "agents.md", "tools.md", "heartbeat.md", "bootstrap.md", "dreams.md",
+/** File names (case-insensitive) that are never served, wherever they are; also matched against every dot-separated run of the name (`MEMORY.md.txt`). */
+export const PROTECTED_FILES = Object.freeze(["memory.md", "soul.md", "user.md", "identity.md", "agents.md", "tools.md", "heartbeat.md", "bootstrap.md", "boot.md", "dreams.md",
   "openclaw.json", "auth.json", "auth-profiles.json", "credentials.json", "secrets.json", "config.json", "settings.json"]);
-/** Words that make a file name sensitive when they stand between separators or at its ends (`my-token.json`, not `tokenizer-notes.md`). */
+/** Name parts (case-insensitive, any extension: `session.json`, `id_rsa.md`) that are never served. */
+export const PROTECTED_STEMS = Object.freeze(["env", "dotenv", "cookies", "wallet", "keys", "session", "id_rsa", "id_ed25519", "passwd"]);
+/** Words that make a file name sensitive when the name ENDS in them or they are followed by a separator or digit (`my-token.json`, `accessToken.json`, not `tokenizer-notes.md`). */
 export const PROTECTED_WORDS = Object.freeze(["secret", "secrets", "credential", "credentials", "token", "tokens", "password", "passwords", "apikey", "api-key", "api_key",
   "privatekey", "private-key", "private_key", "auth-profile", "auth-profiles"]);
-const PROTECTED_WORD_RE = new RegExp(`(?:^|[^a-z0-9])(?:${[...PROTECTED_WORDS].sort((a, b) => b.length - a.length).map((w) => w.replace(/[-_]/g, "[-_]")).join("|")})(?:[^a-z0-9]|$)`);
-/** Types whose first bytes are also looked at for a secret (best effort: the head only, narrow shapes, so ordinary documents pass). */
+const PROTECTED_WORD_RE = new RegExp(`(?:${[...PROTECTED_WORDS].sort((a, b) => b.length - a.length).map((w) => w.replace(/[-_]/g, "[-_]")).join("|")})(?:[^a-z]|$)`);
+/** Types whose head is also looked at for a secret. Best effort: the first 64 KiB only, narrow shapes, so ordinary documents pass. */
 const TEXT_EXTS = new Set([".txt", ".md", ".csv", ".json"]);
+export const SECRET_SCAN_BYTES = 64 * 1024;
 const SECRET_SHAPES = Object.freeze([
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
   /\bsk-ant-[A-Za-z0-9_-]{20,}/,
@@ -456,37 +469,87 @@ const SECRET_SHAPES = Object.freeze([
   /\bxox[abprs]-[A-Za-z0-9-]{20,}/,
   /\bBearer\s+eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/,
 ]);
+// KEY=VALUE / "key": "value" where the key names a secret (OPENCLAW_GATEWAY_TOKEN=…, "apiKey": "…", db_password: …) and the value has 16+
+// characters without spaces or quotes. Looked at around each `=` / `:` (a bounded window each), so the scan stays linear in the head.
+const KEY_BEFORE = /(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_.-]{0,40}["']?\s*$/i;
+const VALUE_AFTER = /^\s*["']?[^\s"']{16,}/;
+function holdsKeyValue(text) {
+  const sep = /[=:]/g;
+  let m;
+  while ((m = sep.exec(text)) !== null) {
+    if (KEY_BEFORE.test(text.slice(Math.max(0, m.index - 64), m.index)) && VALUE_AFTER.test(text.slice(m.index + 1, m.index + 160))) return true;
+  }
+  return false;
+}
 
-/** The root `real` is under, as its real path, or null. */
-const rootOf = (real, roots) => rootList(roots).find((r) => real.startsWith(r + path.sep)) ?? null;
+/** The deepest root `real` is under, as its real path, or null. */
+const rootOf = (real, roots) => {
+  let best = null;
+  for (const r of rootList(roots)) if (real.startsWith(r + path.sep) && (best === null || r.length > best.length)) best = r;
+  return best;
+};
+const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
 
-/** Does the real path of a candidate file hit a path rule? `rel` is its path below the root. */
-export function isProtectedRelPath(rel) {
+/** Does the path of a candidate file, below its root, hit a path rule? `words: false` skips the secret-word rule only (owner uploads keep their own file names). */
+export function isProtectedRelPath(rel, { words = true } = {}) {
   const segs = String(rel).split(/[\\/]+/).filter(Boolean);
   if (!segs.length) return true;
   const lower = segs.map((x) => x.toLowerCase());
   if (lower.some((x) => x.startsWith("."))) return true; // hidden files and directories (.env, .git, .ssh, .openclaw, …)
   if (lower.slice(0, -1).some((x) => PROTECTED_DIRS.includes(x))) return true;
   const base = lower[lower.length - 1];
-  return PROTECTED_FILES.includes(base) || PROTECTED_WORD_RE.test(base);
-}
-
-/** The shared path check: the real path is inside a root and no path rule applies. */
-function pathAllowed(real, roots) {
-  const root = rootOf(real, roots);
-  return root !== null && !isProtectedRelPath(real.slice(root.length + 1));
-}
-
-/** The shared head check, for the text types: no high-confidence secret in the first 4 KiB (best effort, head only). */
-function headHoldsSecret(real, head) {
-  if (!TEXT_EXTS.has(path.extname(real).toLowerCase())) return false;
-  const text = head.toString("latin1");
-  return SECRET_SHAPES.some((re) => re.test(text));
+  const parts = base.split(".");
+  if (parts.some((x) => PROTECTED_STEMS.includes(x))) return true;
+  for (let i = 0; i < parts.length; i++) {
+    for (let n = 1; n <= 3 && i + n <= parts.length; n++) if (PROTECTED_FILES.includes(parts.slice(i, i + n).join("."))) return true; // MEMORY.md.txt, memory.md.bak
+  }
+  return words && PROTECTED_WORD_RE.test(base);
 }
 
 /**
- * The file behind a reference, only if: its real path is a regular file inside one of `roots`, its type is allowlisted (by extension,
- * else the recorded inline-viewable image type `hint`), it is not larger than MAX_MEDIA_BYTES and its first bytes match the type.
+ * The shared path check: the real path is inside a root, is not inside the engine's STATE DIR (its config, credentials, sessions, device
+ * and cron files) unless a root that lies strictly inside the state dir holds it (`<stateDir>/media`, or a workspace kept below it), and no
+ * path rule applies. Evaluated on a real path only.
+ */
+function pathAllowed(real, roots, stateDir) {
+  const root = rootOf(real, roots);
+  if (root === null) return false;
+  const under = (p, r) => p.startsWith(r + path.sep);
+  const state = stateDir ? realOrNull(stateDir) : null;
+  if (state !== null && (real === state || under(real, state)) && !rootList(roots).some((r) => under(r, state) && under(real, r))) return false;
+  const media = state !== null ? realOrNull(path.join(stateDir, "media")) : null;
+  const ownerUpload = media !== null && real.startsWith(path.join(media, "inbound") + path.sep);
+  return !isProtectedRelPath(real.slice(root.length + 1), { words: !ownerUpload });
+}
+
+/** `\uXXXX` and `\-` escapes of a JSON string decoded, so `sk-ant-…` is seen as what it is. */
+const unescapeJsonish = (t) => t.replace(/\\u00([0-7][0-9a-fA-F])/g, (_m, h) => String.fromCharCode(parseInt(h, 16))).replace(/\\-/g, "-");
+/** The shared head check, for the text types: no high-confidence secret in the head (best effort, first SECRET_SCAN_BYTES only). */
+function headHoldsSecret(real, head) {
+  if (!TEXT_EXTS.has(path.extname(real).toLowerCase())) return false;
+  const raw = head.toString("latin1");
+  const text = raw.includes("\\") ? `${raw}\n${unescapeJsonish(raw)}` : raw;
+  return SECRET_SHAPES.some((re) => re.test(text)) || holdsKeyValue(text);
+}
+const headLength = (real, size) => Math.min(TEXT_EXTS.has(path.extname(real).toLowerCase()) ? SECRET_SCAN_BYTES : 4096, size);
+
+/** The real path of an OPEN file (what the descriptor really is, not what its name resolved to a moment ago), or null. */
+function fdRealSync(fd, real) {
+  const viaProc = realOrNull(`/proc/self/fd/${fd}`);
+  if (viaProc !== null) return viaProc;
+  // no /proc: the name must still resolve to the very same file it did
+  try {
+    const now = fs.realpathSync(real); const a = fs.fstatSync(fd); const b = fs.statSync(now);
+    return now === real && a.dev === b.dev && a.ino === b.ino ? now : null;
+  } catch { return null; }
+}
+/** Test seam only: called between the realpath and the open, where a directory could be swapped for a symlink. */
+export const _testHooks = { afterRealpath: null };
+
+/**
+ * The file behind a reference, only if: its real path is a regular file inside one of `roots`, not a protected path, its type is
+ * allowlisted (by extension, else the recorded inline-viewable image type `hint`), it is not larger than MAX_MEDIA_BYTES, its first bytes
+ * match the type, and, once opened, the descriptor's own real path passes the same path rules.
  * Else {error: "unavailable" | "too_large" | "unsupported"}. `checkMediaFile` applies exactly the same rules without keeping it open.
  */
 // Read-only, never follow a final symlink, and NEVER wait for a writer: a named pipe (FIFO) with an allowlisted name would otherwise
@@ -499,20 +562,26 @@ export async function openMediaFile(src, { workspaceDir, stateDir, roots, hint }
   if (!abs) return { error: "unavailable" };
   let real;
   try { real = await fs.promises.realpath(abs); } catch { return { error: "unavailable" }; }
-  if (!pathAllowed(real, roots)) return { error: "unavailable" }; // outside the roots, or a protected path: indistinguishable to the app
+  if (!pathAllowed(real, roots, stateDir)) return { error: "unavailable" }; // outside the roots, or a protected path: indistinguishable to the app
   const t = fileType(real, hint);
   if (!t) return { error: "unsupported" };
   let fh;
   try {
+    await _testHooks.afterRealpath?.(real);
     fh = await fs.promises.open(real, OPEN_FLAGS);
+    // what was opened is judged again by ITS real path: a directory swapped for a symlink after the check would otherwise be followed
+    let opened = null;
+    try { opened = await fs.promises.realpath(`/proc/self/fd/${fh.fd}`); } catch { opened = fdRealSync(fh.fd, real); }
+    const t2 = opened !== null && pathAllowed(opened, roots, stateDir) ? fileType(opened, hint) : null;
+    if (!t2 || t2[0] !== t[0]) { await fh.close(); return { error: "unavailable" }; }
     const st = await fh.stat();
     if (!st.isFile()) { await fh.close(); return { error: "unavailable" }; }
     if (st.size > MAX_MEDIA_BYTES) { await fh.close(); return { error: "too_large" }; }
-    const head = Buffer.alloc(Math.min(4096, st.size));
+    const head = Buffer.alloc(headLength(opened, st.size));
     await fh.read(head, 0, head.length, 0);
     if (!bytesMatch(t[0], head)) { await fh.close(); return { error: "unsupported" }; }
-    if (headHoldsSecret(real, head)) { await fh.close(); return { error: "unavailable" }; }
-    return { fh, size: st.size, mime: t[0], name: path.basename(real).slice(0, 120) };
+    if (headHoldsSecret(opened, head)) { await fh.close(); return { error: "unavailable" }; }
+    return { fh, size: st.size, mime: t[0], name: path.basename(opened).slice(0, 120) };
   } catch {
     await fh?.close().catch(() => {});
     return { error: "unavailable" };
@@ -526,15 +595,19 @@ export function checkMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
   let fd;
   try {
     const real = fs.realpathSync(abs);
-    if (!pathAllowed(real, roots)) return { ok: false };
+    if (!pathAllowed(real, roots, stateDir)) return { ok: false };
     const t = fileType(real, hint);
     if (!t) return { ok: false };
+    _testHooks.afterRealpath?.(real);
     fd = fs.openSync(real, OPEN_FLAGS);
+    const opened = fdRealSync(fd, real);
+    const t2 = opened !== null && pathAllowed(opened, roots, stateDir) ? fileType(opened, hint) : null;
+    if (!t2 || t2[0] !== t[0]) return { ok: false };
     const st = fs.fstatSync(fd);
     if (!st.isFile() || st.size > MAX_MEDIA_BYTES) return { ok: false };
-    const head = Buffer.alloc(Math.min(4096, st.size));
+    const head = Buffer.alloc(headLength(opened, st.size));
     fs.readSync(fd, head, 0, head.length, 0);
-    return bytesMatch(t[0], head) && !headHoldsSecret(real, head) ? { ok: true, size: st.size } : { ok: false };
+    return bytesMatch(t[0], head) && !headHoldsSecret(opened, head) ? { ok: true, size: st.size } : { ok: false };
   } catch { return { ok: false }; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
 }
 

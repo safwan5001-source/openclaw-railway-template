@@ -374,22 +374,35 @@ buffer. Every call is built by the bridge with the app session key or a key that
 - **What the app can download.** `/media` (and the `available` flag of every `media` entry, which applies the very same rules) serves a
   local file only if ALL of these hold; the pieces are in one place (`src/app-bridge-media.js`) and pinned by `src/app-bridge-media-guard.test.mjs`:
   1. **Roots.** Its real path (symlinks resolved, no final symlink followed) is a regular file inside the agent workspace or `<stateDir>/media`. Nothing else.
-  2. **Type.** The extension is on the fixed list (images png/jpg/jpeg/gif/webp/heic/heif, pdf, txt, md, csv, json, docx, xlsx, pptx, mp3, m4a, ogg, wav, mp4), or the id has none and the
+  2. **Not the engine's state.** Whatever the roots, a real path under the state dir (config, device and auth files, sessions, cron, models with provider keys, the bridge's own
+     files) is refused unless it is under `<stateDir>/media` (or under a root that itself lies inside the state dir, as the default layout's `<stateDir>/workspace`).
+     This holds when the workspace is the state dir, or a parent of it.
+  3. **Type.** The extension is on the fixed list (images png/jpg/jpeg/gif/webp/heic/heif, pdf, txt, md, csv, json, docx, xlsx, pptx, mp3, m4a, ogg, wav, mp4), or the id has none and the
      engine recorded an inline-viewable image type for that stored upload; the first bytes match the type; the size is at most 20 MB. SVG, HTML, scripts and everything else are never served.
-  3. **Protected paths (initial guard).** Judged on the real path, below the root it is under (where the root itself lives does not matter), case-insensitively. A file is refused when
-     any path segment starts with `.` (`.env`, `.git`, `.ssh`, `.openclaw`); or any directory is `memory`, `memories`, `dreams`, `dreaming`, `credentials`, `secrets`, `auth`, `backups` or
-     `node_modules`; or its name is `MEMORY.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, `DREAMS.md`, `openclaw.json`, `auth.json`,
-     `auth-profiles.json`, `credentials.json`, `secrets.json`, `config.json` or `settings.json`; or its name contains, between separators or at its ends, `secret(s)`, `credential(s)`,
-     `token(s)`, `password(s)`, `apikey`, `api-key`, `api_key`, `privatekey`, `private-key`, `private_key`, `auth-profile(s)` (`my-token.json` and `db_password.txt` are refused,
-     `tokenizer-notes.md` and `secretary.md` are not). For `.txt .md .csv .json` the first 4 KiB must also hold no private-key header (`-----BEGIN … PRIVATE KEY-----`) and no
-     well-known token shape (`sk-ant-…`, `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `github_pat_`, `AKIA…`, `xox?-…`, `Bearer eyJ….….…`): best effort, head only. A symlink to a protected
-     file or directory is refused (the real path is judged). Hard links are out of scope (realpath cannot tell a second name from the first).
+  4. **Protected paths (initial guard).** Judged on the real path, below the deepest root it is under (where the root itself lives does not matter), case-insensitively, and judged AGAIN on the
+     real path of the file once opened (a directory swapped for a symlink after the check is caught). A file is refused when
+     - any path segment starts with `.` (`.env`, `.git`, `.ssh`, `.openclaw`, `.cache`);
+     - any directory is `memory`, `memories`, `dreams`, `dreaming`, `credentials`, `secrets`, `auth`, `backups` or `node_modules`;
+     - its name, or any run of up to three dot-separated parts of it, is `memory.md`, `soul.md`, `user.md`, `identity.md`, `agents.md`, `tools.md`, `heartbeat.md`, `bootstrap.md`, `boot.md`,
+       `dreams.md`, `openclaw.json`, `auth.json`, `auth-profiles.json`, `credentials.json`, `secrets.json`, `config.json` or `settings.json` (so `MEMORY.md.txt` is caught too);
+     - any dot-separated part of its name is `env`, `dotenv`, `cookies`, `wallet`, `keys`, `session`, `id_rsa`, `id_ed25519` or `passwd` (`session.json`, `id_rsa.md`);
+     - its name ends with, or has followed by a separator or digit, one of `secret(s)`, `credential(s)`, `token(s)`, `password(s)`, `apikey`, `api-key`, `api_key`, `privatekey`, `private-key`,
+       `private_key`, `auth-profile(s)`, in any letter case (`my-token.json`, `db_password.txt`, `accessToken.json`, `gatewaytoken.txt`; `tokenizer-notes.md`, `secretary.md`, `passwordless.txt` pass).
+       This one rule is skipped for files under `<stateDir>/media/inbound/`: the owner's uploads keep their own file names (`my-password-screen---3f2a.png` is served);
+     - for `.txt .md .csv .json` the first **64 KiB** hold a private-key header (`-----BEGIN … PRIVATE KEY-----`), a well-known token shape (`sk-ant-…`, `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
+       `github_pat_`, `AKIA…`, `xox?-…`, `Bearer eyJ….….…`), or a `KEY=VALUE` / `"key": "value"` whose key contains `token`, `secret`, `password`, `passwd` or `api_key` and whose value has 16+
+       characters without spaces. `\u002d` and `\-` escapes are decoded first. Best effort, head only, linear time: a secret further into a file, or in a binary type (pdf, docx, xlsx, pptx), is not seen.
   A refused file is answered exactly like a file that is not there (`available: false`, `/media` 404): the app is never told why. The lists are constants in one place, not configuration.
-  **This is an initial guard, not the final design:** the allow-listed outbox for files the agent sends (and the full review of what else a workspace may expose) is Batch 7. Until then,
-  if the owner really wants a memory or config file in the chat, they can ask for its content as text in the conversation; the file route will not serve the file itself.
+  **This is an initial guard, not the final design:** the allow-listed outbox for files the agent sends (and the full review of what else a workspace may expose) is Batch 7, which also closes
+  what a deny-list cannot: hard links to a protected file, and a copy of it under a new name. Also left as they are: the listing check is synchronous (`checkMediaFile` is not async),
+  and `skills/` and `daftra-ledger/` are not protected folders.
+  **Known false positives (refused on purpose; documented, not removed):** `design-tokens.json`, `password-policy.pdf`, `secret-santa.xlsx`, `customer-credentials-checklist.pdf`,
+  `backups/q3-report.pdf`, `clients/auth/letter.pdf`, `Memory/photo.png`, any `agents.md`, `tools.md`, `user.md`, `config.json`, `settings.json`, a document that quotes `Bearer eyJ…` or
+  `sk-…` or `OPENAI_API_KEY=…` in its first 64 KiB, anything inside a `.cache` (or any hidden) folder. **To get such a file across today:** give it a different name (for example
+  `design-notes.json`, `report-q3.pdf`) or move it out of the protected folder, and name the new path; or ask for its text in the chat. If the owner really wants a memory or config file in the
+  chat, they can ask for its content as text; the file route will not serve the file itself.
   Legitimate flows are unchanged: images, documents, reports (`out/`, `reports/2026/`, the workspace root), audio and video, and everything under `<stateDir>/media` (inbound uploads,
-  generated images, speech) are listed and served as before. A workspace folder that is literally named `memory`, `backups`, `auth`, `secrets` or `credentials`, or a file whose name has
-  one of the words above, is not downloadable through the app any more.
+  generated images, speech) are listed and served as before.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
   - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the
