@@ -713,7 +713,7 @@ test("I2: a run whose terminal event was missed (write link dropped/reconnected)
     b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 1, state: "delta", deltaText: "par" });
     b.writeLink.isUp = () => false; // the link dropped: final/error/aborted never arrive on it
     b.link.history[key] = { messages: [{ role: "user", idempotencyKey: `${K1}:user`, content: "hello", timestamp: 1, __openclaw: { id: "row0001" } },
-      { role: "assistant", content: [{ type: "text", text: "partial and then the full reply" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
+      { role: "assistant", content: [{ type: "text", text: "partial and then the full reply" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
     b.link.waits[K1] = "ok";
     let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
     assert.equal(r.json.status, "done"); assert.equal(r.json.text, "partial and then the full reply");
@@ -1282,4 +1282,28 @@ test("N6 (#38): a RESEND to 'legacy' during legacy /new is busy (legacy), nothin
     assert.equal(b.writeLink.sends.length, 0);
     release(); await reset;
   } finally { await b.close(); }
+});
+
+
+test("Codex (7f6843e): agent.wait ok before the final row is readable: a toolUse preamble never becomes the answer; pending until the final row", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  const b = await bridge({ link });
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    const preamble = { role: "assistant", content: [{ type: "text", text: "let me look that up" }, { type: "toolCall", id: "c1", name: "read" }], stopReason: "toolUse", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } };
+    const textOnlyPreamble = { role: "assistant", content: [{ type: "text", text: "one moment" }], stopReason: "toolUse", timestamp: 3, __openclaw: { id: "row0003", runId: K1 } };
+    link.history[key] = { messages: [userRow(K1, "row0001"), preamble, textOnlyPreamble] };
+    link.waits[K1] = "ok";
+    await sleep(1600);
+    let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, ""); assert.equal(r.json.textPending, true);
+    link.history[key] = { messages: [userRow(K1, "row0001"), preamble, textOnlyPreamble, replyRow(K1, "row0009", "the final answer", 9)] };
+    r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.text, "the final answer"); assert.equal(r.json.textPending, undefined);
+  } finally { await b.close(); }
+  // the terminal stop reasons count as final; toolUse / restart / none do not
+  const { isFinalReply } = await import("./app-bridge-threads.js");
+  const row = (stopReason) => ({ role: "assistant", content: [{ type: "text", text: "x" }], stopReason });
+  for (const r of ["stop", "end_turn", "length", "error", "aborted", "timeout", "cancelled"]) assert.equal(isFinalReply(row(r)), true, r);
+  for (const r of ["toolUse", "restart", undefined, "rpc", "STOP"]) assert.equal(isFinalReply(row(r)), false, String(r));
 });

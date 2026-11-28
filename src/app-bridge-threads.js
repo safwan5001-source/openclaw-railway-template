@@ -62,11 +62,16 @@ export function userRowRunId(m) {
 }
 /** A reply row's run id when it is a chat.send run (= clientMsgId), else null (HTTP rows carry chatcmpl_… ids). */
 export const assistantRunId = (m) => (m?.role === "assistant" && typeof m.__openclaw?.runId === "string" && CLIENT_MSG_ID_RE.test(m.__openclaw.runId) ? m.__openclaw.runId : null);
-/** K's final reply row: an assistant row that stopped ("stop"/"end_turn") with no tool call still pending, not a notice. */
+/**
+ * The stop reasons that END a turn in OpenClaw 2026.11.10 (dist: stop, length, error, aborted, timeout, cancelled; end_turn from
+ * providers that report it). NOT final: "toolUse" (a preamble before a tool step), "restart" (cut by a restart), none at all.
+ */
+export const FINAL_STOP_REASONS = Object.freeze(new Set(["stop", "end_turn", "length", "error", "aborted", "timeout", "cancelled"]));
+/** K's final reply row: an assistant row with a final stop reason, no tool call still pending, not a status notice. */
 export function isFinalReply(m) {
   if (m?.role !== "assistant" || isStatusNotice(m)) return false;
   const calls = Array.isArray(m.content) && m.content.some((p) => p?.type === "toolCall" || p?.type === "tool_use");
-  return !calls && (m.stopReason === "stop" || m.stopReason === "end_turn");
+  return !calls && FINAL_STOP_REASONS.has(m.stopReason);
 }
 /** An engine status notice (not the model's reply): every content part is flagged `openclawStatusNotice` (integration BUG-2). */
 export function isStatusNotice(m) {
@@ -542,9 +547,11 @@ export function registerThreadRoutes(router, ctx) {
     // a record that ended without its reply text (missed final, ack "ok", a notice-only final): K's own reply row, as soon as the
     // engine has it; re-read on every poll while pending
     if (live && live.status !== "running" && (live.textPending || !live.text)) {
-      const last = own.findLast((m) => isFinalReply(m)) ?? own.filter((m) => !isStatusNotice(m)).at(-1);
+      // ONLY a final row may become the answer (Codex 7f6843e): a "toolUse" preamble never does; until the final row is readable
+      // the text stays pending and is re-read on later polls
+      const last = own.findLast((m) => isFinalReply(m));
       if (last) { live.text = ctx.messageText(last); live.finalText = true; live.textPending = false; }
-      else if (live.status === "done" && !live.finalText) live.textPending = true;
+      else if (live.status !== "unknown" && !live.finalText) live.textPending = true;
     }
     // ONE rule for "terminal + text" from the engine's rows, cached or not (Codex + N1): agent.wait ok/error, else K's own final
     // reply row (agent.wait can time out for a run finished before a gateway + wrapper restart). Read-only.
