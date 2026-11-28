@@ -1026,6 +1026,14 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       });
     });
     registerThreadRoutes(router, { link, writeLink, gatewayCall, now, log, gate, legacySerial: serial, legacyResetActive: () => resetState.active,
+      // the legacy conversation's paging across resets: the same ledger cursor and anchoredPage() as legacy /history (Codex f0b6276)
+      legacyHistory: {
+        page: (cursor) => (gatewayCall ? anchoredPage(convoCtx, APP_SESSION_KEY, cursor, "before") : Promise.reject(Object.assign(new Error("no gatewayCall"), { code: "link_down" }))),
+        earlierOf: (rows) => {
+          const first = rows.find((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m)));
+          return first && isResetRow(first) && ledger.anchorFor(rowId(first)) ? rowId(first) : null;
+        },
+      },
       boot: () => link?.epoch ?? writeLink?.epoch ?? null,
       mapRows: (key, rows) => mapRows(key, rows, false, { thread: true }),
       messageText, cleanLiveText, cleanSnippet,

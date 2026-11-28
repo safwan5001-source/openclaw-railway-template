@@ -99,7 +99,7 @@ function fakeHttp() {
 }
 
 const W = 40; // the accept window in these tests (the real default, RECENT_ACCEPT_MS = 3 s, is tested on its own)
-async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWriteLink(), httpGw = fakeHttp(), gatewayCall, now, recentAcceptMs = W } = {}) {
+async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWriteLink(), httpGw = fakeHttp(), gatewayCall, now, recentAcceptMs = W, stateDir } = {}) {
   const calls = [];
   const gc = gatewayCall ?? (async (method, params) => {
     calls.push({ method, params });
@@ -119,7 +119,7 @@ async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWrite
     return ack;
   };
   const router = createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://gw.invalid", gatewayToken: "synthetic-gateway-token-0123456789abcdef",
-    configPath: "/nonexistent/openclaw.json", fetchImpl: httpGw.fetch, gatewayCall: gc, link, writeLink, env: threads ? { BASHT_THREADS: "on" } : {}, ...(recentAcceptMs === null ? {} : { recentAcceptMs }), ...(now ? { now } : {}) });
+    configPath: "/nonexistent/openclaw.json", fetchImpl: httpGw.fetch, gatewayCall: gc, link, writeLink, ...(stateDir ? { stateDir } : {}), env: threads ? { BASHT_THREADS: "on" } : {}, ...(recentAcceptMs === null ? {} : { recentAcceptMs }), ...(now ? { now } : {}) });
   const app = express(); app.use("/app/v1", router);
   const server = http.createServer(app);
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -507,7 +507,7 @@ test("runs: live text from the write link's chat events (filtered by qualified k
   // the bridge restarted: nothing in memory; the engine still knows (history rows tagged with K, agent.wait)
   link.history[key] = { messages: [
     { role: "user", idempotencyKey: `${K1}:user`, content: "hello", timestamp: 1, __openclaw: { id: "row0001" } },
-    { role: "assistant", content: [{ type: "text", text: "ack l3 done" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
+    { role: "assistant", content: [{ type: "text", text: "ack l3 done" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
   link.waits[K1] = "ok";
   const b2 = await bridge({ link });
   try {
@@ -755,7 +755,7 @@ test("Codex: a resumed reply is bound to ITS turn: polling an earlier turn never
   const key = `agent:main:app:owner:${A}`;
   link.history[key] = { messages: [
     { role: "user", idempotencyKey: `${K1}:user`, content: "first", timestamp: 1, __openclaw: { id: "row0001" } },
-    { role: "assistant", content: [{ type: "text", text: "first reply" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } },
+    { role: "assistant", content: [{ type: "text", text: "first reply" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } },
     { role: "user", idempotencyKey: `${K2}:user`, content: "second", timestamp: 3, __openclaw: { id: "row0003" } },
     { role: "assistant", content: [{ type: "text", text: "second, cut" }], timestamp: 4, __openclaw: { id: "row0004", runId: K2 } },
     { role: "assistant", content: [{ type: "text", text: "second continued" }], timestamp: 6, __openclaw: { id: "row0006", runId: "run-r2", continuation: { source: "restart" } } },
@@ -927,7 +927,7 @@ test("Codex: an OLDER turn behind a tool-heavy later turn is located by bounded 
     : { role: "assistant", content: [{ type: "toolCall", id: `c${i + 1}`, name: "read" }], timestamp: t0 + i, __openclaw: { id: `tool${String(i).padStart(5, "0")}`, runId: K2 } }));
   const all = [
     { role: "user", idempotencyKey: `${K1}:user`, content: "old question", timestamp: 1, __openclaw: { id: "old00001" } },
-    { role: "assistant", content: [{ type: "text", text: "old answer" }], timestamp: 2, __openclaw: { id: "old00002", runId: K1 } },
+    { role: "assistant", content: [{ type: "text", text: "old answer" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "old00002", runId: K1 } },
     { role: "user", idempotencyKey: `${K2}:user`, content: "new question", timestamp: 3, __openclaw: { id: "new00003" } },
     ...tools(300, 4)];
   const pager = (hasOlderKnown = true, win = Infinity) => (p) => {
@@ -1306,4 +1306,56 @@ test("Codex (7f6843e): agent.wait ok before the final row is readable: a toolUse
   const row = (stopReason) => ({ role: "assistant", content: [{ type: "text", text: "x" }], stopReason });
   for (const r of ["stop", "end_turn", "length", "error", "aborted", "timeout", "cancelled"]) assert.equal(isFinalReply(row(r)), true, r);
   for (const r of ["toolUse", "restart", undefined, "rpc", "STOP"]) assert.equal(isFinalReply(row(r)), false, String(r));
+});
+
+
+test("Codex (f0b6276 :561): an UNCACHED terminal run with only a toolUse preamble is done + textPending, never the preamble as its answer", async () => {
+  const link = fakeLink(); const key = `agent:main:app:owner:${A}`;
+  link.history[key] = { messages: [userRow(K1, "row0001"),
+    { role: "assistant", content: [{ type: "text", text: "Let me check" }], stopReason: "toolUse", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } }] };
+  link.waits[K1] = "ok";
+  const b = await bridge({ link }); // wrapper restart / cache eviction: no live record
+  try {
+    let r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, ""); assert.equal(r.json.textPending, true);
+    link.history[key] = { messages: [...link.history[key].messages, replyRow(K1, "row0009", "the answer", 9)] };
+    r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.json.text, "the answer"); assert.equal(r.json.textPending, undefined);
+  } finally { await b.close(); }
+  const { decideRun } = await import("./app-bridge-threads.js");
+  const mt = (m) => m.content[0].text;
+  const pre = { role: "assistant", content: [{ type: "text", text: "pre" }], stopReason: "toolUse" };
+  assert.deepEqual(decideRun({ live: null, wait: "timeout", own: [pre], resumed: null, messageText: mt }), { status: "unknown", text: "", textPending: false });
+  assert.deepEqual(decideRun({ live: null, wait: "error", own: [], resumed: null, messageText: mt }), { status: "error", text: "", textPending: true });
+});
+
+test("Codex (f0b6276 :393): /threads/legacy/history pages across a reset with the reset-ledger cursor (as legacy /history)", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b4-ledger-"));
+  fs.mkdirSync(path.join(dir, "app-bridge"));
+  fs.writeFileSync(path.join(dir, "app-bridge", "resets.json"), JSON.stringify([{ resetId: "reset0001", anchorId: "before0002", at: 5 }]));
+  const lkey = "agent:main:app:owner";
+  const beforeRows = [
+    { role: "user", content: "old question", timestamp: 1, __openclaw: { id: "before0001" } },
+    { role: "assistant", content: [{ type: "text", text: "old answer" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "before0002" } }];
+  const resetRow = { role: "system", content: "", timestamp: 3, __openclaw: { id: "reset0001", kind: "reset" } };
+  const afterRows = [{ role: "user", content: "new question", timestamp: 4, __openclaw: { id: "after0001" } }];
+  const link = fakeLink();
+  link.history[lkey] = { messages: [resetRow, ...afterRows] }; // the engine's default projection starts at the reset row
+  const gc = async (method, params) => {
+    if (method === "chat.history" && params.sessionKey === lkey) return { messages: [...beforeRows, resetRow, ...afterRows].slice(0, [...beforeRows, resetRow].findIndex((m) => m.__openclaw.id === params.messageId) + 1), anchor: { hasOlder: false } };
+    throw new Error(`unexpected ${method}`);
+  };
+  const b = await bridge({ link, gatewayCall: gc, stateDir: dir });
+  try {
+    const first = await b.call("GET", "/threads/legacy/history");
+    assert.equal(first.status, 200, first.text);
+    assert.equal(first.json.earlier, "reset0001", "a cursor into the conversation before the reset");
+    const older = await b.call("GET", `/threads/legacy/history?before=${first.json.earlier}`);
+    assert.equal(older.status, 200, older.text);
+    assert.deepEqual(older.json.messages.map((m) => m.id), ["before0001", "before0002"]);
+    assert.equal(older.json.earlier, null);
+    assert.equal((await b.call("GET", `/threads/legacy/history?before=before0002.reset0001`)).status, 200, "the dotted ledger cursor is accepted for legacy");
+    assert.equal((await b.call("GET", `/threads/${A}/history?before=before0002.reset0001`)).status, 400, "but never for a thread (no ledger there)");
+  } finally { await b.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

@@ -42,6 +42,7 @@ const MAX_SEARCH_TIDS = 500;
 const SEARCH_BATCH = 100;
 const SEARCH_LIMIT = 20;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{6,100}$/;
+const LEGACY_CURSOR_RE = /^[A-Za-z0-9_-]{6,100}(?:\.[A-Za-z0-9_-]{6,100})?$/; // = app-bridge-convo.js CURSOR_RE
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const MIME_EXT = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/heic": "heic", "image/heif": "heif" };
 
@@ -73,6 +74,34 @@ export function isFinalReply(m) {
   const calls = Array.isArray(m.content) && m.content.some((p) => p?.type === "toolCall" || p?.type === "tool_use");
   return !calls && FINAL_STOP_REASONS.has(m.stopReason);
 }
+/**
+ * "Terminal + text": THE one rule, for a cached (live) run and an uncached one alike (review N1, Codex 9555422/7f6843e/f0b6276).
+ * - status: a live terminal event, else agent.wait ok/error, else K's own FINAL row ⇒ done (error for agent.wait error); a restart
+ *   continuation in K's turn without a final row ⇒ unknown (K was interrupted); otherwise running (live) / unknown (uncached).
+ * - text: the first final reply event's text, else the FINAL row's text, never a preamble or a notice. A terminal run without a
+ *   readable final row is `textPending` (re-read on later polls), never frozen empty.
+ * A live record is updated in place (status, finishedAt, text, finalText, textPending); the engine rows are only read.
+ */
+export function decideRun({ live, wait, own, resumed, messageText, at }) {
+  const finalRow = (own ?? []).findLast((m) => isFinalReply(m));
+  const finalText = finalRow ? messageText(finalRow) : null;
+  const engineTerminal = wait === "ok" || wait === "error" || finalRow !== undefined;
+  if (live) {
+    if (live.status === "running") {
+      if (engineTerminal) { live.status = wait === "error" ? "error" : "done"; live.finishedAt = at; }
+      else if (resumed) { live.status = "unknown"; live.finishedAt = at; }
+    }
+    if (live.status !== "running" && !live.finalText) {
+      if (finalText !== null) { live.text = finalText; live.finalText = true; live.textPending = false; }
+      else live.textPending = live.status !== "unknown";
+    }
+    return { status: live.status, text: live.text, textPending: live.textPending === true };
+  }
+  const status = wait === "ok" ? "done" : wait === "error" ? "error" : finalRow && !resumed ? "done" : "unknown";
+  const terminal = status === "done" || status === "error";
+  return { status, text: finalText ?? "", textPending: terminal && finalText === null };
+}
+
 /** An engine status notice (not the model's reply): every content part is flagged `openclawStatusNotice` (integration BUG-2). */
 export function isStatusNotice(m) {
   const c = m?.content;
@@ -151,8 +180,7 @@ export function createThreadRuns({ writeLink, now = Date.now, messageText }) {
       // content parts with openclawStatusNotice). The first final reply text is kept; notices never replace it (history agrees).
       if (r.status !== "done") { r.status = "done"; r.finishedAt = now(); }
       const t = p.message && !isStatusNotice(p.message) ? messageText(p.message) : "";
-      if (t && !r.finalText) { r.text = t; r.finalText = true; r.textPending = false; }
-      else if (!r.finalText) r.textPending = true; // a final without the reply text (a notice only): read it from the engine
+      if (t && !r.finalText) { r.text = t; r.finalText = true; } // a notice-only final leaves the text to decideRun (engine rows)
     }
     else if (p.state === "aborted") { r.status = "stopped"; r.finishedAt = now(); }
     else if (p.state === "error") {
@@ -378,9 +406,16 @@ export function registerThreadRoutes(router, ctx) {
     const k = keysOf(req, res); if (!k) return;
     const limit = Math.min(Math.max(intOr(req.query.limit, 50), 1), HISTORY_MAX_LIMIT);
     const before = req.query.before === undefined ? null : String(req.query.before);
-    if (before !== null && !MESSAGE_ID_RE.test(before)) return bad(res, "bad_cursor");
+    const legacyPaging = k.tid === "legacy" && ctx.legacyHistory; // the legacy conversation crosses its resets (Codex f0b6276)
+    if (before !== null && !(legacyPaging ? LEGACY_CURSOR_RE : MESSAGE_ID_RE).test(before)) return bad(res, "bad_cursor");
     if (!link?.isUp?.()) return linkDown(res);
     try {
+      if (legacyPaging && before !== null) {
+        // the legacy /history?before= translation, unchanged: the reset-ledger cursor ("<resetId>" | "<messageId>.<resetId>" | id)
+        // and anchoredPage(), which continues into the conversation before the previous reset this bridge made
+        const p = await ctx.legacyHistory.page(before);
+        return res.json({ ok: true, thread: k.tid, messages: ctx.mapRows(k.qualified, p.messages), earlier: p.earlier, found: p.found });
+      }
       // an anchored window spans both sides of the anchor: ask for 2*limit+1, never above the link's own cap (review I1)
       const r = await link.request("chat.history", { sessionKey: k.qualified, limit: before ? Math.min(2 * limit + 1, CHAT_HISTORY_MAX) : limit, ...(before ? { messageId: before } : {}) },
         { timeoutMs: READ_TIMEOUT_MS });
@@ -390,7 +425,10 @@ export function registerThreadRoutes(router, ctx) {
       const messages = ctx.mapRows(k.qualified, rows);
       const oldest = rows.find((m) => typeof m?.__openclaw?.id === "string" && MESSAGE_ID_RE.test(m.__openclaw.id))?.__openclaw.id ?? null;
       const more = before ? r?.anchor?.hasOlder === true || rows.length >= limit : r?.hasMore === true || rows.length >= limit;
-      res.json({ ok: true, thread: k.tid, messages, earlier: more && oldest ? oldest : null, found });
+      // after a reset the engine's default view starts at the reset row: the cursor into the conversation before it is the
+      // reset's id, exactly as legacy /history gives it (only for a reset this bridge recorded)
+      const earlier = more && oldest ? oldest : legacyPaging && !before ? ctx.legacyHistory.earlierOf(rows) : null;
+      res.json({ ok: true, thread: k.tid, messages, earlier, found });
     } catch (err) { failRead(res, err, "history"); }
   });
 
@@ -500,8 +538,8 @@ export function registerThreadRoutes(router, ctx) {
     // have been missed: a write-link drop/reconnect, an ack timeout), and on every poll while its final text is still pending.
     // agent.wait before history (review N1): a run that ends between the two reads still has its reply row in the history page.
     let rows = null; let wait = null;
-    const pending = live?.textPending === true;
-    if (link?.isUp?.() && (!live || live.status !== "running" || pending || now() - live.stepsAt >= 1500)) {
+    // (a finished record, including one whose text is pending, is re-read on every poll: only "running" is throttled)
+    if (link?.isUp?.() && (!live || live.status !== "running" || now() - live.stepsAt >= 1500)) {
       try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
       try {
         const h = await link.request("chat.history", { sessionKey: k.qualified, limit: 50 }, { timeoutMs: READ_TIMEOUT_MS });
@@ -515,7 +553,7 @@ export function registerThreadRoutes(router, ctx) {
     // record, or when a live record needs the engine's rows for its final text (terminal now, or text pending: review N1).
     // A live run that is still running polls the newest page only (cheap).
     const terminalNow = wait === "ok" || wait === "error";
-    if (seg === null && rows !== null && (!live || pending || (live.status === "running" && terminalNow) || (live.status !== "running" && !live.text))) {
+    if (seg === null && rows !== null && (!live || (live.status === "running" && terminalNow) || (live.status !== "running" && !live.finalText))) {
       const f = await findTurnCached(k.qualified, K);
       if (f.found) seg = turnSegment(f.rows, K);
       // could not tell: honest "unknown", never not_found; nothing about the run is reported (agent.wait is engine-global)
@@ -533,37 +571,13 @@ export function registerThreadRoutes(router, ctx) {
     // its reply, never a trailing engine status notice (Codex, as BUG-2)
     const resumedReply = resumedRows.filter((m) => !isStatusNotice(m)).at(-1);
     const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: resumedReply ? ctx.messageText(resumedReply) : "" } : null;
-    if (live && live.status === "running") {
-      if (rows) live.steps = stepsFrom(after, 0);
-      // the engine's verdict when no final reached this bridge: agent.wait, else K's own final reply row in history (agent.wait can
-      // time out for an id the engine finished before a restart, integration BUG-1)
-      const finalRow = own.findLast((m) => isFinalReply(m));
-      if (terminalNow || finalRow) {
-        live.status = wait === "error" ? "error" : "done"; live.finishedAt = now();
-        // the final text comes from the engine's rows; until they are readable the text is PENDING, never frozen (review N1)
-        if (!live.finalText) live.textPending = true;
-      } else if (resumed) { live.status = "unknown"; live.finishedAt = now(); } // K was interrupted; the engine continued it in another run
-    }
-    // a record that ended without its reply text (missed final, ack "ok", a notice-only final): K's own reply row, as soon as the
-    // engine has it; re-read on every poll while pending
-    if (live && live.status !== "running" && (live.textPending || !live.text)) {
-      // ONLY a final row may become the answer (Codex 7f6843e): a "toolUse" preamble never does; until the final row is readable
-      // the text stays pending and is re-read on later polls
-      const last = own.findLast((m) => isFinalReply(m));
-      if (last) { live.text = ctx.messageText(last); live.finalText = true; live.textPending = false; }
-      else if (live.status !== "unknown" && !live.finalText) live.textPending = true;
-    }
-    // ONE rule for "terminal + text" from the engine's rows, cached or not (Codex + N1): agent.wait ok/error, else K's own final
-    // reply row (agent.wait can time out for a run finished before a gateway + wrapper restart). Read-only.
-    const ownFinal = own.findLast((m) => isFinalReply(m));
-    const status = live ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : ownFinal && !resumed ? "done" : "unknown";
-    const ownReply = ownFinal ?? own.filter((m) => !isStatusNotice(m)).at(-1);
-    const text = live ? live.text : ownReply ? ctx.messageText(ownReply) : "";
+    if (live && live.status === "running" && rows) live.steps = stepsFrom(after, 0);
+    const { status, text, textPending } = decideRun({ live, wait, own, resumed, messageText: ctx.messageText, at: now() });
     res.json({ ok: true, runId: K, thread: k.tid, status, text: ctx.cleanLiveText(text, { streaming: status === "running" }), phase: live?.phase ?? null,
       steps: live ? live.steps : stepsFrom(after, 0), startedAt: live?.startedAt ?? null, finishedAt: live?.finishedAt ?? null,
       ...(live?.errorCode ? { errorCode: live.errorCode } : {}),
       // the engine continued this turn in a NEW run after a restart (lab L5): shown as what it is, never re-executed by the bridge
-      interrupted: resumed !== null, resumed, ...(live?.textPending ? { textPending: true } : {}), boot: ctx.boot() });
+      interrupted: resumed !== null, resumed, ...(textPending ? { textPending: true } : {}), boot: ctx.boot() });
   });
 
   router.post("/threads/:tid/runs/:runId/abort", async (req, res) => {
