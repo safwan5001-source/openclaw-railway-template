@@ -910,3 +910,38 @@ test("m1/m6/m8: the settings queue map is pruned; an unavailable model is refuse
     assert.equal((await b.call("GET", `/threads/%6c%65%67%61%63%79/model`)).json.reason, "bad_tid", "'legacy' encoded too");
   } finally { await b.close(); }
 });
+
+test("Codex: an OLDER turn behind a tool-heavy later turn is located by bounded paging (no false 404); unreachable = honest unknown", async () => {
+  const key = `agent:main:app:owner:${A}`;
+  const tools = (n, t0) => Array.from({ length: n }, (_, i) => (i % 2
+    ? { role: "toolResult", toolCallId: `c${i}`, content: [], timestamp: t0 + i, __openclaw: { id: `tool${String(i).padStart(5, "0")}` } }
+    : { role: "assistant", content: [{ type: "toolCall", id: `c${i + 1}`, name: "read" }], timestamp: t0 + i, __openclaw: { id: `tool${String(i).padStart(5, "0")}`, runId: K2 } }));
+  const all = [
+    { role: "user", idempotencyKey: `${K1}:user`, content: "old question", timestamp: 1, __openclaw: { id: "old00001" } },
+    { role: "assistant", content: [{ type: "text", text: "old answer" }], timestamp: 2, __openclaw: { id: "old00002", runId: K1 } },
+    { role: "user", idempotencyKey: `${K2}:user`, content: "new question", timestamp: 3, __openclaw: { id: "new00003" } },
+    ...tools(300, 4)];
+  const pager = (hasOlderKnown = true, win = Infinity) => (p) => {
+    if (!p.messageId) return { messages: all.slice(-p.limit), hasMore: all.length > p.limit };
+    const at = all.findIndex((m) => m.__openclaw.id === p.messageId);
+    const lo = Math.max(0, at - Math.min(p.limit, win) + 1);
+    return { messages: all.slice(lo, at + 1), ...(hasOlderKnown ? { anchor: { hasOlder: lo > 0 } } : {}) };
+  };
+  const link = fakeLink();
+  link.history[key] = pager();
+  link.waits[K1] = "ok";
+  const b = await bridge({ link }); // fresh bridge: no live record (restart / eviction)
+  try {
+    const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.status, "done"); assert.equal(r.json.text, "old answer"); assert.equal(r.json.interrupted, false);
+    assert.ok(b.link.requests.filter((q) => q.method === "chat.history").every((q) => q.params.limit <= 200), "bounded pages, real validator");
+    // the membership check still holds: thread B does not have K1
+    link.history[`agent:main:app:owner:${B}`] = { messages: [] };
+    assert.equal((await b.call("GET", `/threads/${B}/runs/${K1}`)).status, 404);
+    // paging cannot tell (the engine does not say whether older rows exist): unknown, not not_found
+    link.history[key] = pager(false, 20);
+    const u = await b.call("GET", `/threads/${A}/runs/${K1}`);
+    assert.equal(u.status, 200); assert.equal(u.json.status, "unknown"); assert.equal(u.json.located, false); assert.equal(u.json.text, "");
+  } finally { await b.close(); }
+});

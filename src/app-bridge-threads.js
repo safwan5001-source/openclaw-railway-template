@@ -206,6 +206,33 @@ export async function reconcile(link, qualified, K, since) {
 }
 
 /**
+ * Locate K's turn in a conversation (Codex, after a restart or a live-cache eviction): pages chat.history back with the same bounded
+ * paging as reconcile until "<K>:user" is found or the start of the history is reached. Returns { found, complete, rows } where rows
+ * are every row read (oldest first) when found. `complete:false` (a failed read, a page that does not say whether older rows exist,
+ * the page budget spent) means "could not tell": never "this run does not exist".
+ */
+export async function findTurn(link, qualified, K) {
+  let all = []; let anchor = null;
+  try {
+    for (let page = 0; page < RECONCILE_MAX_PAGES; page++) {
+      const r = await link.request("chat.history", { sessionKey: qualified, limit: RECONCILE_PAGE, ...(anchor ? { messageId: anchor } : {}) }, { timeoutMs: READ_TIMEOUT_MS });
+      let rows = Array.isArray(r?.messages) ? r.messages : null;
+      if (!rows) return { found: false, complete: false, rows: null };
+      if (anchor) { const at = rows.findIndex((m) => m?.__openclaw?.id === anchor); if (at < 0) return { found: false, complete: false, rows: null }; rows = rows.slice(0, at); }
+      all = [...rows, ...all];
+      if (rows.some((m) => userRowRunId(m) === K)) return { found: true, complete: true, rows: all };
+      const more = anchor ? (typeof r?.anchor?.hasOlder === "boolean" ? r.anchor.hasOlder : null) : r?.hasMore === true || rows.length >= RECONCILE_PAGE;
+      if (more === null) return { found: false, complete: false, rows: null };
+      if (!more) return { found: false, complete: true, rows: null };
+      const oldest = rows.find((m) => typeof m?.__openclaw?.id === "string");
+      if (!oldest || !MESSAGE_ID_RE.test(oldest.__openclaw.id)) return { found: false, complete: false, rows: null };
+      anchor = oldest.__openclaw.id;
+    }
+  } catch { /* no answer */ }
+  return { found: false, complete: false, rows: null };
+}
+
+/**
  * ctx: { router, link, writeLink, gatewayCall, now, log, boot(), gate, mapRows(key, rows), messageText, models: {mapModel, modelRef, levelIds},
  *        media: { ...mediaCtx, cache, gatewayCall } }
  */
@@ -433,7 +460,15 @@ export function registerThreadRoutes(router, ctx) {
       try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
     }
     if (!live && rows === null) return reply(res, 502, "engine_unavailable"); // could not read: never reported as "no such run"
-    const seg = rows ? turnSegment(rows, K) : null;
+    let seg = rows ? turnSegment(rows, K) : null;
+    if (!live && seg === null) {
+      // K's user row is older than the newest page (a tool-heavy later turn): page back, bounded, before answering (Codex)
+      const f = await findTurn(link, k.qualified, K);
+      if (f.found) seg = turnSegment(f.rows, K);
+      // could not tell: honest "unknown", never not_found; nothing about the run is reported (agent.wait is engine-global)
+      else if (!f.complete) return res.json({ ok: true, runId: K, thread: k.tid, status: "unknown", text: "", phase: null, steps: [], startedAt: null, finishedAt: null,
+        interrupted: false, resumed: null, located: false, boot: ctx.boot() });
+    }
     // m2: with no live record, a run is reported only when K's own user row is in THIS conversation (agent.wait is engine-global)
     if (!live && seg === null) return reply(res, 404, "not_found");
     const after = seg ?? [];
