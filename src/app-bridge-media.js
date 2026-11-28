@@ -38,8 +38,12 @@ export const MEDIA_TYPES = {
   ".mp3": ["audio/mpeg", false], ".m4a": ["audio/mp4", false], ".ogg": ["audio/ogg", false], ".wav": ["audio/wav", false],
   ".mp4": ["video/mp4", false],
 };
-const MIME_EXT = Object.fromEntries(Object.entries(MEDIA_TYPES).map(([ext, [mime]]) => [mime, ext]).reverse());
+const MIME_EXT = Object.assign(Object.create(null), Object.fromEntries(Object.entries(MEDIA_TYPES).map(([ext, [mime]]) => [mime, ext]).reverse()));
 const INLINE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+/** An inline image (decoded from the transcript row on every request) is capped below the CLI's output buffer of the anchored read (~8 MB of JSON). */
+export const MAX_INLINE_BYTES = 5 * 1024 * 1024;
+/** The mime of a declared type if it is one of the allowlisted ones (own keys only: "constructor" is not a type), else null. */
+const knownMime = (m) => (typeof m === "string" && Object.hasOwn(MIME_EXT, m) ? m : null);
 
 /** Does `buf` start like a file of `mime`? Unknown types (and text) are checked for what they must NOT be. */
 export function bytesMatch(mime, buf) {
@@ -105,7 +109,10 @@ export function splitMediaLines(text) {
   for (const line of String(text ?? "").split("\n")) {
     const f = FENCE.exec(line);
     if (f) { fence = fence === null ? f[1] : fence === f[1] ? null : fence; keep.push(line); continue; }
-    const m = fence === null && /^ {0,3}MEDIA:\s*(.+?)\s*$/.exec(line);
+    // `<= 3 leading spaces, MEDIA:, then the rest of the line trimmed` (no pattern with two open-ended parts: linear on any line)
+    const head = fence === null ? /^ {0,3}MEDIA:/.exec(line) : null;
+    const rest = head ? line.slice(head[0].length).trim() : "";
+    const m = head && rest !== "" && !/[\r\u2028\u2029]/.test(rest) ? [line, rest] : null;
     if (m) {
       let src = m[1];
       if (src.length > 1 && src.startsWith('"') && src.endsWith('"')) src = src.slice(1, -1);
@@ -116,12 +123,77 @@ export function splitMediaLines(text) {
   return { text: keep.join("\n").replace(/\n{3,}/g, "\n\n").trim(), sources: out };
 }
 
-const ATTACHED = /\[media attached(?: \d+\/\d+)?: ([^\]\n]{1,2048})\]/g;
+const MARKER_HEADER = /\[media attached(?: \d+\/\d+)?: /y;
+const MARKER_WINDOW = 8192; // a marker (path, type, URL and file name) is never searched for beyond this
+const MARKER_BODY_MAX = 2048;
+
+/**
+ * Where the marker whose body starts at `b` ends: {body, next} (the text of its source part, the index after its `]`) or null.
+ * The engine writes `<path> (<type>) | <url> "<file name>"`, the name as a JSON string, so a name may hold `]`, `"` (escaped, or not
+ * when something else wrote it) and be long. The name starts at the first ` "` before the first `]`, and ends at the first
+ * unescaped `"` that is directly followed by `]`; without such a pair the marker ends at the first `]`. One bounded pass.
+ */
+function markerEnd(t, b, next) {
+  // the first `]` and the first line end after the header, found once per stretch of text (see splitAttachedMarkers): a header with no
+  // `]` in its line or in reach costs nothing, so a long run of unclosed headers is linear
+  const first = next.bracket(b);
+  const nl = next.newline(b);
+  if (first < 0 || first - b > MARKER_WINDOW || (nl >= 0 && nl < first)) return null;
+  const seg = t.slice(b, nl >= 0 ? Math.min(nl, b + MARKER_WINDOW) : b + MARKER_WINDOW);
+  const q = seg.indexOf(' "');
+  if (q >= 0 && q < first - b) {
+    for (let i = q + 2; i < seg.length; i++) {
+      const c = seg.charCodeAt(i);
+      if (c === 92) { i++; continue; } // backslash escape
+      if (c === 34 && seg.charCodeAt(i + 1) === 93) return q >= 1 && q <= MARKER_BODY_MAX ? { body: seg.slice(0, q), next: b + i + 2 } : null;
+    }
+  }
+  return first - b >= 1 && first - b <= MARKER_BODY_MAX ? { body: seg.slice(0, first - b), next: first + 1 } : null;
+}
+
+/**
+ * What one `[media attached: …]` marker names (its body without the file name). The stored-upload URL (`media://inbound/<id>`,
+ * prefix only: what follows is not part of it) wins when there is one; else the path. The content type is never part of the source.
+ * Linear in the body: no pattern here can backtrack.
+ */
+function attachedSource(body) {
+  const stripType = (v) => {
+    const x = v.trim();
+    if (!x.endsWith(")")) return x;
+    const i = x.lastIndexOf(" (");
+    return i > 0 && !x.slice(i + 2, -1).includes("(") && !x.slice(i + 2, -1).includes(")") ? x.slice(0, i).trimEnd() : x;
+  };
+  const b = body.trim();
+  const sep = b.indexOf(" | ");
+  if (sep >= 0) {
+    const m = /^media:\/\/inbound\/[A-Za-z0-9._-]+/i.exec(b.slice(sep + 3).trimStart());
+    if (m) return m[0];
+  }
+  return stripType(sep >= 0 ? b.slice(0, sep) : b);
+}
 /** `[media attached: media://inbound/<id>]` markers the engine adds to a user message for a stored upload. */
 export function splitAttachedMarkers(text) {
+  const t = String(text ?? "");
   const sources = [];
-  const rest = String(text ?? "").replace(ATTACHED, (_m, src) => { sources.push(src.trim().replace(/\s+\(.*\)$/, "")); return ""; });
-  return { text: rest.replace(/\n{3,}/g, "\n\n").trim(), sources };
+  let out = "";
+  let pos = 0;
+  // next `]` / next newline at or after an index, each searched again only once the previous answer lies behind the index
+  const cache = { "]": -2, "\n": -2 };
+  const find = (ch) => (from) => { if (cache[ch] !== -1 && cache[ch] < from) cache[ch] = t.indexOf(ch, from); return cache[ch]; };
+  const next = { bracket: find("]"), newline: find("\n") };
+  for (;;) {
+    const i = t.indexOf("[media attached", pos);
+    if (i < 0) break;
+    MARKER_HEADER.lastIndex = i;
+    const h = MARKER_HEADER.exec(t);
+    const end = h ? markerEnd(t, i + h[0].length, next) : null;
+    if (!end) { out += t.slice(pos, i + 1); pos = i + 1; continue; } // not a marker: keep it
+    out += t.slice(pos, i);
+    sources.push(attachedSource(end.body));
+    pos = end.next;
+  }
+  out += t.slice(pos);
+  return { text: out.replace(/\n{3,}/g, "\n\n").trim(), sources };
 }
 
 const MEDIA_LINE_PREFIX = "MEDIA:";
@@ -170,7 +242,9 @@ export function cleanLiveText(text, { streaming = false } = {}) {
   return attached.text;
 }
 
-const typeOf = (name) => MEDIA_TYPES[path.extname(String(name)).toLowerCase()] ?? null;
+const typeOf = (name) => { const e = path.extname(String(name)).toLowerCase(); return Object.hasOwn(MEDIA_TYPES, e) ? MEDIA_TYPES[e] : null; };
+/** The type a file is served as: its extension's, else (an id without one) the image type the engine recorded for it, if inline-viewable. */
+const fileType = (real, hint) => typeOf(real) ?? (INLINE_MIMES.has(hint) ? [hint, true] : null);
 const baseName = (src) => {
   const s = String(src).replace(/^media:\/\/inbound\//i, "");
   try { return path.basename(decodeURIComponent(s)).slice(0, 120) || "file"; } catch { return path.basename(s).slice(0, 120) || "file"; }
@@ -189,31 +263,146 @@ export function mediaRef(key, messageId, index, source) {
   return crypto.createHash("sha256").update(`${key}\0${messageId}\0${index}\0${source}`).digest("hex").slice(0, 32);
 }
 
+/** The text the engine's chat endpoint writes for a turn made of images only. It is not the owner's words: never shown. */
+export const IMAGE_ONLY_PLACEHOLDER = "User sent image(s) with no text.";
+
+/** The key two references to the same stored upload share: `media://inbound/<id>` and the absolute path of that file are one. */
+const sameFileKey = (src) => {
+  const s = String(src);
+  const m = /^media:\/\/inbound\/([^/\\]+)$/i.exec(s) ?? /[/\\]media[/\\]inbound[/\\]([^/\\]+)$/.exec(s);
+  return m ? `inbound/${m[1]}` : s;
+};
+
+/** Decoded size of a base64 string without decoding it. */
+const base64Bytes = (data) => Math.floor((data.length * 3) / 4) - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+
+/** The inline base64 payload of an image block of a transcript message (`data`, or `source.data` in the provider shape), else "". */
+function inlineData(p) {
+  const d = typeof p?.data === "string" ? p.data : typeof p?.source?.data === "string" ? p.source.data : "";
+  return d;
+}
+
+/** Standard base64 with correct padding (length a multiple of 4, `=` only at the very end, at most two). */
+const validBase64 = (data) => data.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(data);
+/** The decoded first bytes of a (valid) base64 payload: the first 48 characters (a multiple of 4, so cut on a byte boundary), or all of it. */
+const headBytes = (data) => Buffer.from(data.slice(0, 48), "base64");
+
 /**
- * Media items of one transcript message, in display order. Each entry keeps its private `source` (artifact id or file reference);
- * the public view (`publicMedia`) drops it. `text` comes back without the MEDIA: lines / attachment markers.
+ * Is the inline payload of block `p` something /media may serve? Looks at the declared type, the size, the base64 form (padding
+ * included) and the first bytes: exactly what inlineImageBytes enforces when the bytes are asked for.
+ */
+function inlineUsable(data, mime) {
+  if (!INLINE_MIMES.has(mime) || data.length < 4 || base64Bytes(data) > MAX_INLINE_BYTES || !validBase64(data)) return false;
+  return bytesMatch(mime, headBytes(data));
+}
+
+/**
+ * Media items of one transcript message, in display order. Each entry keeps its private `source` (artifact id, block index or file
+ * reference); the public view (`publicMedia`) drops it. `text` comes back without the MEDIA: lines / attachment markers.
+ *
+ * An image block of a message can be, depending on what the engine kept:
+ *   - `{type:"image", artifactId, mimeType, bytes, omitted:true}`: what the engine's own history view shows for every stored image
+ *     (the inline payload is replaced by an artifact id; read back with `artifacts.download`);
+ *   - `{type:"image", data, mimeType}`: the payload inline (raw transcript shape; served by decoding that block on demand);
+ *   - `{type:"image", mimeType, bytes, omitted:true}`: nothing left to read from the block. The message's own file facts
+ *     (`__openclaw.media`, the `[media attached: …]` marker) may still name the stored file; else the image is listed as unavailable.
+ * An image block never makes the message disappear: it always yields one item, `avail: false` when its bytes cannot be served.
+ * A file reference that names the same upload as an image block is that block's file, not a second image.
  */
 export function extractMedia(m, key, text = textOf(m)) {
   const id = typeof m?.__openclaw?.id === "string" ? m.__openclaw.id : "";
-  const items = [];
   const content = Array.isArray(m?.content) ? m.content : [];
-  for (const p of content) {
-    if (p?.type !== "image" || typeof p.artifactId !== "string" || p.artifactId.length > 2048) continue;
-    const mime = typeof p.mimeType === "string" ? p.mimeType.toLowerCase() : "image/png";
-    items.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", artifact: p.artifactId, mime, name: `image${MIME_EXT[mime] ?? ".png"}`,
-      size: Number.isFinite(p.bytes) ? p.bytes : null });
-  }
+  const blocks = [];
+  content.forEach((p, ci) => {
+    if (p?.type !== "image") return;
+    // declared type: `mimeType`, else the provider shape's `source.media_type`, else png. Only allowlisted types are ever published.
+    const declared = [p.mimeType, p.source?.media_type].find((v) => typeof v === "string" && v.length > 0 && v.length < 100);
+    const mime = declared === undefined ? "image/png" : knownMime(declared.toLowerCase());
+    const label = (m) => `image${m ? MIME_EXT[m] : ""}`;
+    const size = Number.isFinite(p.bytes) ? p.bytes : null;
+    if (typeof p.artifactId === "string" && p.artifactId && p.artifactId.length <= 2048) {
+      // served by artifacts.download for any allowlisted image type (a heic is a download, not an inline picture)
+      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", artifact: p.artifactId, mime, name: label(mime), size, avail: mime !== null && mime.startsWith("image/") });
+      return;
+    }
+    const data = inlineData(p);
+    if (data) {
+      const avail = inlineUsable(data, mime);
+      // an inline payload that cannot be served pairs with a file by what its bytes really are (its declared type may be wrong)
+      const sniffed = avail || !validBase64(data) ? null : ["image/png", "image/jpeg", "image/gif", "image/webp", "image/heic"].find((mm) => bytesMatch(mm, headBytes(data))) ?? null;
+      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", inline: ci, mime, name: label(mime), size: base64Bytes(data), avail, ...(sniffed ? { pairMime: sniffed } : {}) });
+      return;
+    }
+    blocks.push({ kind: "image", missing: ci, mime, name: label(mime), size, avail: false });
+  });
+
   let rest = text;
   const files = [];
   if (m?.role === "assistant") { const s = splitMediaLines(rest); rest = s.text; files.push(...s.sources); }
   const a = splitAttachedMarkers(rest); rest = a.text; files.push(...a.sources);
-  for (const src of files) {
-    if (/^https:\/\//i.test(src)) { items.push({ kind: "link", url: src.slice(0, 2048), name: baseName(src.split("?")[0]) }); continue; }
-    const t = typeOf(src);
-    items.push({ kind: t?.[1] ? "image" : "file", file: src, mime: t?.[0] ?? null, name: baseName(src), size: null });
+  // what the engine recorded for the stored uploads of this message (a marker may be missing; these are projected to media://inbound/<id>)
+  const facts = m?.role === "user" && Array.isArray(m?.__openclaw?.media) ? m.__openclaw.media : [];
+  const hints = new Map(); // same-file key -> the content type the engine recorded for it
+  for (const f of facts) {
+    const src = [f?.path, f?.url].find((v) => typeof v === "string" && /^media:\/\/inbound\/[^/\\]+$/i.test(v));
+    if (!src) continue;
+    files.push(src);
+    if (typeof f.contentType === "string") hints.set(sameFileKey(src), f.contentType.toLowerCase());
   }
-  const media = items.slice(0, MAX_MEDIA_PER_MESSAGE).map((it, i) => ({ ...it, ref: it.kind === "link" ? null : mediaRef(key, id, i, it.artifact ?? it.file) }));
+  const seenFiles = new Set();
+  const refs = files.filter((src) => { const k = sameFileKey(src); if (seenFiles.has(k)) return false; seenFiles.add(k); return true; }).map((src) => {
+    if (/^https:\/\//i.test(src)) return { kind: "link", url: src.slice(0, 2048), name: baseName(src.split("?")[0]) };
+    const t = typeOf(src);
+    // an id without an extension: the content type the engine recorded for it decides (inline-viewable image types only; the bytes
+    // are still checked against it when served)
+    const hint = t ? null : (INLINE_MIMES.has(hints.get(sameFileKey(src))) ? hints.get(sameFileKey(src)) : null);
+    const name = baseName(src);
+    const recorded = hints.get(sameFileKey(src));
+    return { kind: t ? (t[1] ? "image" : "file") : hint ? "image" : "file", pictured: !!(t?.[0].startsWith("image/") || recorded?.startsWith("image/")), file: src, mime: t?.[0] ?? hint, ...(hint ? { hint } : {}),
+      name: hint && !path.extname(name) ? `${name}${MIME_EXT[hint]}` : name, size: null };
+  });
+
+  // each image block takes the next image file reference of the same message: it is that block's file (used only when the block
+  // itself has nothing to read), never a second picture
+  // (only in a user row: an assistant reply that carries a block and a MEDIA: line shows both)
+  const items = [];
+  // (every picture file of the message counts, a heic too: a block that is not inline-viewable must not shift the pairing of the next one)
+  const spare = m?.role === "user" ? refs.filter((r) => r.pictured) : [];
+  const used = new Set();
+  for (const b of blocks) {
+    // the next picture file of the message; one whose type is known and differs from the block's is another picture's (a heic block
+    // without a file of its own must not take the jpeg's)
+    const bm = b.pairMime ?? b.mime;
+    const at = spare.findIndex((r) => !bm || !r.mime || bm === r.mime);
+    const own = at >= 0 ? spare.splice(at, 1)[0] : undefined;
+    if (own) used.add(own);
+    // the block wins when it can be served (the file is the same picture, not a second one); a block that cannot (nothing left,
+    // too large for the inline path, undecodable, bytes not what it declares) gives way to its stored file, which is the working fallback
+    items.push(b.avail === false && own ? own : b);
+  }
+  items.push(...refs.filter((r) => !used.has(r)));
+
+  // a turn of images only: the engine writes its own sentence for it. It goes; and an image the engine kept nothing of is still listed
+  if (m?.role === "user" && rest.trim() === IMAGE_ONLY_PLACEHOLDER) {
+    rest = "";
+    if (!items.some((it) => it.kind === "image" || (it.kind === "file" && it.mime?.startsWith("image/")))) items.push({ kind: "image", missing: -1, mime: null, name: "image", size: null, avail: false });
+  }
+  const source = (it) => it.artifact ?? it.file ?? (it.inline !== undefined ? `inline:${it.inline}` : `missing:${it.missing}`);
+  const media = items.slice(0, MAX_MEDIA_PER_MESSAGE).map((it, i) => ({ ...it, ref: it.kind === "link" ? null : mediaRef(key, id, i, source(it)) }));
   return { text: rest, media, messageId: id };
+}
+
+/** The bytes of an inline image block of message `m` (the item came from extractMedia of that same message), or {error}. */
+export function inlineImageBytes(m, item) {
+  const p = Array.isArray(m?.content) ? m.content[item.inline] : null;
+  const data = p?.type === "image" ? inlineData(p) : "";
+  if (!data || !INLINE_MIMES.has(item.mime)) return { error: "not_found" };
+  if (base64Bytes(data) > MAX_INLINE_BYTES) return { error: "too_large" };
+  if (!validBase64(data)) return { error: "unsupported" };
+  const bytes = Buffer.from(data, "base64");
+  if (bytes.length > MAX_INLINE_BYTES) return { error: "too_large" };
+  if (!bytesMatch(item.mime, bytes.subarray(0, 64))) return { error: "unsupported" };
+  return { bytes };
 }
 
 /**
@@ -247,38 +436,185 @@ export function resolveSource(src, { workspaceDir, stateDir }) {
   return workspaceDir ? path.resolve(workspaceDir, s) : null;
 }
 
+// ---------------------------------------------------------------- protected paths (initial guard) ------------------------------------
+// What the app can download is "a file inside an engine-owned root with an allowlisted type" (docs: "What the app can download"). That
+// alone would let a reply steered by prompt injection name `MEDIA:MEMORY.md` or a credentials `.json`. This is the INITIAL guard against
+// that, one shared place for BOTH listing (checkMediaFile) and serving (openMediaFile). It is evaluated on the REAL path (after
+// realpath: a symlink or a case trick cannot hide a protected file) relative to the deepest root the file is under (the root's own
+// location, e.g. a state dir named `.openclaw`, is not looked at), and AGAIN on the real path of the opened file (a directory swapped for
+// a symlink between the check and the open is caught). A refused file is simply "unavailable": the app is never told why.
+// It is a deny-list on purpose and NOT a substitute for the allow-listed outbox (Batch 7): hard links and a copy of a protected file
+// under a new name are out of scope. The lists are constants, not configuration.
+/** Directory names (case-insensitive, any depth below the root) whose files are never served. */
+export const PROTECTED_DIRS = Object.freeze(["memory", "memories", "dreams", "dreaming", "credentials", "secrets", "auth", "backups", "node_modules", ".openclaw"]);
+/** File names (case-insensitive) that are never served, wherever they are; also matched against every dot-separated run of the name (`MEMORY.md.txt`). */
+export const PROTECTED_FILES = Object.freeze(["memory.md", "soul.md", "user.md", "identity.md", "agents.md", "tools.md", "heartbeat.md", "bootstrap.md", "boot.md", "dreams.md",
+  "openclaw.json", "auth.json", "auth-profiles.json", "credentials.json", "secrets.json", "config.json", "settings.json"]);
+/** Name parts (case-insensitive, any extension: `session.json`, `id_rsa.md`) that are never served. */
+export const PROTECTED_STEMS = Object.freeze(["env", "dotenv", "cookies", "wallet", "keys", "session", "id_rsa", "id_ed25519", "passwd"]);
+/** Words that make a file name sensitive when the name ENDS in them or they are followed by a separator or digit (`my-token.json`, `accessToken.json`, not `tokenizer-notes.md`). */
+export const PROTECTED_WORDS = Object.freeze(["secret", "secrets", "credential", "credentials", "token", "tokens", "password", "passwords", "apikey", "api-key", "api_key",
+  "privatekey", "private-key", "private_key", "auth-profile", "auth-profiles"]);
+const PROTECTED_WORD_RE = new RegExp(`(?:${[...PROTECTED_WORDS].sort((a, b) => b.length - a.length).map((w) => w.replace(/[-_]/g, "[-_]")).join("|")})(?:[^a-z]|$)`);
+/** Types whose head is also looked at for a secret. Best effort: the first 64 KiB only, narrow shapes, so ordinary documents pass. */
+const TEXT_EXTS = new Set([".txt", ".md", ".csv", ".json"]);
+export const SECRET_SCAN_BYTES = 64 * 1024;
+const SECRET_SHAPES = Object.freeze([
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+  /\bsk-ant-[A-Za-z0-9_-]{20,}/,
+  /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}/,
+  /\bgh[pousr]_[A-Za-z0-9]{36,}/,
+  /\bgithub_pat_[A-Za-z0-9_]{40,}/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bxox[abprs]-[A-Za-z0-9-]{20,}/,
+  /\bBearer\s+eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/,
+]);
+// KEY=VALUE / "key": "value" where the key names a secret (OPENCLAW_GATEWAY_TOKEN=…, "apiKey": "…", db_password: …) and the value has 16+
+// characters without spaces or quotes. Looked at around each `=` / `:` (a bounded window each), so the scan stays linear in the head.
+const KEY_BEFORE = /(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_.-]{0,40}["']?\s*$/i;
+const VALUE_AFTER = /^\s*["']?[^\s"']{16,}/;
+function holdsKeyValue(text) {
+  const sep = /[=:]/g;
+  let m;
+  while ((m = sep.exec(text)) !== null) {
+    if (KEY_BEFORE.test(text.slice(Math.max(0, m.index - 64), m.index)) && VALUE_AFTER.test(text.slice(m.index + 1, m.index + 160))) return true;
+  }
+  return false;
+}
+
+/** The deepest root `real` is under, as its real path, or null. */
+const rootOf = (real, roots) => {
+  let best = null;
+  for (const r of rootList(roots)) if (real.startsWith(r + path.sep) && (best === null || r.length > best.length)) best = r;
+  return best;
+};
+const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+
+/** Does the path of a candidate file, below its root, hit a path rule? `words: false` skips the secret-word rule only (owner uploads keep their own file names). */
+export function isProtectedRelPath(rel, { words = true } = {}) {
+  const segs = String(rel).split(/[\\/]+/).filter(Boolean);
+  if (!segs.length) return true;
+  const lower = segs.map((x) => x.toLowerCase());
+  if (lower.some((x) => x.startsWith("."))) return true; // hidden files and directories (.env, .git, .ssh, .openclaw, …)
+  if (lower.slice(0, -1).some((x) => PROTECTED_DIRS.includes(x))) return true;
+  const base = lower[lower.length - 1];
+  const parts = base.split(".");
+  if (parts.some((x) => PROTECTED_STEMS.includes(x))) return true;
+  for (let i = 0; i < parts.length; i++) {
+    for (let n = 1; n <= 3 && i + n <= parts.length; n++) if (PROTECTED_FILES.includes(parts.slice(i, i + n).join("."))) return true; // MEMORY.md.txt, memory.md.bak
+  }
+  return words && PROTECTED_WORD_RE.test(base);
+}
+
 /**
- * The file behind a reference, only if: its real path is a regular file inside one of `roots`, its extension is allowlisted, it is
- * not larger than MAX_MEDIA_BYTES and its first bytes match the type. Else {error: "unavailable" | "too_large" | "unsupported"}.
+ * The shared path check: the real path is inside a root, is not inside the engine's STATE DIR (its config, credentials, sessions, device
+ * and cron files) unless a root that lies strictly inside the state dir holds it (`<stateDir>/media`, or a workspace kept below it), and no
+ * path rule applies. Evaluated on a real path only.
  */
-export async function openMediaFile(src, { workspaceDir, stateDir, roots }) {
+function pathAllowed(real, roots, stateDir) {
+  const root = rootOf(real, roots);
+  if (root === null) return false;
+  const under = (p, r) => p.startsWith(r + path.sep);
+  const state = stateDir ? realOrNull(stateDir) : null;
+  if (state !== null && (real === state || under(real, state)) && !rootList(roots).some((r) => under(r, state) && under(real, r))) return false;
+  const media = state !== null ? realOrNull(path.join(stateDir, "media")) : null;
+  const ownerUpload = media !== null && real.startsWith(path.join(media, "inbound") + path.sep);
+  return !isProtectedRelPath(real.slice(root.length + 1), { words: !ownerUpload });
+}
+
+/** `\uXXXX` and `\-` escapes of a JSON string decoded, so `sk-ant-…` is seen as what it is. */
+const unescapeJsonish = (t) => t.replace(/\\u00([0-7][0-9a-fA-F])/g, (_m, h) => String.fromCharCode(parseInt(h, 16))).replace(/\\-/g, "-");
+/** The shared head check, for the text types: no high-confidence secret in the head (best effort, first SECRET_SCAN_BYTES only). */
+function headHoldsSecret(real, head) {
+  if (!TEXT_EXTS.has(path.extname(real).toLowerCase())) return false;
+  const raw = head.toString("latin1");
+  const text = raw.includes("\\") ? `${raw}\n${unescapeJsonish(raw)}` : raw;
+  return SECRET_SHAPES.some((re) => re.test(text)) || holdsKeyValue(text);
+}
+const headLength = (real, size) => Math.min(TEXT_EXTS.has(path.extname(real).toLowerCase()) ? SECRET_SCAN_BYTES : 4096, size);
+
+/** The real path of an OPEN file (what the descriptor really is, not what its name resolved to a moment ago), or null. */
+function fdRealSync(fd, real) {
+  const viaProc = realOrNull(`/proc/self/fd/${fd}`);
+  if (viaProc !== null) return viaProc;
+  // no /proc: the name must still resolve to the very same file it did
+  try {
+    const now = fs.realpathSync(real); const a = fs.fstatSync(fd); const b = fs.statSync(now);
+    return now === real && a.dev === b.dev && a.ino === b.ino ? now : null;
+  } catch { return null; }
+}
+/** Test seam only: called between the realpath and the open, where a directory could be swapped for a symlink. */
+export const _testHooks = { afterRealpath: null };
+
+/**
+ * The file behind a reference, only if: its real path is a regular file inside one of `roots`, not a protected path, its type is
+ * allowlisted (by extension, else the recorded inline-viewable image type `hint`), it is not larger than MAX_MEDIA_BYTES, its first bytes
+ * match the type, and, once opened, the descriptor's own real path passes the same path rules.
+ * Else {error: "unavailable" | "too_large" | "unsupported"}. `checkMediaFile` applies exactly the same rules without keeping it open.
+ */
+// Read-only, never follow a final symlink, and NEVER wait for a writer: a named pipe (FIFO) with an allowlisted name would otherwise
+// block the open() (the whole event loop for the synchronous listing check) until some process opens its other end. With O_NONBLOCK the
+// open returns at once and the regular-file check that follows refuses it.
+const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+export async function openMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
   const abs = resolveSource(src, { workspaceDir, stateDir });
   if (!abs) return { error: "unavailable" };
   let real;
   try { real = await fs.promises.realpath(abs); } catch { return { error: "unavailable" }; }
-  if (!rootList(roots).some((r) => real.startsWith(r + path.sep))) return { error: "unavailable" };
-  const t = typeOf(real);
+  if (!pathAllowed(real, roots, stateDir)) return { error: "unavailable" }; // outside the roots, or a protected path: indistinguishable to the app
+  const t = fileType(real, hint);
   if (!t) return { error: "unsupported" };
   let fh;
   try {
-    fh = await fs.promises.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    await _testHooks.afterRealpath?.(real);
+    fh = await fs.promises.open(real, OPEN_FLAGS);
+    // what was opened is judged again by ITS real path: a directory swapped for a symlink after the check would otherwise be followed
+    let opened = null;
+    try { opened = await fs.promises.realpath(`/proc/self/fd/${fh.fd}`); } catch { opened = fdRealSync(fh.fd, real); }
+    const t2 = opened !== null && pathAllowed(opened, roots, stateDir) ? fileType(opened, hint) : null;
+    if (!t2 || t2[0] !== t[0]) { await fh.close(); return { error: "unavailable" }; }
     const st = await fh.stat();
     if (!st.isFile()) { await fh.close(); return { error: "unavailable" }; }
     if (st.size > MAX_MEDIA_BYTES) { await fh.close(); return { error: "too_large" }; }
-    const head = Buffer.alloc(Math.min(4096, st.size));
+    const head = Buffer.alloc(headLength(opened, st.size));
     await fh.read(head, 0, head.length, 0);
     if (!bytesMatch(t[0], head)) { await fh.close(); return { error: "unsupported" }; }
-    return { fh, size: st.size, mime: t[0], name: path.basename(real).slice(0, 120) };
+    if (headHoldsSecret(opened, head)) { await fh.close(); return { error: "unavailable" }; }
+    return { fh, size: st.size, mime: t[0], name: path.basename(opened).slice(0, 120) };
   } catch {
     await fh?.close().catch(() => {});
     return { error: "unavailable" };
   }
 }
 
+/** Would `openMediaFile` serve this reference? The same steps, synchronously, for listing: {ok: true, size} or {ok: false}. */
+export function checkMediaFile(src, { workspaceDir, stateDir, roots, hint }) {
+  const abs = resolveSource(src, { workspaceDir, stateDir });
+  if (!abs) return { ok: false };
+  let fd;
+  try {
+    const real = fs.realpathSync(abs);
+    if (!pathAllowed(real, roots, stateDir)) return { ok: false };
+    const t = fileType(real, hint);
+    if (!t) return { ok: false };
+    _testHooks.afterRealpath?.(real);
+    fd = fs.openSync(real, OPEN_FLAGS);
+    const opened = fdRealSync(fd, real);
+    const t2 = opened !== null && pathAllowed(opened, roots, stateDir) ? fileType(opened, hint) : null;
+    if (!t2 || t2[0] !== t[0]) return { ok: false };
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_MEDIA_BYTES) return { ok: false };
+    const head = Buffer.alloc(headLength(opened, st.size));
+    fs.readSync(fd, head, 0, head.length, 0);
+    return bytesMatch(t[0], head) && !headHoldsSecret(opened, head) ? { ok: true, size: st.size } : { ok: false };
+  } catch { return { ok: false }; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
+}
+
 /** What the app sees of one media item: never a path, an artifact id or a URL other than a public https link. */
 export function publicMedia(it, available) {
   if (it.kind === "link") return { kind: "link", name: it.name, url: it.url };
-  return { ref: it.ref, kind: it.kind, name: it.name, mime: it.mime, size: it.size ?? null, available: available !== false };
+  return { ref: it.ref, kind: it.kind, name: it.name, mime: knownMime(it.mime), size: it.size ?? null, available: available !== false };
 }
 
 /** Bounded memory of refs the bridge has handed out: ref -> {key, messageId, item}. Lets /media skip a transcript re-read. */
@@ -307,28 +643,36 @@ export function registerMediaRoute(router, ctx) {
     try {
       if (!ctx.readable(key)) return gone();
       let hit = ctx.cache.get(ref);
-      if (!hit || hit.key !== key || hit.messageId !== msg) {
-        // not handed out by this process (restart) or asked for another message: re-derive the refs from that message itself
-        const m = await ctx.findMessage(key, msg);
-        if (!m) return gone();
-        const { media } = extractMedia(m, key);
+      let found = null; // the message itself, when it had to be read (an inline image is decoded from it, never cached)
+      if (!hit || hit.key !== key || hit.messageId !== msg || hit.item.inline !== undefined) {
+        // not handed out by this process (restart), asked for another message, or an inline image (its bytes live in the
+        // transcript row, not here): re-derive the refs from that message itself
+        found = await ctx.findMessage(key, msg);
+        if (!found) return gone();
+        const { media } = extractMedia(found, key);
         const item = media.find((it) => it.ref === ref);
         if (!item) return gone();
         hit = { key, messageId: msg, item };
         ctx.cache.put(key, msg, item);
       }
       const it = hit.item;
+      if (it.inline !== undefined) {
+        const r = inlineImageBytes(found, it);
+        if (r.error) return res.status(r.error === "too_large" ? 413 : r.error === "unsupported" ? 415 : 404).json({ ok: false, error: r.error });
+        return send(res, it.mime, it.name, r.bytes.length, (out) => out.end(r.bytes));
+      }
+      if (it.missing !== undefined) return gone(); // the engine kept no bytes for this image
       if (it.artifact) {
         if (!ctx.gatewayCall) return res.status(503).json({ ok: false, error: "not_available" });
         const d = await ctx.gatewayCall("artifacts.download", { sessionKey: key, artifactId: it.artifact });
         const mime = String(d?.artifact?.mimeType ?? "").toLowerCase();
         const data = d?.encoding === "base64" && typeof d.data === "string" ? Buffer.from(d.data, "base64") : null;
-        if (!data || !MIME_EXT[mime] || !mime.startsWith("image/")) return res.status(415).json({ ok: false, error: "unsupported" });
+        if (!data || !knownMime(mime) || !mime.startsWith("image/")) return res.status(415).json({ ok: false, error: "unsupported" });
         if (data.length > MAX_MEDIA_BYTES) return res.status(413).json({ ok: false, error: "too_large" });
         if (!bytesMatch(mime, data.subarray(0, 64))) return res.status(415).json({ ok: false, error: "unsupported" });
         return send(res, mime, `image${MIME_EXT[mime]}`, data.length, (out) => out.end(data));
       }
-      const f = await openMediaFile(it.file, ctx);
+      const f = await openMediaFile(it.file, { ...ctx, hint: it.hint });
       if (f.error) return res.status(f.error === "too_large" ? 413 : f.error === "unsupported" ? 415 : 404).json({ ok: false, error: f.error === "unavailable" ? "not_found" : f.error });
       return send(res, f.mime, f.name, f.size, (out) => {
         const stream = f.fh.createReadStream({ start: 0, end: Math.max(f.size - 1, 0), autoClose: true });

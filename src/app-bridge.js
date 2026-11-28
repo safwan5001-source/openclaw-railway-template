@@ -55,7 +55,7 @@ import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStat
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createRunsProbe } from "./app-bridge-runs.js";
 import { createAppControl } from "./app-control.js";
-import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
+import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, checkMediaFile, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
 
 export const APP_SESSION = "app:owner";
@@ -64,6 +64,9 @@ export const MAIN_SESSION_KEY = "agent:main:main";
 export const MIN_TOKEN_LENGTH = 32;
 export const MAX_MESSAGE_CHARS = 8000;
 const MAX_RUNS_KEPT = 20;
+/** The id the engine's chat endpoint gives a turn (`id` of every stream chunk; `__openclaw.runId` of the reply rows it writes). */
+const ENGINE_RUN_ID = /^chatcmpl_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_RUN_LINKS = 500; // engine run id -> the runId /send returned, kept in memory for the rows of recent turns
 const RUN_TIMEOUT_MS = 15 * 60_000;
 const READ_TIMEOUT_MS = 15_000;
 const AUTH_FAILURES_PER_MINUTE = 20;
@@ -227,6 +230,18 @@ export function messageText(m) {
   return c.filter((p) => p && typeof p === "object" && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
 }
 
+/**
+ * A coarse, non-sensitive code for a turn that failed, read from what the engine / the provider said (the text itself never leaves
+ * the bridge): `rate_limited` for a provider limit (HTTP 429, `usage_limit_reached`, "rate limit", "too many requests").
+ * `null` when the failure has no known code; `run.error` stays `engine_error` either way.
+ */
+export function runErrorCode(err) {
+  const s = String(err?.message ?? err ?? "").slice(0, 2000);
+  // anchored to what a limit looks like: an HTTP status ("HTTP 429", "status 429", "chat 429", a message that starts with it), the
+  // provider's own `usage_limit_reached`, "rate limit", "too many requests". A bare 429 elsewhere ("after 429ms", a pid, an id) is not one.
+  return /\b(?:HTTP(?:\/[\d.]+)?|status|chat)\s*:?\s*429\b|^\s*429\b|usage_limit_reached|rate[_ ]?limit|too many requests/i.test(s) ? "rate_limited" : null;
+}
+
 function sessionLabel(row) {
   if (row.key === APP_SESSION_KEY) return "التطبيق";
   if (row.key === MAIN_SESSION_KEY) return "الجلسة الرئيسية";
@@ -248,7 +263,7 @@ export function capConcurrency(fn, max, queueMax) {
 }
 
 /** Reads the SSE stream of /v1/chat/completions, calling onText with the growing text (the first call marks the first token). */
-async function readCompletionStream(body, onText) {
+async function readCompletionStream(body, onText, onEngineRunId) {
   const decoder = new TextDecoder();
   let buf = "";
   let text = "";
@@ -265,6 +280,7 @@ async function readCompletionStream(body, onText) {
         let j;
         try { j = JSON.parse(data); } catch { continue; }
         if (j?.error) throw new Error(typeof j.error?.message === "string" ? j.error.message : "agent run failed");
+        if (onEngineRunId && typeof j?.id === "string" && ENGINE_RUN_ID.test(j.id)) onEngineRunId(j.id);
         const delta = j?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta) { text += delta; onText(text); }
       }
@@ -296,6 +312,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
   const router = express.Router();
   const resetState = { active: false }; // B1: shared by /new and /send (see app-bridge-convo.js)
+  const runLinks = new Map(); // engine run id -> runId of /send (this process only)
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   let failures = { windowStart: 0, count: 0 };
   // B4: a reply that finishes while the app was not polling (phone locked / app closed) is worth a push; /events is the server's
@@ -440,19 +457,38 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const roots = mediaRoots(workspaceDir, stateDir); // a getter: roots are resolved lazily
   const mediaCtx = { workspaceDir, stateDir, roots };
   /** Transcript rows -> the app's rows: text (MEDIA: lines and attachment markers removed), media refs, id, reset boundaries. */
-  const mapRows = (key, rows) => rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))).map((m) => {
+  /**
+   * The runId /send returned for the turn that wrote user row `i` of `list`, or null. The engine does not store any id of its own on
+   * the user row (its `idempotencyKey` is an internal run id the chat endpoint never reveals), but the reply row of the same turn
+   * carries the id of the stream (`__openclaw.runId`), which this process saw and linked to the runId it returned. A user row gets it
+   * only when it is provably THE one user row of that turn: the key is the app session, the next row is an assistant row whose engine
+   * run id was linked in this process and which is not older than the user row, and the row before the user row is an assistant row
+   * or a reset (or the page starts here and `complete` says nothing older exists). Two user rows in a row before one reply (a turn
+   * that was stopped, then another) are ambiguous: neither gets an id. Nothing else is ever published.
+   */
+  const runIdOf = (key, list, i, complete) => {
+    if (key !== APP_SESSION_KEY || list[i]?.role !== "user") return null;
+    const prev = i === 0 ? null : list[i - 1];
+    if (i === 0 ? complete !== true : prev.role === "user") return null;
+    const next = list[i + 1];
+    const engineId = next?.role === "assistant" ? next.__openclaw?.runId : null;
+    if (typeof engineId !== "string" || !(Number(next.timestamp) >= Number(list[i].timestamp))) return null;
+    return runLinks.get(engineId) ?? null;
+  };
+  const mapRows = (key, rows, complete = false) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
     if (isResetRow(m)) return { role: "system", kind: "reset", text: "", at: Number(m.timestamp) || 0, id: rowId(m), media: [] };
     const { text, media, messageId } = extractMedia(m, key, messageText(m));
     for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
     const pub = media.map((it) => {
-      if (it.kind === "link" || it.artifact) return publicMedia(it, true);
-      const abs = resolveSource(it.file, mediaCtx);
-      let size = null; let ok = false;
-      try { const real = fs.realpathSync(abs); const st = fs.statSync(real); ok = st.isFile() && roots().some((r) => real.startsWith(`${r}/`)); size = ok ? st.size : null; } catch { /* missing */ }
+      if (it.kind === "link") return publicMedia(it, true);
+      if (it.avail !== undefined) return publicMedia(it, it.avail); // an image block: served from the transcript, or unavailable (never dropped)
+      const c = checkMediaFile(it.file, { ...mediaCtx, hint: it.hint }); // the very rules /media serves by
+      const ok = c.ok; const size = ok ? c.size : null;
       return publicMedia({ ...it, size }, ok);
     });
-    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(m.role === "assistant" ? assistantMeta(m) : {}) };
-  }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0);
+    const runId = runIdOf(key, list, i, complete);
+    return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(runId ? { runId } : {}), ...(m.role === "assistant" ? assistantMeta(m) : {}) };
+  }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0); };
 
   router.get("/history", async (req, res) => {
     const key = String(req.query.key ?? APP_SESSION_KEY);
@@ -475,7 +511,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (offsetRaw !== undefined) args.offset = Math.max(Number.parseInt(String(offsetRaw), 10) || 0, 0);
       const h = await invoke("sessions_history", args);
       const raw = Array.isArray(h.messages) ? h.messages : [];
-      const messages = mapRows(key, raw);
+      const messages = mapRows(key, raw, h.hasMore !== true && args.offset === undefined);
       // after «محادثة جديدة» the engine's default view starts at the reset row; the rows before it stay readable (anchored)
       const first = raw.find((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m)));
       const earlier = h.hasMore !== true && key === APP_SESSION_KEY && first && isResetRow(first) && ledger.anchorFor(rowId(first)) ? rowId(first) : null;
@@ -514,12 +550,17 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
         signal: ctl.signal,
       });
       if (!r.ok || !r.body) throw new Error(`chat ${r.status}`);
-      run.text = await readCompletionStream(r.body, (t) => { run.firstTokenAt ??= now(); run.text = t; });
+      run.text = await readCompletionStream(r.body, (t) => { run.firstTokenAt ??= now(); run.text = t; }, (engineId) => {
+        if (runLinks.has(engineId)) return;
+        runLinks.set(engineId, id);
+        while (runLinks.size > MAX_RUN_LINKS) runLinks.delete(runLinks.keys().next().value);
+      });
       run.status = "done";
     })()
       .catch((err) => {
         run.status = ctl.signal.aborted ? "stopped" : "error";
         run.error = run.status === "error" ? "engine_error" : null;
+        if (run.status === "error") run.errorCode = runErrorCode(err);
         if (run.status === "error") log?.warn?.("app-bridge", `run failed: ${err?.message ?? err}`);
       })
       .finally(() => { clearTimeout(timer); run.finishedAt = now(); forgetDescribe(); }); // the turn saved the session: a cached describe is stale
@@ -532,7 +573,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     totalMs: r.finishedAt == null ? null : r.finishedAt - r.startedAt,
   });
   // the live text hides the engine's own media markers the same way history rows do (the app shows the file, not the marker)
-  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: cleanLiveText(r.text, { streaming: r.status === "running" }), error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
+  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: cleanLiveText(r.text, { streaming: r.status === "running" }), error: r.error, ...(r.errorCode ? { errorCode: r.errorCode } : {}), startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
     steps: r.steps ?? [] });
 
   /** B1 tool progress: refreshed only while the app polls a running turn, at most every STEPS_EVERY_MS; names only. */

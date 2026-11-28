@@ -49,7 +49,12 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `GET /app/v1/memory/file?name=&part=` | `MEMORY.md` or `USER.md` only, read-only | RPC `agents.files.get` |
 | `GET /app/v1/capabilities` | Channels, skills ready/missing, effective tools of the app session, plugins; cached 60 s | RPC `channels.status`, `skills.status`, `tools.effective`, `tools.catalog` (10 min), `plugins.list` |
 
-`/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Its `text` (while
+`/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. When a turn ends in
+`status: "error"`, `error` stays the opaque `engine_error`; an additive `errorCode` is present only when the failure is a known kind:
+`rate_limited` (the failure text shows an HTTP status 429 (`HTTP 429`, `status 429`, `chat 429`, or a message that begins with `429`), `usage_limit_reached`, "rate limit" or "too many requests"; a bare number such as `429ms` or a pid is not one; lab: the gateway reports
+"429 The usage limit has been reached" on the stream). The provider's own text never leaves the bridge. Other failures carry no `errorCode`.
+That is the only place the bridge sees such a failure: when an image-generation tool fails inside a turn that otherwise completes, the
+failure is only in the model's reply text (and in the tool result, which the bridge never reads), so there is nothing to map. Its `text` (while
 running and when done) never contains the engine's own media markers: standalone `MEDIA:` lines and `[media attached: …]` markers are
 removed with the same rules as history rows, and while the reply is still streaming a half-written marker at the very end (`ME`,
 `MEDIA:`, `[media att…`) is held back until the next chunk completes it. The file itself is delivered as in history (`media` refs). Assistant messages in
@@ -314,7 +319,7 @@ persona (`<state dir>/settings/tts.json`): it would read `mismatch` too.
 
 ## Chat basics and media (B1 + B2)
 
-Code: `src/app-bridge-convo.js` and `src/app-bridge-media.js`. Tests: `src/app-bridge-media.test.mjs`. The wrapper's CLI allowlist
+Code: `src/app-bridge-convo.js` and `src/app-bridge-media.js`. Tests: `src/app-bridge-media.test.mjs`, `src/app-bridge-media-shapes.test.mjs`. The wrapper's CLI allowlist
 adds `sessions.reset`, `sessions.search`, `chat.history` and `artifacts.download`; only `artifacts.download` gets a 32 MB output
 buffer. Every call is built by the bridge with the app session key or a key that passed `isReadable`.
 
@@ -327,9 +332,81 @@ buffer. Every call is built by the bridge with the app session key or a key that
   `MEDIA:` lines (the engine's rule: standalone, outside code) and `[media attached: …]` markers are removed from `text` and
   become `media: [{ref, kind: image|file, name, mime, size, available}]`, or `{kind: "link", url}` for a public https URL.
   A `ref` is `sha256(key, messageId, position, source)`. Paths and artifact ids never leave the bridge.
+- **Images in the transcript (lab, OpenClaw 2026.11.10).** Every image block in the rows the bridge reads is one `media` entry, and a
+  message with an image is never dropped from `/history` (a row with no text and no image still is). Shapes, from the engine's
+  `sessions_history` tool and the anchored `chat.history` read (the same projection; the raw stored block is `{type: "image", data,
+  mimeType}`, with `data` inline, in the engine's database):
+
+  | Block the bridge sees | When | Entry |
+  |---|---|---|
+  | `{type: "image", mimeType, artifactId, omitted: true, bytes}` | every stored image: an app photo (vision model), a WhatsApp photo. The engine replaces `data` by an artifact id and adds the decoded size | served with `artifacts.download` |
+  | `{type: "image", data, mimeType}` (or `source.data`) | never seen in the lab through either read (the engine's projection removes `data`); handled if a row ever carries it | decoded from that block on demand, only if type is png/jpeg/gif/webp, size ≤ **5 MiB** decoded, well-formed base64 (length a multiple of 4, `=` padding only at the end, at most two) and the first bytes match (above that: kept, `available: false`, `/media` 413); the base64 is never copied into a cache or a response. The cap is below the 20 MB file cap because every request re-reads the row with `chat.history` through the CLI, whose output buffer is 8 MB of JSON |
+  | `{type: "image", mimeType, omitted: true, bytes}` (no `artifactId`) | the stored block has no payload left | the file facts of the message (`__openclaw.media` → `media://inbound/<id>`), if any, are served through the engine-owned roots; else `available: false`. An id with no file extension is typed by the image type the engine recorded for it (png/jpeg/gif/webp only); the bytes must still match it |
+  | no image block, text `User sent image(s) with no text.` | a turn of images only on a model without image input (the engine drops the image) | one `available: false` image entry |
+
+  `User sent image(s) with no text.` is the engine's own sentence for an image-only turn; in a user row it is not shown as text.
+  A WhatsApp photo has the block, the marker `[media attached: <path> (<type>) | media://inbound/<id>]` and the file fact: they name
+  one picture and give one entry (blocks pair, in order, with the picture files of the message, a heic too; a file whose type differs from the block's is another picture's; a block that cannot be served itself, being empty, over the 5 MiB inline cap, undecodable or not what it declares, gives way to its paired file, so the photo stays downloadable; a servable block wins and the file is not a second entry) (the marker's stored-upload URL, or else its path, is the source; the type and file name are not). The file name is a quoted JSON string that may hold `]`, quotes and be long; it is parsed in one bounded linear pass and never leaves debris in `text`.
+  A listed entry means `/media` will serve it: the listing applies the same rules as serving (engine-owned roots, type by extension or recorded image type, 20 MB cap, magic bytes). Only allowlisted mime types are published (`mime` is `null` otherwise). An artifact block of a non-inline image type (heic/heif) is listed as `kind: "file"` and downloaded; an inline block of such a type is `available: false`.
+  **Refs change once:** a WhatsApp photo used to list two entries (artifact + marker file); it is now one, so its position-based `ref` is different. A `ref` the app already holds for such a row answers 404 until `/history` is read again (the app re-reads it).
+  An entry that cannot be served is `available: false` and `/media` answers 404/413/415, as for files. Not provable in the lab: what
+  a CLI-backed model runtime writes for a photo (a mock vision model was used), and which of these shapes the production rows actually have.
+- **`runId` on a user row (additive).** `/history` user rows of the app session carry `runId`, the same id `POST /send` returned, **only
+  when the bridge knows it**; otherwise the field is absent. Lab (OpenClaw 2026.11.10): the engine stores nothing the bridge could
+  send or read back on the user row itself. Its `idempotencyKey` is `<internal run id>:user`, a uuid the chat endpoint never reveals
+  (the endpoint reads no idempotency header or body field, and the stream's `id` is a different one, `chatcmpl_<uuid>`). The stream
+  `id` is, however, what the engine writes as `__openclaw.runId` on the reply rows of that turn. The bridge links that id to the
+  `runId` it returned (in memory, last 500 turns) and gives a user row the `runId` of the reply row right after it, when: the key is
+  the app session, the next row is an assistant row whose engine run id was linked in this process and which is not older than the
+  user row, **and it is the only user row of that turn**: the row before it is an assistant row or a reset row, or the page starts
+  at it and nothing older can exist (a default page, no `offset`, `hasMore: false`). Two user rows in a row before one reply
+  (a turn that was stopped, then another) get no `runId` at all, because the first turn's reply could still be written after the
+  second row. So there is no `runId` for: rows of any other conversation (WhatsApp), turns started by another client, turns before
+  the last bridge restart, a turn that failed or was stopped before a reply row existed, the turn sent right after a stopped one (its
+  row follows the stopped turn's orphan user row), the first row of a cut page, and rows whose reply is outside the page that was
+  read. Only the bridge's own uuid is ever published: no engine run id, idempotency key, row id of another row, session key or internal id.
+  Lab (stop and re-send): aborting the bridge's request to the chat endpoint (the stop button, the 15-minute timeout) **does stop the
+  engine's run**: its user row stays with no reply, the next turn's user row follows it, and no late reply for the stopped turn was
+  written in 40 s. Two requests to the endpoint at once are **serialized by the engine** (the second user row is written after the
+  first reply). So the sequence user A, user B, reply A was not seen; the strict rule above makes sure a late reply could never
+  hand A's id to B if it happened. The bridge's busy check still looks only at its own turns (it can start a turn right after a stop
+  while the engine winds the stopped one down); that is documented, not changed.
+- **What the app can download.** `/media` (and the `available` flag of every `media` entry, which applies the very same rules) serves a
+  local file only if ALL of these hold; the pieces are in one place (`src/app-bridge-media.js`) and pinned by `src/app-bridge-media-guard.test.mjs`:
+  1. **Roots.** Its real path (symlinks resolved, no final symlink followed) is a regular file inside the agent workspace or `<stateDir>/media`. Nothing else.
+  2. **Not the engine's state.** Whatever the roots, a real path under the state dir (config, device and auth files, sessions, cron, models with provider keys, the bridge's own
+     files) is refused unless it is under `<stateDir>/media` (or under a root that itself lies inside the state dir, as the default layout's `<stateDir>/workspace`).
+     This holds when the workspace is the state dir, or a parent of it.
+  3. **Type.** The extension is on the fixed list (images png/jpg/jpeg/gif/webp/heic/heif, pdf, txt, md, csv, json, docx, xlsx, pptx, mp3, m4a, ogg, wav, mp4), or the id has none and the
+     engine recorded an inline-viewable image type for that stored upload; the first bytes match the type; the size is at most 20 MB. SVG, HTML, scripts and everything else are never served.
+  4. **Protected paths (initial guard).** Judged on the real path, below the deepest root it is under (where the root itself lives does not matter), case-insensitively, and judged AGAIN on the
+     real path of the file once opened (a directory swapped for a symlink after the check is caught). A file is refused when
+     - any path segment starts with `.` (`.env`, `.git`, `.ssh`, `.openclaw`, `.cache`);
+     - any directory is `memory`, `memories`, `dreams`, `dreaming`, `credentials`, `secrets`, `auth`, `backups` or `node_modules`;
+     - its name, or any run of up to three dot-separated parts of it, is `memory.md`, `soul.md`, `user.md`, `identity.md`, `agents.md`, `tools.md`, `heartbeat.md`, `bootstrap.md`, `boot.md`,
+       `dreams.md`, `openclaw.json`, `auth.json`, `auth-profiles.json`, `credentials.json`, `secrets.json`, `config.json` or `settings.json` (so `MEMORY.md.txt` is caught too);
+     - any dot-separated part of its name is `env`, `dotenv`, `cookies`, `wallet`, `keys`, `session`, `id_rsa`, `id_ed25519` or `passwd` (`session.json`, `id_rsa.md`);
+     - its name ends with, or has followed by a separator or digit, one of `secret(s)`, `credential(s)`, `token(s)`, `password(s)`, `apikey`, `api-key`, `api_key`, `privatekey`, `private-key`,
+       `private_key`, `auth-profile(s)`, in any letter case (`my-token.json`, `db_password.txt`, `accessToken.json`, `gatewaytoken.txt`; `tokenizer-notes.md`, `secretary.md`, `passwordless.txt` pass).
+       This one rule is skipped for files under `<stateDir>/media/inbound/`: the owner's uploads keep their own file names (`my-password-screen---3f2a.png` is served);
+     - for `.txt .md .csv .json` the first **64 KiB** hold a private-key header (`-----BEGIN … PRIVATE KEY-----`), a well-known token shape (`sk-ant-…`, `sk-…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`,
+       `github_pat_`, `AKIA…`, `xox?-…`, `Bearer eyJ….….…`), or a `KEY=VALUE` / `"key": "value"` whose key contains `token`, `secret`, `password`, `passwd` or `api_key` and whose value has 16+
+       characters without spaces. `\u002d` and `\-` escapes are decoded first. Best effort, head only, linear time: a secret further into a file, or in a binary type (pdf, docx, xlsx, pptx), is not seen.
+  A refused file is answered exactly like a file that is not there (`available: false`, `/media` 404): the app is never told why. The lists are constants in one place, not configuration.
+  **This is an initial guard, not the final design:** the allow-listed outbox for files the agent sends (and the full review of what else a workspace may expose) is Batch 7, which also closes
+  what a deny-list cannot: hard links to a protected file, and a copy of it under a new name. Also left as they are: the listing check is synchronous (`checkMediaFile` is not async),
+  and `skills/` and `daftra-ledger/` are not protected folders.
+  **Known false positives (refused on purpose; documented, not removed):** `design-tokens.json`, `password-policy.pdf`, `secret-santa.xlsx`, `customer-credentials-checklist.pdf`,
+  `backups/q3-report.pdf`, `clients/auth/letter.pdf`, `Memory/photo.png`, any `agents.md`, `tools.md`, `user.md`, `config.json`, `settings.json`, a document that quotes `Bearer eyJ…` or
+  `sk-…` or `OPENAI_API_KEY=…` in its first 64 KiB, anything inside a `.cache` (or any hidden) folder. **To get such a file across today:** give it a different name (for example
+  `design-notes.json`, `report-q3.pdf`) or move it out of the protected folder, and name the new path; or ask for its text in the chat. If the owner really wants a memory or config file in the
+  chat, they can ask for its content as text; the file route will not serve the file itself.
+  Legitimate flows are unchanged: images, documents, reports (`out/`, `reports/2026/`, the workspace root), audio and video, and everything under `<stateDir>/media` (inbound uploads,
+  generated images, speech) are listed and served as before.
 - **`/media`.** The ref is resolved from the bridge's bounded ref cache, or else by re-reading THAT message (anchored
   `chat.history`), so it only works for the message it came from.
-  - Image blocks are fetched with `artifacts.download` (image types only, bytes must match).
+  - Image blocks are fetched with `artifacts.download` (image types only, bytes must match). An inline block is decoded from the
+    re-read message (an inline ref is never answered from the cache, which holds no payload) under the same limits.
   - Allowed roots are resolved per request (a root created after the wrapper started is honoured).
   - Files are served only if their realpath (symlinks resolved, `O_NOFOLLOW`) is a regular file inside the agent workspace or
     `<stateDir>/media`, the extension is on a fixed list (images, PDF, txt/md/csv/json, docx/xlsx/pptx, mp3/m4a/ogg/wav, mp4),
