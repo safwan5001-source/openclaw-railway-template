@@ -46,6 +46,8 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const MIME_EXT = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/heic": "heic", "image/heif": "heif" };
 
 const SESSION_RETRY_MS = [100, 300, 600];
+const TURN_CACHE_MS = 5_000;
+const PRECHECK_TIMEOUT_MS = 3_000; // N2: the already-used-id check inside the send mutex is short
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const str = (v, max = 200) => (typeof v === "string" && v.trim() ? v.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max) : null);
@@ -144,7 +146,8 @@ export function createThreadRuns({ writeLink, now = Date.now, messageText }) {
       // content parts with openclawStatusNotice). The first final reply text is kept; notices never replace it (history agrees).
       if (r.status !== "done") { r.status = "done"; r.finishedAt = now(); }
       const t = p.message && !isStatusNotice(p.message) ? messageText(p.message) : "";
-      if (t && !r.finalText) { r.text = t; r.finalText = true; }
+      if (t && !r.finalText) { r.text = t; r.finalText = true; r.textPending = false; }
+      else if (!r.finalText) r.textPending = true; // a final without the reply text (a notice only): read it from the engine
     }
     else if (p.state === "aborted") { r.status = "stopped"; r.finishedAt = now(); }
     else if (p.state === "error") {
@@ -410,7 +413,15 @@ export function registerThreadRoutes(router, ctx) {
       if (legacyBusy(k)) return reply(res, 409, "busy", { busyThread: "legacy" });
       // after a bridge restart the in-memory record is gone: ask the ENGINE whether this id already ran (in any conversation, m3)
       let w;
-      try { w = await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }); } catch { return reply(res, 503, "not_written", { reason: "precheck_failed" }); }
+      try { w = await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: PRECHECK_TIMEOUT_MS }); } catch (err) {
+        // N2: an engine REFUSAL of this call (unknown method, missing scope, bad params) would block every thread send: reported
+        // distinctly (and logged loudly) so it is seen at once; no answer at all is the ordinary precheck_failed. Both: nothing sent.
+        if (err?.refused || err?.code === "not_allowed" || err?.code === "bad_params") {
+          log?.warn?.("app-bridge", `thread send pre-check refused by the engine (${err?.code ?? "?"}): every thread send is blocked until this is fixed`);
+          return reply(res, 503, "not_written", { reason: "precheck_refused" });
+        }
+        return reply(res, 503, "not_written", { reason: "precheck_failed" });
+      }
       if (w?.status === "ok" || w?.status === "error") return reply(res, 409, ALREADY_SENT);
       let s;
       try { s = await describe(k.qualified); } catch { return reply(res, 503, "not_written", { reason: "precheck_failed" }); }
@@ -479,26 +490,31 @@ export function registerThreadRoutes(router, ctx) {
     const live = runs.get(K);
     if (live && live.tid !== k.tid) return reply(res, 404, "not_found");
     if (!link?.isUp?.() && !live) return linkDown(res);
-    // The engine's own record: history rows tagged with K (bounded to K's turn), the resumed run, and agent.wait {timeoutMs:0}.
-    // Read for every poll of a finished or unknown run, and at most every 1.5 s for a live one, whose terminal event may have been
-    // missed (a write-link drop/reconnect, an ack timeout): the engine then decides, never the stale cache (review I2).
+    // The engine's own record: agent.wait {timeoutMs:0} FIRST, then history rows tagged with K (bounded to K's turn), and the
+    // resumed run. Read for every poll of a finished or unknown run, at most every 1.5 s for a live one (its terminal event may
+    // have been missed: a write-link drop/reconnect, an ack timeout), and on every poll while its final text is still pending.
+    // agent.wait before history (review N1): a run that ends between the two reads still has its reply row in the history page.
     let rows = null; let wait = null;
-    if (link?.isUp?.() && (!live || live.status !== "running" || now() - live.stepsAt >= 1500)) {
+    const pending = live?.textPending === true;
+    if (link?.isUp?.() && (!live || live.status !== "running" || pending || now() - live.stepsAt >= 1500)) {
+      try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
       try {
         const h = await link.request("chat.history", { sessionKey: k.qualified, limit: 50 }, { timeoutMs: READ_TIMEOUT_MS });
         rows = Array.isArray(h?.messages) ? h.messages : [];
         if (live) live.stepsAt = now();
       } catch { rows = null; }
-      try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
     }
     if (!live && rows === null) return reply(res, 502, "engine_unavailable"); // could not read: never reported as "no such run"
     let seg = rows ? turnSegment(rows, K) : null;
-    if (!live && seg === null) {
-      // K's user row is older than the newest page (a tool-heavy later turn): page back, bounded, before answering (Codex)
-      const f = await findTurn(link, k.qualified, K);
+    // K's user row is older than the newest page (a tool-heavy turn): page back, bounded, before answering (Codex) — with no live
+    // record, or when a live record needs the engine's rows for its final text (terminal now, or text pending: review N1).
+    // A live run that is still running polls the newest page only (cheap).
+    const terminalNow = wait === "ok" || wait === "error";
+    if (seg === null && rows !== null && (!live || pending || (live.status === "running" && terminalNow) || (live.status !== "running" && !live.text))) {
+      const f = await findTurnCached(k.qualified, K);
       if (f.found) seg = turnSegment(f.rows, K);
       // could not tell: honest "unknown", never not_found; nothing about the run is reported (agent.wait is engine-global)
-      else if (!f.complete) return res.json({ ok: true, runId: K, thread: k.tid, status: "unknown", text: "", phase: null, steps: [], startedAt: null, finishedAt: null,
+      else if (!live && !f.complete) return res.json({ ok: true, runId: K, thread: k.tid, status: "unknown", text: "", phase: null, steps: [], startedAt: null, finishedAt: null,
         interrupted: false, resumed: null, located: false, boot: ctx.boot() });
     }
     // m2: with no live record, a run is reported only when K's own user row is in THIS conversation (agent.wait is engine-global)
@@ -509,31 +525,38 @@ export function registerThreadRoutes(router, ctx) {
     const first = after.find((m) => isResumedRow(m) && m.__openclaw?.runId !== K);
     const resumedId = first ? first.__openclaw.runId : null;
     const resumedRows = resumedId ? after.filter((m) => m.role === "assistant" && m.__openclaw?.runId === resumedId) : [];
-    const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: ctx.messageText(resumedRows.at(-1)) } : null;
+    // its reply, never a trailing engine status notice (Codex, as BUG-2)
+    const resumedReply = resumedRows.filter((m) => !isStatusNotice(m)).at(-1);
+    const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: resumedReply ? ctx.messageText(resumedReply) : "" } : null;
     if (live && live.status === "running") {
       if (rows) live.steps = stepsFrom(after, 0);
       // the engine's verdict when no final reached this bridge: agent.wait, else K's own final reply row in history (agent.wait can
       // time out for an id the engine finished before a restart, integration BUG-1)
       const finalRow = own.findLast((m) => isFinalReply(m));
-      if (wait === "ok" || wait === "error" || finalRow) {
+      if (terminalNow || finalRow) {
         live.status = wait === "error" ? "error" : "done"; live.finishedAt = now();
-        const t = (finalRow ?? own.filter((m) => !isStatusNotice(m)).at(-1)) ? ctx.messageText(finalRow ?? own.filter((m) => !isStatusNotice(m)).at(-1)) : "";
-        if (t) { live.text = t; live.finalText = true; }
+        // the final text comes from the engine's rows; until they are readable the text is PENDING, never frozen (review N1)
+        if (!live.finalText) live.textPending = true;
       } else if (resumed) { live.status = "unknown"; live.finishedAt = now(); } // K was interrupted; the engine continued it in another run
     }
-    // a record that ended without its reply text (ack "ok", a notice-only final): the text of K's own reply row
-    if (live && live.status === "done" && !live.text && own.length) {
-      const last = own.filter((m) => !isStatusNotice(m)).at(-1);
-      if (last) { live.text = ctx.messageText(last); live.finalText = true; }
+    // a record that ended without its reply text (missed final, ack "ok", a notice-only final): K's own reply row, as soon as the
+    // engine has it; re-read on every poll while pending
+    if (live && live.status !== "running" && (live.textPending || !live.text)) {
+      const last = own.findLast((m) => isFinalReply(m)) ?? own.filter((m) => !isStatusNotice(m)).at(-1);
+      if (last) { live.text = ctx.messageText(last); live.finalText = true; live.textPending = false; }
+      else if (live.status === "done" && !live.finalText) live.textPending = true;
     }
-    const status = live ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : "unknown";
-    const ownReply = own.filter((m) => !isStatusNotice(m)).at(-1);
+    // ONE rule for "terminal + text" from the engine's rows, cached or not (Codex + N1): agent.wait ok/error, else K's own final
+    // reply row (agent.wait can time out for a run finished before a gateway + wrapper restart). Read-only.
+    const ownFinal = own.findLast((m) => isFinalReply(m));
+    const status = live ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : ownFinal && !resumed ? "done" : "unknown";
+    const ownReply = ownFinal ?? own.filter((m) => !isStatusNotice(m)).at(-1);
     const text = live ? live.text : ownReply ? ctx.messageText(ownReply) : "";
     res.json({ ok: true, runId: K, thread: k.tid, status, text: ctx.cleanLiveText(text, { streaming: status === "running" }), phase: live?.phase ?? null,
       steps: live ? live.steps : stepsFrom(after, 0), startedAt: live?.startedAt ?? null, finishedAt: live?.finishedAt ?? null,
       ...(live?.errorCode ? { errorCode: live.errorCode } : {}),
       // the engine continued this turn in a NEW run after a restart (lab L5): shown as what it is, never re-executed by the bridge
-      interrupted: resumed !== null, resumed, boot: ctx.boot() });
+      interrupted: resumed !== null, resumed, ...(live?.textPending ? { textPending: true } : {}), boot: ctx.boot() });
   });
 
   router.post("/threads/:tid/runs/:runId/abort", async (req, res) => {
@@ -551,6 +574,17 @@ export function registerThreadRoutes(router, ctx) {
   });
 
   // ---- per-conversation settings: one write at a time per key; a change while a run is active is refused (it would be overwritten) ----
+  // N3: one poll of an id the bridge holds no record of may page back up to RECONCILE_MAX_PAGES (10 × 200 rows); the result is kept
+  // for TURN_CACHE_MS per (conversation, K) so repeated or concurrent polls cost 2 link reads (agent.wait + one history page)
+  const turnCache = new Map();
+  async function findTurnCached(qualified, K) {
+    const key = `${qualified}|${K}`; const hit = turnCache.get(key);
+    if (hit && now() - hit.at < TURN_CACHE_MS) return hit.result;
+    const result = await findTurn(link, qualified, K);
+    turnCache.delete(key); turnCache.set(key, { at: now(), result });
+    while (turnCache.size > 100) turnCache.delete(turnCache.keys().next().value);
+    return result;
+  }
   const keyed = createKeyedSerial();
   // m5: the legacy conversation's settings share the legacy routes' ONE queue (which also forgets the legacy describe cache)
   const serialFor = (k, fn) => (k.tid === "legacy" && ctx.legacySerial ? ctx.legacySerial(fn) : keyed(k.qualified, fn));
