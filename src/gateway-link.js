@@ -23,19 +23,49 @@ import crypto from "node:crypto";
 export const APP_SESSION_KEY = "agent:main:app:owner";
 export const LINK_SCOPES = Object.freeze(["operator.read", "operator.approvals", "operator.admin"]);
 export const LINK_CAPS = Object.freeze(["approvals"]);
-/** The ONLY gateway methods this link will send. Reads, plus the one approval write. Anything else is refused locally. */
+/**
+ * The ONLY gateway methods this link will send. Reads, the one approval write, and `tts.speak` (BASHT's voice: it returns audio bytes
+ * and writes nothing; its params are closed, see PARAM_VALIDATORS). Anything else is refused locally.
+ */
 export const LINK_METHODS = Object.freeze(new Set([
   "models.list", "sessions.describe",
   "exec.approval.list", "plugin.approval.list", "openclaw.approval.list", "approval.get", "approval.history", "approval.resolve",
+  "tts.speak",
+  "sessions.list", "cron.list", // read-only, fixed params: only to COUNT running work for GET /status (see src/app-bridge-runs.js)
 ]));
+export const TTS_SPEAK_MAX_CHARS = 1500; // the same cap as POST /app/v1/speak
+/**
+ * Methods whose params the link checks itself before anything is sent (a closed shape). A method without an entry keeps the
+ * gateway's own validation only. `tts.speak` takes `text` and nothing else: the gateway rejects any other param, and a voice, a
+ * provider or a model must never ride along from this side.
+ */
+/** The ONLY params the link sends for the two counting reads (exact match, nothing else): active sessions (one row, we read `totalCount`) and compact cron jobs. */
+export const SESSIONS_ACTIVE_PARAMS = Object.freeze({ activeOnly: true, limit: 1, includeGlobal: true, includeUnknown: true });
+export const CRON_RUNNING_PARAMS = Object.freeze({ includeDisabled: true, limit: 200, compact: true, includeDeliveryPreviews: false });
+// Own data properties only (an accessor could answer one value to this check and another to the serializer).
+const sameParams = (expected) => {
+  const want = Object.entries(expected);
+  return (p) => isPlainObject(p) && Object.keys(p).length === want.length && want.every(([k, v]) => {
+    const d = Object.getOwnPropertyDescriptor(p, k);
+    return d !== undefined && "value" in d && d.value === v;
+  });
+};
+const PARAM_VALIDATORS = Object.freeze({
+  "sessions.list": sameParams(SESSIONS_ACTIVE_PARAMS),
+  "cron.list": sameParams(CRON_RUNNING_PARAMS),
+  "tts.speak": (p) => isPlainObject(p) && Object.keys(p).length === 1 && typeof p.text === "string" && p.text.length >= 1 && p.text.length <= TTS_SPEAK_MAX_CHARS,
+});
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
 export const APPROVAL_KINDS = Object.freeze({ exec: "exec", plugin: "plugin", openclaw: "system-agent" });
 const LIST_METHOD = { exec: "exec.approval.list", plugin: "plugin.approval.list", "system-agent": "openclaw.approval.list" };
 export const RING_SIZE = 500;
 export const MAX_SUMMARY = 300;
+const SYNC_RETRY_MS = [2_000, 5_000, 15_000, 30_000];
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 const CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_TICK_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_REQUEST_TIMEOUT_MS = 120_000; // a caller may ask for longer than the default (tts.speak: 60 s), never unbounded
 const SEEN_APPROVALS = 2_000;
 const PROTOCOL = 4;
 
@@ -136,6 +166,11 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
   let retryTimer = null;
   let watchdog = null;
   let tickMs = DEFAULT_TICK_MS;
+  let syncAttempt = 0;
+  let approvalsSynced = false; // true only once EVERY approval list was read on the CURRENT connection (an empty map before that is "unknown", not zero)
+  let syncRetry = null; // retry timer for a resync that could not read every approval list (backoff; cleared on drop/stop)
+  let syncGen = 0; // bumps on every (re)connect and drop: a resync that finishes after its connection ended must not mark the next one synced
+  let serverVersion = null; // hello-ok `server.version` of the current connection (an engine version label, nothing else)
   let stopped = true;
 
   const setState = (s, err) => {
@@ -205,6 +240,7 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
 
   /** After (re)connecting: the pending approvals are read again, and any that arrived while the link was down enter the ring. */
   async function resync() {
+    const gen = syncGen;
     // Only approvals known BEFORE this resync can be forgotten, and only for kinds whose list was actually read: one that
     // arrives as a live event while the lists are being read stays pending (it is simply not in an earlier list answer).
     const before = new Map([...pending].map(([id, p]) => [id, p.kind]));
@@ -222,11 +258,19 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
       }
     }
     for (const [id, kind] of before) if (!seen.has(id) && read.has(kind) && pending.get(id)?.kind === kind) pending.delete(id);
+    if (gen !== syncGen || state !== "up") return;
+    if (read.size === Object.keys(LIST_METHOD).length) { approvalsSynced = true; syncAttempt = 0; return; }
+    // A list could not be read: stay "unknown" but try again (backoff), so a transient failure does not block releases until the next reconnect.
+    clearTimer(syncRetry);
+    const delay = SYNC_RETRY_MS[Math.min(syncAttempt, SYNC_RETRY_MS.length - 1)]; syncAttempt += 1;
+    syncRetry = setTimeout(() => { if (gen === syncGen && state === "up") resync().catch(() => {}); }, delay);
+    syncRetry.unref?.();
   }
 
   function dropped(reason) {
     clearTimer(watchdog);
     ws = null;
+    syncGen += 1; approvalsSynced = false; syncAttempt = 0; clearTimer(syncRetry);
     failInflight("link_down");
     if (stopped) { setState("off"); return; }
     if (state === "up") { downSince = now(); push({ type: "gateway.down" }); }
@@ -292,11 +336,13 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
             return;
           }
           tickMs = int(hello?.policy?.tickIntervalMs) || DEFAULT_TICK_MS;
+          serverVersion = typeof hello?.server?.version === "string" && /^[0-9A-Za-z._+-]{1,40}$/.test(hello.server.version) ? hello.server.version : null;
           attempt = 0;
           const downFor = downSince ? now() - downSince : null;
           lastUpAt = now(); downSince = null; lastError = null;
           reconnects += 1;
           push({ type: "gateway.up", downForMs: downFor });
+          syncGen += 1; approvalsSynced = false; syncAttempt = 0; clearTimer(syncRetry);
           setState("up");
           armWatchdog();
           resync().catch(() => {});
@@ -325,11 +371,22 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
     kick() { if (!stopped && !ws) { clearTimer(retryTimer); attempt = 0; connect(); } },
     isUp: () => state === "up",
     status: () => ({ state, since, lastUpAt, reconnects: Math.max(0, reconnects - 1), lastError: state === "up" ? null : lastError, pendingApprovals: pending.size }),
-    /** One allowlisted RPC over the link. Rejects with code "link_down" when the link is not up, "not_allowed" off the list. */
+    /** True only once every approval list was read on the CURRENT connection; before that `status().pendingApprovals` is not authoritative. */
+    approvalsSynced: () => state === "up" && approvalsSynced,
+    /** The engine version the gateway reported in hello-ok, or null (unknown / link never up). Costs nothing: no request is made. */
+    serverVersion: () => serverVersion,
+    /**
+     * One allowlisted RPC over the link. Rejects with code "not_allowed" off the list, "bad_params" when the method's closed params
+     * do not match (nothing is sent), "link_down" when the link is not up, "timeout" after `timeoutMs` (default 15 s, at most 120 s).
+     * A timeout only stops WAITING: the gateway may still finish the work (a provider call is still billed), so callers must not
+     * retry a call that costs money.
+     */
     request(method, params, { timeoutMs } = {}) {
       if (!LINK_METHODS.has(method)) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
+      if (PARAM_VALIDATORS[method] && !PARAM_VALIDATORS[method](params)) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
       if (state !== "up") return Promise.reject(Object.assign(new Error("link_down"), { code: "link_down" }));
-      return rpc(method, params, timeoutMs);
+      const t = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, MAX_REQUEST_TIMEOUT_MS) : REQUEST_TIMEOUT_MS;
+      return rpc(method, params, t);
     },
     /** Records with id > after (oldest first, at most `limit`). `truncated`: some records after `after` already left the ring. */
     events(after, limit = 100) {

@@ -12,7 +12,9 @@
 //   POST /app/v1/thinking { level }-> sets a thinking level the current model offers ("default" clears it)
 //   POST /app/v1/fast { mode }     -> "on" | "off" | "default"; "on" only when the current model supports fast mode
 //   GET  /app/v1/events, /approvals, /approvals/history, POST /approvals/:id -> src/app-bridge-live.js (B0/B3, persistent link)
-//   POST /app/v1/speak { text }    -> the text spoken in BASHT's own voice (the agent's `tts` config), as audio bytes
+//   POST /app/v1/speak { text }    -> the text spoken in BASHT's own voice (the agent's `tts` config), as audio bytes. Over the persistent
+//                                     link (`tts.speak`) once the global `tts` block carries the agent's voice identity (src/app-bridge-voice.js);
+//                                     until then through the `tts` tool, exactly as before.
 //   POST /app/v1/transcribe <audio>-> { text }: a voice note transcribed with the engine's own audio config (as on WhatsApp)
 //   B1/B2 (src/app-bridge-convo.js, src/app-bridge-media.js):
 //   POST /send { message, images? }-> images ride on the same turn as `image_url` parts (<= 8, <= 10 MB each, <= 14 MB in total)
@@ -31,8 +33,10 @@
 //   `sessions.describe` and `sessions.patch` (thinkingLevel / fastMode), and the `sessions` tool `patch` (model). Every
 //   write targets APP_SESSION_KEY only, with values validated against what the engine itself listed. No config writes.
 // - Voice (V2/V3): the `tts` tool on the app session (so `agents.entries.main.tts` — provider, voice, model, instructions — applies;
-//   the caller never picks a voice, provider or session), and an injected `transcribe(filePath)` (the wrapper runs
+//   the caller never picks a voice, provider or session) or, when the identity guard says the global `tts` block is the same voice,
+//   the link RPC `tts.speak` ({text} only); and an injected `transcribe(filePath)` (the wrapper runs
 //   `openclaw infer audio transcribe --agent main`). Audio files live only in private temp/state paths and are deleted after use.
+// - Signing (src/app-bridge-signing.js): optional HMAC request signatures ("basht-bridge-v1") on top of the bearer token.
 // - The app is the owner's own client, so its turns are owner turns (same agent, same shared memory, same tool policy and
 //   approval rules as the Control UI). They run in their own session (`app:owner`), separate from the WhatsApp chat.
 // - Reads are limited to the owner's own conversations: the app session, the owner's direct WhatsApp chat(s) (owners from
@@ -47,8 +51,11 @@ import path from "node:path";
 import express from "express";
 import { normalizeWhatsAppSender, whatsAppOwnersFrom } from "../patches/whatsapp-owner.mjs";
 import { createLiveRoutes } from "./app-bridge-live.js";
+import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
+import { createSigningVerifier } from "./app-bridge-signing.js";
+import { createRunsProbe } from "./app-bridge-runs.js";
 import { createAppControl } from "./app-control.js";
-import { SEND_BODY_LIMIT, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
+import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, resolveSource, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
 
 export const APP_SESSION = "app:owner";
@@ -85,11 +92,16 @@ const TRANSCRIBE_TIMEOUT_MS = 125_000;
 const SPEAK_PER_MINUTE = 30;
 const TRANSCRIBE_PER_MINUTE = 20;
 const TRANSCRIBES_IN_FLIGHT = 2; // each one spawns the OpenClaw CLI
+const SPEAKS_IN_FLIGHT = 2; // each one is a billed provider call that can take tens of seconds
+const SIGNATURE_LOG_EVERY_MS = 60_000; // a rejected signature is logged (reason only) at most this often per reason
 /** Recorded audio the app may upload: MIME (without parameters) -> the file extension the transcriber sees. */
 export const AUDIO_TYPES = { "audio/ogg": ".ogg", "audio/webm": ".webm", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
   "audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav" };
 /** Synthesized speech the bridge may return: file extension -> content type. */
 const SPEECH_TYPES = { ".mp3": "audio/mpeg", ".opus": "audio/ogg", ".ogg": "audio/ogg", ".wav": "audio/wav" };
+/** `mimeType` of a `tts.speak` answer -> the content type the bridge returns (the same four formats as SPEECH_TYPES). */
+const SPEECH_MIMES = { "audio/mpeg": "audio/mpeg", "audio/mp3": "audio/mpeg", "audio/ogg": "audio/ogg", "audio/opus": "audio/ogg",
+  "audio/wav": "audio/wav", "audio/x-wav": "audio/wav", "audio/wave": "audio/wav" };
 
 /** A short display string from an upstream value: strings only, control characters removed, capped. Else null. */
 export function safeStr(v, max = 200) {
@@ -266,7 +278,9 @@ async function readCompletionStream(body, onText) {
  *           fetchImpl?: typeof fetch, now?: () => number,
  *           gatewayCall?: (method: "models.list" | "sessions.describe" | "sessions.patch", params: object) => Promise<any> }} opts
  *   gatewayCall: one gateway RPC as the wrapper (the wrapper injects `openclaw gateway call`); without it the model routes return 503.
- *   stateDir: OpenClaw's state dir; the `tts` tool writes its audio under <stateDir>/media/tool-speech-synthesis/. Without it /speak is 503.
+ *   stateDir: OpenClaw's state dir; the `tts` tool writes its audio under <stateDir>/media/tool-speech-synthesis/. Without it the tool
+ *     path of /speak is 503 (the link path does not need it).
+ *   signing: { secret, previousSecret, mode } from signingConfigFromEnv(); absent = no signature is looked at (mode "off").
  *   transcribe: (filePath) => Promise<string>, the wrapper's `openclaw infer audio transcribe`; it rejects with `.refused` when the CLI
  *     answered ok:false (no audio model, provider error), `.badAudio` when the recording cannot be read. Without it /transcribe is 503.
  *   stateDir / workspaceDir: OpenClaw's state dir and the agent workspace — the only roots a MEDIA: file may be served from
@@ -276,7 +290,7 @@ async function readCompletionStream(body, onText) {
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
 export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall, link,
-  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS }) {
+  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
@@ -289,24 +303,65 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   let lastAppAt = 0;
   link?.setDecorator((e) => (e.type === "chat.final" || e.type === "chat.error" ? { ...e, seen: now() - lastAppAt < WATCH_MS } : e));
 
-  router.use((req, res, next) => {
-    res.set("Cache-Control", "no-store");
-    const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
-    // A valid token always passes: anonymous failures must never lock the owner's app out (they only slow down guessing).
-    if (m && safeEqual(m[1].trim(), appToken)) {
-      if (!req.path.startsWith("/events")) lastAppAt = now();
-      return next();
-    }
+  const verifier = createSigningVerifier({ ...signing, now });
+  /** One failed authentication (bad token OR bad signature): same counter, same 429 after AUTH_FAILURES_PER_MINUTE a minute. */
+  const authFailure = (res, error) => {
     const t = now();
     if (t - failures.windowStart > 60_000) failures = { windowStart: t, count: 0 };
     failures.count += 1;
     if (failures.count > AUTH_FAILURES_PER_MINUTE) return res.status(429).json({ ok: false, error: "rate_limited" });
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+    return res.status(401).json({ ok: false, error });
+  };
+  // A signature this bridge did not accept: remembered (reason + time, for /status) and logged once a minute per reason. Never a header value.
+  let lastRejected = null;
+  const loggedAt = new Map();
+  const noteLoud = (key, message) => {
+    const t = now();
+    if (t - (loggedAt.get(key) ?? -Infinity) >= SIGNATURE_LOG_EVERY_MS) { loggedAt.set(key, t); log?.warn?.("app-bridge", message); }
+  };
+  const noteRejected = (reason) => {
+    const t = now();
+    lastRejected = { reason, at: t };
+    if (t - (loggedAt.get(reason) ?? -Infinity) >= SIGNATURE_LOG_EVERY_MS) { loggedAt.set(reason, t); log?.warn?.("app-bridge", `signature rejected: ${reason} (mode ${verifier.mode})`); }
+  };
+  // "required" refuses (and counts in the failed-auth limiter); "optional" never locks anyone out: the request is processed as UNSIGNED.
+  const signatureRejected = (res, reason) => { noteRejected(reason); return authFailure(res, "bad_signature"); };
+
+  router.use((req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    const m = /^Bearer\s+(.+)$/i.exec(req.get("authorization") ?? "");
+    // A valid token always passes the token check: anonymous failures must never lock the owner's app out (they only slow down guessing).
+    if (!(m && safeEqual(m[1].trim(), appToken))) return authFailure(res, "unauthorized");
+    // "required" with a missing or unusable secret FAILS CLOSED: it is never read as "off". Everything but GET /status (so the owner can
+    // see why) answers 503, after the bearer check, and nothing is processed.
+    if (verifier.failClosed && !(req.method === "GET" && req.path === "/status")) {
+      noteLoud("signing_unavailable", `signing is required but its secret is unusable (${verifier.status().error}): refusing /app/v1 requests`);
+      return res.status(503).json({ ok: false, error: "signing_unavailable" });
+    }
+    // Signing (when configured) comes on top of the token, never instead of it. Header phase here; the body hash is checked once the body is read.
+    const sig = verifier.checkHeaders(req);
+    if (!sig.ok) {
+      if (verifier.mode === "required") return signatureRejected(res, sig.reason);
+      noteRejected(sig.reason); // optional: present but not valid = treated as unsigned, never as verified
+    } else if (sig.signed) res.locals.signedSha256 = sig.contentSha256;
+    if (!req.path.startsWith("/events")) lastAppAt = now();
+    return next();
   });
-  const jsonBody = express.json({ limit: "64kb" });
-  const sendBody = express.json({ limit: SEND_BODY_LIMIT }); // photos ride on the turn (B2); every other JSON route keeps 64 kB
+  // The signature covers the exact body bytes: every parser keeps the raw buffer it was given (the verify hook runs before parsing)
+  const keepRaw = (req, _res, buf) => { req.rawBody = buf; };
+  // The body hash of a request whose headers verified. A mismatch is a bad signature in "required"; in "optional" the request goes on as unsigned.
+  const bodyMatchesSignature = (req, res) => {
+    if (res.locals.signedSha256 === undefined || verifier.checkBody(res.locals.signedSha256, req.rawBody)) return true;
+    if (verifier.mode === "required") return false;
+    res.locals.signedSha256 = undefined;
+    noteRejected("body");
+    return true;
+  };
+  const jsonBody = express.json({ limit: "64kb", verify: keepRaw });
+  const sendBody = express.json({ limit: SEND_BODY_LIMIT, verify: keepRaw }); // photos ride on the turn (B2); every other JSON route keeps 64 kB
   // /transcribe takes raw audio only (its own express.raw, 10 MiB, inside the route); /send takes the bigger JSON body
   router.use((req, res, next) => (req.path === "/transcribe" ? next() : (req.path === "/send" ? sendBody : jsonBody)(req, res, next)));
+  router.use((req, res, next) => (req.path === "/transcribe" || bodyMatchesSignature(req, res) ? next() : signatureRejected(res, "body")));
 
   const gatewayHeaders = { authorization: `Bearer ${gatewayToken}`, "content-type": "application/json" };
 
@@ -320,6 +375,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const j = await res.json().catch(() => null);
     if (!res.ok || j?.ok !== true) {
       const err = new Error(`gateway ${tool} failed (${res.status})`);
+      err.status = res.status;
       err.toolError = j?.error?.type === "tool_error"; // the tool ran and refused (bad input), not an outage
       err.answered = j?.ok === false; // the gateway answered with a refusal (tool failed, or not allowed: 404), as opposed to no answer
       throw err;
@@ -346,7 +402,24 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     res.status(502).json({ ok: false, error: "engine_unavailable" });
   };
 
-  router.get("/status", (_req, res) => res.json({ ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" } }));
+  // Cheap by design (the deploy tooling and the app poll it): the config file, in-memory state and, at most every 3 s, two read-only
+  // counting reads over the persistent link (runs). No TTS call, no write.
+  const runsProbe = createRunsProbe({ link, now });
+  router.get("/status", async (_req, res) => {
+    const guard = readVoiceGuard(configPath, { stateDir });
+    const version = link?.serverVersion?.() ?? null;
+    res.json({
+      ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" },
+      features: [...FEATURES], // the shared contract with the app (src/fixtures/voice-contract.json)
+      voice: { ...speakStatus(guard, { linkUp: link?.isUp?.() === true, toolPath: !!speechDir }), warnings: guard.warnings },
+      // turns running right now: a restart of the engine while this is above 0 makes the gateway re-run them (docs: release rule)
+      runs: await runsProbe.read([...runs.values()].filter((r) => r.status === "running").length),
+      // mode, whether it is verifying (active), why not (error for required, reason for optional), warnings, the replay protection in force
+      // (in memory + boot fence: NOT durable), and the last signature this bridge did not accept: a reason and a time
+      signing: { ...verifier.status(), ...(lastRejected ? { lastRejected } : {}) },
+      ...(version ? { engine: { version } } : {}),
+    });
+  });
 
   router.get("/sessions", async (_req, res) => {
     try {
@@ -458,7 +531,8 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     firstTokenMs: r.firstTokenAt == null ? null : r.firstTokenAt - r.startedAt,
     totalMs: r.finishedAt == null ? null : r.finishedAt - r.startedAt,
   });
-  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: r.text, error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
+  // the live text hides the engine's own media markers the same way history rows do (the app shows the file, not the marker)
+  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: cleanLiveText(r.text, { streaming: r.status === "running" }), error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
     steps: r.steps ?? [] });
 
   /** B1 tool progress: refreshed only while the app polls a running turn, at most every STEPS_EVERY_MS; names only. */
@@ -683,39 +757,99 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     } catch { return null; }
   }
 
-  router.post("/speak", async (req, res) => {
-    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request");
-    if (!speechDir) return voiceUnavailable(res);
-    if (!speakLimit()) return res.status(429).json({ ok: false, error: "rate_limited" });
+  /**
+   * A refused speak. `{ok:false, error:<code the app already knows>, reason}`: a client that ignores `reason` keeps working. `reason`
+   * is always a member of REASONS (the shared contract). One log line with the reason only: never the text, never what the engine said.
+   */
+  const refuseSpeak = (res, status, error, reason) => {
+    log?.warn?.("app-bridge", `speak refused: ${error} (${reason})`);
+    return res.status(status).json({ ok: false, error, reason });
+  };
+  let speaking = 0;
+
+  /**
+   * Speak over the persistent link: the RPC `tts.speak` ({text} only). It speaks with the GLOBAL `tts` block, which the guard has just
+   * confirmed is the same voice as the agent's. NEVER retried here: a timed-out call may still be running at the provider, and a
+   * second one would be billed twice. No fallback to the CLI/admin path either (owner decision): a down link is an answer.
+   * The gateway may fall back to ANOTHER provider when the first fails (closed params cannot disable that): the answer names the
+   * provider that spoke, and anything but the approved one is refused, with no audio returned.
+   */
+  async function speakViaLink(res, text, guard) {
+    if (!link?.isUp?.()) return refuseSpeak(res, 502, "engine_unavailable", REASONS.LINK_DOWN);
+    let d;
+    try {
+      d = await link.request("tts.speak", { text }, { timeoutMs: SPEAK_TIMEOUT_MS });
+    } catch (err) {
+      if (err?.code === "link_down") return refuseSpeak(res, 502, "engine_unavailable", REASONS.LINK_DOWN);
+      if (err?.code === "timeout") return refuseSpeak(res, 502, "engine_unavailable", REASONS.TIMEOUT); // existing status vocabulary: no 504
+      if (err?.refused && err.code === "INVALID_REQUEST") return refuseSpeak(res, 400, "bad_request", REASONS.TEXT_REJECTED); // the engine's own text rules (e.g. a lower max length)
+      if (err?.refused) return refuseSpeak(res, 503, "voice_unavailable", REASONS.PROVIDER_ERROR); // the gateway answered ok:false (e.g. UNAVAILABLE)
+      return refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
+    }
+    // another provider spoke (or the answer does not say which): not BASHT's voice. The audio is dropped, not returned.
+    if (normalizeSpeechProviderId(d?.provider) !== guard.provider) return refuseSpeak(res, 503, "voice_unavailable", REASONS.IDENTITY_MISMATCH);
+    const b64 = typeof d?.audioBase64 === "string" ? d.audioBase64 : "";
+    const mime = String(d?.mimeType ?? "").split(";")[0].trim().toLowerCase();
+    const ext = d?.fileExtension === undefined || d?.fileExtension === null ? null : String(d.fileExtension).toLowerCase();
+    // check the encoded size first: a huge answer must not be decoded into memory just to be refused
+    if (!b64 || b64.length > Math.ceil((MAX_SPEECH_BYTES * 4) / 3) + 4 || !Object.hasOwn(SPEECH_MIMES, mime) || (ext !== null && !Object.hasOwn(SPEECH_TYPES, ext))) {
+      return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
+    }
+    const audio = Buffer.from(b64, "base64");
+    if (audio.length < 1 || audio.length > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
+    res.set({ "Content-Type": SPEECH_MIMES[mime], "Content-Length": String(audio.length), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    return res.status(200).end(audio);
+  }
+
+  /** Speak through the agent's `tts` tool on the app session (the original path; needs the tool to be allowed by the tool policy). */
+  async function speakViaTool(res, text) {
     let d;
     try {
       // the agent's tool on the app session: agents.entries.main.tts (voice, model, instructions) applies; markdown is stripped by the engine
       d = await invoke("tts", { text }, { sessionKey: APP_SESSION_KEY, timeoutMs: SPEAK_TIMEOUT_MS });
     } catch (err) {
-      if (err?.answered) { log?.warn?.("app-bridge", `speak refused: ${err.message}`); return voiceUnavailable(res); }
-      return fail(res, err, "speak");
+      if (err?.answered) {
+        // 404/403: the tool policy does not allow `tts` for this caller; anything else the tool or the provider refused with
+        return refuseSpeak(res, 503, "voice_unavailable", err.status === 404 || err.status === 403 ? REASONS.TOOL_DENIED : REASONS.PROVIDER_ERROR);
+      }
+      return refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
     }
     const file = await speechFile(d?.audioPath);
-    if (!file) {
-      // never read (or delete) anything outside the speech directory
-      log?.warn?.("app-bridge", "speak: the tool returned no usable audio file");
-      return voiceUnavailable(res);
-    }
+    // never read (or delete) anything outside the speech directory
+    if (!file) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
     try {
-      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return voiceUnavailable(res);
+      if (file.size < 1 || file.size > MAX_SPEECH_BYTES) return refuseSpeak(res, 503, "voice_unavailable", REASONS.BAD_AUDIO);
       const audio = await fs.promises.readFile(file.real);
       res.set({ "Content-Type": SPEECH_TYPES[path.extname(file.real).toLowerCase()], "Content-Length": String(audio.length),
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
       res.status(200).end(audio);
-    } catch (err) {
-      fail(res, err, "speak read");
+    } catch {
+      refuseSpeak(res, 502, "engine_unavailable", REASONS.ENGINE_ERROR);
     } finally {
       fs.promises.unlink(file.real).catch(() => {}); // one-shot: the app plays it, the engine keeps no copy
     }
+  }
+
+  router.post("/speak", async (req, res) => {
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text || text.length > MAX_SPEAK_CHARS) return bad(res, "bad_request"); // UTF-16 code units, like the engine's own count
+    if (!speakLimit()) return refuseSpeak(res, 429, "rate_limited", REASONS.PER_MINUTE);
+    // BASHT's voice is the agent block's. Decide which engine path can speak it, from the config as it is right now.
+    const guard = readVoiceGuard(configPath, { stateDir });
+    if (guard.state === "mismatch") return refuseSpeak(res, 503, "voice_unavailable", REASONS.IDENTITY_MISMATCH); // no provider is called
+    if (guard.state === "no_agent_block") return refuseSpeak(res, 503, "voice_unavailable", REASONS.UNCONFIGURED);
+    // The link path (RPC `tts.speak`, global block) is used only when an agent block exists and the guard proved the global block
+    // is the same voice. Everything else (no_global, global_only, unknown) takes the tool path, as before the RPC existed.
+    const viaLink = guard.state === "match";
+    if (!viaLink && !speechDir) return refuseSpeak(res, 503, "voice_unavailable", REASONS.UNCONFIGURED);
+    if (speaking >= SPEAKS_IN_FLIGHT) return refuseSpeak(res, 429, "rate_limited", REASONS.IN_FLIGHT);
+    speaking++;
+    try {
+      await (viaLink ? speakViaLink(res, text, guard) : speakViaTool(res, text));
+    } finally { speaking--; }
   });
 
-  const rawAudio = express.raw({ type: () => true, limit: MAX_AUDIO_BYTES });
+  const rawAudio = express.raw({ type: () => true, limit: MAX_AUDIO_BYTES, verify: keepRaw });
   router.post("/transcribe", (req, res, next) => {
     if (!transcribe) return voiceUnavailable(res);
     const type = String(req.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
@@ -736,6 +870,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     req.audioExt = AUDIO_TYPES[type];
     rawAudio(req, res, (err) => {
       if (err) return res.status(err.status === 413 ? 413 : 400).json({ ok: false, error: err.status === 413 ? "too_large" : "bad_request" });
+      if (!bodyMatchesSignature(req, res)) return signatureRejected(res, "body"); // the slot is released when this response closes
       next();
     });
   }, async (req, res) => {

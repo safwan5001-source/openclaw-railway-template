@@ -124,6 +124,52 @@ export function splitAttachedMarkers(text) {
   return { text: rest.replace(/\n{3,}/g, "\n\n").trim(), sources };
 }
 
+const MEDIA_LINE_PREFIX = "MEDIA:";
+const ATTACHED_PREFIX = "[media attached";
+
+/**
+ * While a reply streams, its last line may be half of a marker that the next chunk completes: "ME", "MEDIA:", "[media att",
+ * "[media attached: /files/ch" (no closing bracket yet). Returns `text` without such a trailing fragment, else `text` itself.
+ * Only the very end is looked at (a finished marker is the job of splitMediaLines / splitAttachedMarkers) and a fenced code
+ * block is left alone, as in splitMediaLines.
+ */
+export function dropPartialMarker(text) {
+  const t = String(text ?? "");
+  const nl = t.lastIndexOf("\n");
+  const last = t.slice(nl + 1);
+  // `[media attached…` can start mid-line; it is partial while its `]` has not arrived
+  const br = last.lastIndexOf("[");
+  if (br >= 0 && !last.includes("]", br)) {
+    const tail = last.slice(br);
+    if (ATTACHED_PREFIX.startsWith(tail) || tail.startsWith(ATTACHED_PREFIX)) return t.slice(0, nl + 1 + br);
+  }
+  // `MEDIA:` only counts as a standalone line (<= 3 leading spaces, outside fenced code)
+  const bare = last.replace(/^ {0,3}/, "");
+  if (bare && MEDIA_LINE_PREFIX.startsWith(bare) && last.length - bare.length <= 3) {
+    let fence = null;
+    for (const line of t.slice(0, nl + 1).split("\n")) {
+      const f = FENCE.exec(line);
+      if (f) fence = fence === null ? f[1] : fence === f[1] ? null : fence;
+    }
+    if (fence === null) return t.slice(0, Math.max(nl, 0)); // the newline before the fragment goes with it
+  }
+  return t;
+}
+
+/**
+ * The text of a LIVE reply (GET /runs/:id) as the app should show it: standalone `MEDIA:` lines and `[media attached: …]` markers
+ * removed with the very same rules as history rows (splitMediaLines / splitAttachedMarkers), and, while the reply is still
+ * streaming (`streaming: true`), a trailing half-written marker too. A text without any marker comes back exactly as it was.
+ */
+export function cleanLiveText(text, { streaming = false } = {}) {
+  const raw = String(text ?? "");
+  const base = streaming ? dropPartialMarker(raw) : raw;
+  const lines = splitMediaLines(base);
+  const attached = splitAttachedMarkers(lines.text);
+  if (!lines.sources.length && !attached.sources.length) return base;
+  return attached.text;
+}
+
 const typeOf = (name) => MEDIA_TYPES[path.extname(String(name)).toLowerCase()] ?? null;
 const baseName = (src) => {
   const s = String(src).replace(/^media:\/\/inbound\//i, "");

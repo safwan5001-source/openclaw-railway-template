@@ -9,7 +9,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { APP_SESSION_KEY, createAppBridge } from "./app-bridge.js";
-import { MAX_IMAGES, bytesMatch, extractMedia, mediaRef, openMediaFile, parseImages, resolveSource, splitAttachedMarkers,
+import { MAX_IMAGES, bytesMatch, cleanLiveText, dropPartialMarker, extractMedia, mediaRef, openMediaFile, parseImages, resolveSource, splitAttachedMarkers,
   splitMediaLines, turnContent } from "./app-bridge-media.js";
 import { cleanSnippet as cleanSnippetForTest, stepsFrom } from "./app-bridge-convo.js";
 
@@ -546,4 +546,88 @@ test("two resets in a row: one ledger entry, and paging back never repeats a con
     assert.deepEqual(p1.messages.map((m) => m.id), ["conv-a-0001", "conv-a-0002"]);
     assert.equal(p1.earlier, null);
   } finally { s.close(); fs.rmSync(st, { recursive: true, force: true }); archive = saved.archive; appRows = saved.appRows; }
+});
+
+// ---------------------------------------------------------------- live text (GET /runs/:id) ---------------------------------------
+
+test("cleanLiveText: MEDIA: lines and attachment markers go, with the SAME rules as history rows; text without markers is untouched", () => {
+  const text = "هذا الرسم.\n\nMEDIA:./out/chart.png\n  MEDIA: \"/data/workspace/out/a b.png\"\n\n```\nMEDIA:./kept.png\n```\nانتهى [media attached: media://inbound/doc---1.pdf] ✓";
+  const live = cleanLiveText(text);
+  const history = extractMedia({ role: "assistant", content: text }, "agent:main:app:owner", text).text;
+  assert.equal(live, history, "live text and history row agree");
+  assert.ok(!live.includes("chart.png") && !live.includes("a b.png") && !live.includes("[media attached"));
+  assert.ok(live.includes("MEDIA:./kept.png"), "a MEDIA: line inside a fenced code block is code, not a marker");
+  for (const plain of ["", "مرحبا", "سطر 1\n\n\n\nسطر 2  \n", "  leading and trailing  \n", "see MEDIA: inline stays", "[a link](https://x.example)"]) {
+    assert.equal(cleanLiveText(plain), plain, JSON.stringify(plain));
+    assert.equal(cleanLiveText(plain, { streaming: true }), plain === "see MEDIA: inline stays" || plain === "[a link](https://x.example)" ? plain : plain);
+  }
+  assert.equal(cleanLiveText(null), "");
+  assert.equal(cleanLiveText(undefined, { streaming: true }), "");
+});
+
+test("cleanLiveText (streaming): a trailing half-written marker is dropped, nothing else is", () => {
+  const cut = (t) => cleanLiveText(t, { streaming: true });
+  for (const partial of ["M", "ME", "MEDI", "MEDIA", "MEDIA:", "  MEDIA:", "   MEDIA"]) assert.equal(cut(`تم الحفظ.\n${partial}`), "تم الحفظ.", JSON.stringify(partial));
+  assert.equal(cut("MEDIA:"), "", "a reply that so far is only the start of a marker shows nothing");
+  assert.equal(cut("MEDIA: ./out/ch"), "", "a path being written is a marker already (the engine rule needs only one character)");
+  for (const partial of ["[", "[m", "[media", "[media att", "[media attached", "[media attached:", "[media attached: media://inbound/doc--", "[media attached 1/2: media://inbound/d"]) {
+    assert.equal(cut(`ملف: ${partial}`), "ملف: ", JSON.stringify(partial));
+  }
+  // not markers: a different word, a finished link, a fence, four leading spaces, or the marker word in the middle of a line
+  for (const keep of ["Meeting", "MEDIA is a word", "نص [رابط](https://x.example)", "[x]", "    MEDIA:", "see MEDIA:", "[media](https://x.example)"]) assert.equal(cut(keep), keep, keep);
+  assert.equal(cut("```\nMEDIA:"), "```\nMEDIA:", "inside an open code fence");
+  assert.equal(cut("```\ncode\n```\nMEDIA:"), "```\ncode\n```", "after the fence closed it is a marker again");
+  // only while the reply is still streaming: a FINISHED reply is never cut at the end
+  assert.equal(cleanLiveText("آخر سطر\nME"), "آخر سطر\nME");
+  assert.equal(cleanLiveText("ملف: [media att"), "ملف: [media att");
+  assert.equal(dropPartialMarker("abc"), "abc");
+  assert.equal(dropPartialMarker(""), "");
+  // a marker that completes in the next chunk never shows up in any prefix of the stream
+  const full = "جاهز.\nMEDIA:./out/chart.png\nتفضل.";
+  for (let i = 0; i <= full.length; i++) {
+    const shown = cut(full.slice(0, i));
+    assert.ok(!/MEDIA|chart\.png/.test(shown), `prefix ${i}: ${JSON.stringify(shown)}`);
+  }
+});
+
+test("GET /runs/:id: live text and the finished text are free of media markers; the stream is untouched", async () => {
+  const gates = [];
+  const gate = () => new Promise((r) => gates.push(r));
+  const release = () => gates.shift()?.();
+  const enc = new TextEncoder();
+  const fetchImpl = async (url) => {
+    if (!String(url).endsWith("/v1/chat/completions")) return new Response("{}", { status: 404 });
+    const chunk = (t) => enc.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: t } }] })}\n\n`);
+    return new Response(new ReadableStream({
+      async start(c) {
+        c.enqueue(chunk("هذه الصورة.\nMEDIA:./out/ch"));
+        await gate();
+        c.enqueue(chunk("art.png\nتفضل [media attached: media://inbound/x.pdf]\nME"));
+        await gate();
+        c.enqueue(enc.encode("data: [DONE]\n\n")); c.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  const app = express();
+  app.use("/app/v1", createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://127.0.0.1:9", gatewayToken: GW_TOKEN, configPath: path.join(dir, "openclaw.json"), fetchImpl }));
+  const s = app.listen(0, "127.0.0.1"); await new Promise((r) => s.once("listening", r));
+  const b = `http://127.0.0.1:${s.address().port}/app/v1`;
+  const auth = { authorization: `Bearer ${APP_TOKEN}`, "content-type": "application/json" };
+  const poll = async (id) => (await fetch(`${b}/runs/${id}`, { headers: auth })).json();
+  const until = async (id, ok) => { for (let i = 0; i < 100; i++) { const r = await poll(id); if (ok(r)) return r; await new Promise((x) => setTimeout(x, 10)); } throw new Error("timeout"); };
+  try {
+    const { runId } = await (await fetch(`${b}/send`, { method: "POST", headers: auth, body: JSON.stringify({ message: "ارسم" }) })).json();
+    const first = await until(runId, (r) => r.text !== "");
+    assert.equal(first.status, "running");
+    assert.equal(first.text, "هذه الصورة.", "a marker still being written is not shown");
+    release(); // the rest of the path and the next lines arrive; a half marker ("ME") is at the end
+    const second = await until(runId, (r) => r.text.includes("تفضل"));
+    assert.equal(second.status, "running");
+    assert.equal(second.text, "هذه الصورة.\nتفضل", JSON.stringify(second.text));
+    release();
+    const done = await until(runId, (r) => r.status !== "running");
+    assert.equal(done.status, "done");
+    assert.equal(done.text, "هذه الصورة.\nتفضل \nME", "a finished reply keeps its last line (only complete markers are removed)");
+    assert.ok(!/MEDIA:|media attached|chart\.png|x\.pdf/.test(JSON.stringify(done)));
+  } finally { release(); release(); s.close(); }
 });
