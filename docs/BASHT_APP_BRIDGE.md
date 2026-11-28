@@ -16,7 +16,7 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 
 | Route | What it does | Gateway call (made by the wrapper) |
 |---|---|---|
-| `GET /app/v1/status` | Liveness, the app session key, the link state and the additive fields below (`features`, `voice`, `runs`, `signing`, `engine`). Cheap: the config file, in-memory state and, at most every 3 s, two read-only counting reads over the persistent link (`runs`); no TTS call, no write | — |
+| `GET /app/v1/status` | Liveness, the app session key, the link state and the additive fields below (`features`, `wrapper`, `attachments`, `voice`, `runs`, `signing`, `engine`). Cheap: the config file, in-memory state and, at most every 3 s, two read-only counting reads over the persistent link (`runs`); no TTS call, no write | — |
 | `GET /app/v1/sessions` | The conversations the owner may read | `sessions_list` |
 | `GET /app/v1/history?key=&limit=&offset=` | Text messages of one allowed conversation | `sessions_history` |
 | `POST /app/v1/send {message}` | Starts **one** owner turn and returns `runId` at once | `/v1/chat/completions` (stream), session `app:owner` |
@@ -65,7 +65,11 @@ removed with the same rules as history rows, and while the reply is still stream
 
 ```json
 { "ok": true, "appSession": "agent:main:app:owner", "link": { "state": "up", ... },
-  "features": ["voice.speak.v2", "voice.transcribe.v1", "voice.status.v1", "signing.v1"],
+  "features": ["voice.speak.v2", "voice.transcribe.v1", "voice.status.v1", "signing.v1",
+               "history.images.v1", "media.inline.v1", "media.guard.v1", "runs.runId.v1", "errorCode.rate_limited.v1"],
+  "wrapper": { "commit": "0123456789ab" },
+  "attachments": { "maxImages": 8, "maxImageBytes": 10485760, "maxTotalImageBytes": 14680064,
+                  "maxFileBytes": 20971520, "maxInlineBytes": 5242880 },
   "voice": { "speak": "ready", "reason": "…", "warnings": [] },
   "runs": { "active": 0, "engine": 0, "cron": 0, "approvalsPending": 0, "total": 0, "complete": true },
   "signing": { "mode": "optional", "active": true, "warnings": [], "replayProtection": "memory+boot_fence",
@@ -73,11 +77,29 @@ removed with the same rules as history rows, and while the reply is still stream
   "engine": { "version": "…" } }
 ```
 
-- `features`: capability hints for the app, equal to the shared contract file `src/fixtures/voice-contract.json` (an identical copy
-  lives in the app; both sides' tests compare against it). `voice.speak.v2` = `/speak` answers with a `reason` on every refusal and can
+- `features`: capability hints for the app. Its first four ids are exactly the shared contract file `src/fixtures/voice-contract.json` (an identical copy
+  lives in the app; both sides' tests compare against it); more ids follow, see below. `voice.speak.v2` = `/speak` answers with a `reason` on every refusal and can
   use the link path; `voice.transcribe.v1` = `/transcribe`; `voice.status.v1` = the `voice` block below; `signing.v1` = the engine can
   verify `basht-bridge-v1` signatures (whether it enforces them is `signing.mode`). The same file fixes every `reason` token
   and every `voice.speak` value: reasons are fixed tokens, never free text.
+- `features` (batch 3): the four ids above (the **voice contract**, fixed by the fixture, always first and in that order) are followed by
+  ids that are **not** in the fixture and may grow: `history.images.v1` = image messages stay in `/history` (not dropped);
+  `media.inline.v1` = inline image blocks of the transcript are served through `/media`; `media.guard.v1` = downloads refuse
+  protected paths; `runs.runId.v1` = user rows of `/history` may carry an additive `runId`; `errorCode.rate_limited.v1` = a failed run
+  may carry `errorCode: "rate_limited"`. The app treats an id it does not know as absent capability, never as an error.
+- `wrapper.commit`: the first 12 characters of the deployed build's git commit (read from Railway's build variable
+  `RAILWAY_GIT_COMMIT_SHA`), or `null` when it is missing or not 7 to 40 lowercase hex characters (an invalid value is never repaired,
+  e.g. uppercase or padded with spaces). Nothing else from the environment is exposed: no branch, repository, message, author or host.
+  The app shows it as the "wrapper build" badge and compares it with what the deploy expects; `null` means "unknown", not "old".
+- `attachments`: the limits the bridge enforces, in bytes except `maxImages` (a count), taken from the code's own constants:
+  `maxImages` images per `/send`; `maxImageBytes` per decoded image; `maxTotalImageBytes` for all images of one `/send`;
+  `maxFileBytes` per file served by `/media`; `maxInlineBytes` per inline image block. The app uses them to refuse or downscale before
+  uploading, instead of waiting for `image_too_large` / `images_too_large` / `too_many_images`.
+- All of these are additive: no older field changed shape or meaning, and an older app ignores the new keys. `/status` stays cheap:
+  they are constants and one environment read, no gateway call, no write, so they are present even when `link.state` is `off` or down.
+  Badges: the app derives its status badges from this one response (engine version from `engine.version`, wrapper build from
+  `wrapper.commit`, link from `link.state`, voice from `voice.speak`, limits from `attachments`, capabilities from `features`); the
+  model that answered a message comes from the transcript (`provider` / `model` on assistant rows), not from `/status`.
 - `voice.speak`: `ready` (guard `match` and the link is up) · `degraded` (`link_down`: the link is down; or `tool_path_only`: the
   link path cannot be used yet — no global `tts` block, or no agent block to compare with — so only the tool path speaks) ·
   `mismatch` (`identity_mismatch`) · `unconfigured` (`no_tts_config`, or `tool_path_unavailable`) · `unknown` (`config_unreadable`).
