@@ -74,32 +74,48 @@ export function isFinalReply(m) {
   const calls = Array.isArray(m.content) && m.content.some((p) => p?.type === "toolCall" || p?.type === "tool_use");
   return !calls && FINAL_STOP_REASONS.has(m.stopReason);
 }
+const TERMINAL = new Set(["done", "error", "stopped"]);
+
 /**
- * "Terminal + text": THE one rule, for a cached (live) run and an uncached one alike (review N1, Codex 9555422/7f6843e/f0b6276).
- * - status: a live terminal event, else agent.wait ok/error, else K's own FINAL row ⇒ done (error for agent.wait error); a restart
- *   continuation in K's turn without a final row ⇒ unknown (K was interrupted); otherwise running (live) / unknown (uncached).
- * - text: the first final reply event's text, else the FINAL row's text, never a preamble or a notice. A terminal run without a
- *   readable final row is `textPending` (re-read on later polls), never frozen empty.
- * A live record is updated in place (status, finishedAt, text, finalText, textPending); the engine rows are only read.
+ * THE run-outcome rule (one pure function; decision table in docs/BASHT_APP_BRIDGE.md "Run outcome"). Nothing is read or written here.
+ *   live  null (no record: wrapper restart / eviction) | { status: running|done|error|stopped, text, finalText } from chat events
+ *         (finalText: the first non-notice final reply event arrived; then the run is SETTLED and the engine is not consulted)
+ *   wait  agent.wait {runId:K, timeoutMs:0}: "ok" | "error" | "timeout" | "pending" | null (no answer)
+ *   seg   { state: "found", rows } (K's user-turn segment: after K's user row, up to the next user row) | { state: "absent" }
+ *         (paging read the whole history: K's user row is not in this conversation) | { state: "unreachable" } (could not tell)
+ * Returns { status, text, textPending, interrupted, resumed, located } or { notFound: true } (uncached and absent).
+ * - A FINAL row: K's own assistant row with a terminal stopReason (FINAL_STOP_REASONS), no pending tool call, not a status notice.
+ * - Continuations: rows with continuation.source "restart" and a runId other than K, INSIDE the segment; the LATEST one (in row
+ *   order) is the resumed reply; its text is ITS final row only. A later user turn is outside the segment by construction.
  */
-export function decideRun({ live, wait, own, resumed, messageText, at }) {
-  const finalRow = (own ?? []).findLast((m) => isFinalReply(m));
-  const finalText = finalRow ? messageText(finalRow) : null;
-  const engineTerminal = wait === "ok" || wait === "error" || finalRow !== undefined;
-  if (live) {
-    if (live.status === "running") {
-      if (engineTerminal) { live.status = wait === "error" ? "error" : "done"; live.finishedAt = at; }
-      else if (resumed) { live.status = "unknown"; live.finishedAt = at; }
-    }
-    if (live.status !== "running" && !live.finalText) {
-      if (finalText !== null) { live.text = finalText; live.finalText = true; live.textPending = false; }
-      else live.textPending = live.status !== "unknown";
-    }
-    return { status: live.status, text: live.text, textPending: live.textPending === true };
+export function runOutcome({ live, wait, seg, K, messageText }) {
+  const settled = !!live && live.finalText === true && TERMINAL.has(live.status);
+  const liveTerminal = !!live && TERMINAL.has(live.status);
+  if (!live && seg.state === "absent") return { notFound: true };
+  if (seg.state !== "found") {
+    // cached and absent: the user row is not visible yet (just sent): the live state; unreachable: honest unknown unless settled
+    if (settled) return { status: live.status, text: live.text, textPending: false, interrupted: false, resumed: null, located: seg.state !== "unreachable" };
+    if (seg.state === "unreachable") return { status: liveTerminal ? live.status : "unknown", text: "", textPending: liveTerminal, interrupted: false, resumed: null, located: false };
+    const status = liveTerminal ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : live.status;
+    return { status, text: status === "running" ? live.text : "", textPending: TERMINAL.has(status), interrupted: false, resumed: null, located: true };
   }
-  const status = wait === "ok" ? "done" : wait === "error" ? "error" : finalRow && !resumed ? "done" : "unknown";
-  const terminal = status === "done" || status === "error";
-  return { status, text: finalText ?? "", textPending: terminal && finalText === null };
+  const rows = seg.rows;
+  const finalOf = (runId) => rows.filter((m) => m?.__openclaw?.runId === runId).findLast((m) => isFinalReply(m)) ?? null;
+  const kFinal = finalOf(K);
+  const conts = rows.filter((m) => isResumedRow(m) && m.__openclaw?.runId !== K).map((m) => m.__openclaw.runId);
+  const latest = conts.length ? conts.at(-1) : null;
+  const latestFinal = latest ? finalOf(latest) : null;
+  const resumed = latest ? { runId: String(latest).slice(0, 100), text: latestFinal ? messageText(latestFinal) : "", textPending: !latestFinal } : null;
+  let status;
+  if (settled || liveTerminal) status = live.status;
+  else if (kFinal) status = wait === "error" ? "error" : "done";
+  else if (wait === "ok") status = "done";
+  else if (wait === "error") status = "error";
+  else if (latest) status = "unknown"; // K was interrupted; the engine continued it in another run (never re-executed here)
+  else status = live ? live.status : "unknown";
+  const text = settled ? live.text : kFinal ? messageText(kFinal) : status === "running" ? live.text : "";
+  const textPending = TERMINAL.has(status) && !settled && !kFinal;
+  return { status, text, textPending, interrupted: latest !== null, resumed, located: true };
 }
 
 /** An engine status notice (not the model's reply): every content part is flagged `openclawStatusNotice` (integration BUG-2). */
@@ -533,13 +549,13 @@ export function registerThreadRoutes(router, ctx) {
     const live = runs.get(K);
     if (live && live.tid !== k.tid) return reply(res, 404, "not_found");
     if (!link?.isUp?.() && !live) return linkDown(res);
-    // The engine's own record: agent.wait {timeoutMs:0} FIRST, then history rows tagged with K (bounded to K's turn), and the
-    // resumed run. Read for every poll of a finished or unknown run, at most every 1.5 s for a live one (its terminal event may
-    // have been missed: a write-link drop/reconnect, an ack timeout), and on every poll while its final text is still pending.
-    // agent.wait before history (review N1): a run that ends between the two reads still has its reply row in the history page.
-    let rows = null; let wait = null;
-    // (a finished record, including one whose text is pending, is re-read on every poll: only "running" is throttled)
-    if (link?.isUp?.() && (!live || live.status !== "running" || now() - live.stepsAt >= 1500)) {
+    // Engine reads: agent.wait FIRST (a run ending between the reads still has its row in the page), then the newest history
+    // page; a "running" record at most every 1.5 s, anything else on every poll. A settled record (final reply event received)
+    // needs neither paging nor the engine's verdict.
+    const settled = live?.finalText === true && TERMINAL.has(live.status);
+    let rows = null; let wait = null; let read = false;
+    if (link?.isUp?.() && !settled && (!live || live.status !== "running" || now() - live.stepsAt >= 1500)) {
+      read = true;
       try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
       try {
         const h = await link.request("chat.history", { sessionKey: k.qualified, limit: 50 }, { timeoutMs: READ_TIMEOUT_MS });
@@ -547,37 +563,32 @@ export function registerThreadRoutes(router, ctx) {
         if (live) live.stepsAt = now();
       } catch { rows = null; }
     }
-    if (!live && rows === null) return reply(res, 502, "engine_unavailable"); // could not read: never reported as "no such run"
-    let seg = rows ? turnSegment(rows, K) : null;
-    // K's user row is older than the newest page (a tool-heavy turn): page back, bounded, before answering (Codex) — with no live
-    // record, or when a live record needs the engine's rows for its final text (terminal now, or text pending: review N1).
-    // A live run that is still running polls the newest page only (cheap).
-    const terminalNow = wait === "ok" || wait === "error";
-    if (seg === null && rows !== null && (!live || (live.status === "running" && terminalNow) || (live.status !== "running" && !live.finalText))) {
+    if (!live && rows === null) return reply(res, 502, "engine_unavailable"); // could not read at all: never "no such run"
+    // locate K's user-turn segment: the newest page, else the bounded paging (cached 5 s) — whenever the run is not settled,
+    // cached or not, whatever agent.wait said
+    let seg;
+    const first = rows ? turnSegment(rows, K) : null;
+    if (first) seg = { state: "found", rows: first };
+    else if (!read) seg = { state: "absent" }; // a throttled running record keeps its live state between engine reads
+    else if (rows === null) seg = { state: "unreachable" };
+    else {
       const f = await findTurnCached(k.qualified, K);
-      if (f.found) seg = turnSegment(f.rows, K);
-      // could not tell: honest "unknown", never not_found; nothing about the run is reported (agent.wait is engine-global)
-      else if (!live && !f.complete) return res.json({ ok: true, runId: K, thread: k.tid, status: "unknown", text: "", phase: null, steps: [], startedAt: null, finishedAt: null,
-        interrupted: false, resumed: null, located: false, boot: ctx.boot() });
+      seg = f.found ? { state: "found", rows: turnSegment(f.rows, K) } : f.complete ? { state: "absent" } : { state: "unreachable" };
     }
-    // m2: with no live record, a run is reported only when K's own user row is in THIS conversation (agent.wait is engine-global)
-    if (!live && seg === null) return reply(res, 404, "not_found");
-    const after = seg ?? [];
-    const own = after.filter((m) => assistantRunId(m) === K);
-    // the continuation run of THIS turn only (Codex): the first restart-continued reply inside K's segment, and only its own rows
-    const first = after.find((m) => isResumedRow(m) && m.__openclaw?.runId !== K);
-    const resumedId = first ? first.__openclaw.runId : null;
-    const resumedRows = resumedId ? after.filter((m) => m.role === "assistant" && m.__openclaw?.runId === resumedId) : [];
-    // its reply, never a trailing engine status notice (Codex, as BUG-2)
-    const resumedReply = resumedRows.filter((m) => !isStatusNotice(m)).at(-1);
-    const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: resumedReply ? ctx.messageText(resumedReply) : "" } : null;
-    if (live && live.status === "running" && rows) live.steps = stepsFrom(after, 0);
-    const { status, text, textPending } = decideRun({ live, wait, own, resumed, messageText: ctx.messageText, at: now() });
-    res.json({ ok: true, runId: K, thread: k.tid, status, text: ctx.cleanLiveText(text, { streaming: status === "running" }), phase: live?.phase ?? null,
-      steps: live ? live.steps : stepsFrom(after, 0), startedAt: live?.startedAt ?? null, finishedAt: live?.finishedAt ?? null,
+    const o = runOutcome({ live: live ? { status: live.status, text: live.text, finalText: live.finalText === true } : null, wait, seg, K, messageText: ctx.messageText });
+    if (o.notFound) return reply(res, 404, "not_found"); // m2: an uncached run is reported only when K's user row is in THIS conversation
+    if (live) {
+      if (seg.state === "found" && live.status === "running") live.steps = stepsFrom(seg.rows, 0);
+      // persist only what the engine settled: a terminal status, and the final row's text (never "unknown", never a preamble)
+      if (TERMINAL.has(o.status) && !TERMINAL.has(live.status)) { live.status = o.status; live.finishedAt = now(); }
+      if (TERMINAL.has(o.status) && !o.textPending && !live.finalText && o.text) { live.text = o.text; live.finalText = true; }
+    }
+    const steps = live ? live.steps : seg.state === "found" ? stepsFrom(seg.rows, 0) : [];
+    res.json({ ok: true, runId: K, thread: k.tid, status: o.status, text: ctx.cleanLiveText(o.text, { streaming: o.status === "running" }), phase: live?.phase ?? null,
+      steps, startedAt: live?.startedAt ?? null, finishedAt: live?.finishedAt ?? null,
       ...(live?.errorCode ? { errorCode: live.errorCode } : {}),
       // the engine continued this turn in a NEW run after a restart (lab L5): shown as what it is, never re-executed by the bridge
-      interrupted: resumed !== null, resumed, ...(textPending ? { textPending: true } : {}), boot: ctx.boot() });
+      interrupted: o.interrupted, resumed: o.resumed, ...(o.textPending ? { textPending: true } : {}), ...(o.located ? {} : { located: false }), boot: ctx.boot() });
   });
 
   router.post("/threads/:tid/runs/:runId/abort", async (req, res) => {

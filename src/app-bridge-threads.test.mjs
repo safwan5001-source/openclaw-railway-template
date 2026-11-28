@@ -524,12 +524,12 @@ test("resumed reply: a restart-continued run (continuation.source 'restart', ano
     { role: "user", idempotencyKey: `${K1}:user`, content: "make the invoice", timestamp: 1, __openclaw: { id: "row0001" } },
     { role: "assistant", content: [{ type: "text", text: "starting" }], timestamp: 2, __openclaw: { id: "row0002", runId: K1 } },
     // seq 3 = the hidden resume input (absent from chat.history, lab L5)
-    { role: "assistant", content: [{ type: "text", text: "continuing after restart" }], timestamp: 4, __openclaw: { id: "row0004", runId: "run-r2-event", turnBoundary: true, continuation: { source: "restart" } } }] };
+    { role: "assistant", content: [{ type: "text", text: "continuing after restart" }], stopReason: "stop", timestamp: 4, __openclaw: { id: "row0004", runId: "run-r2-event", turnBoundary: true, continuation: { source: "restart" } } }] };
   const b = await bridge({ link });
   try {
     const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
     assert.equal(r.json.interrupted, true);
-    assert.deepEqual(r.json.resumed, { runId: "run-r2-event", text: "continuing after restart" });
+    assert.deepEqual(r.json.resumed, { runId: "run-r2-event", text: "continuing after restart", textPending: false });
     assert.equal(r.json.status, "unknown", "agent.wait K times out after a restart: not 'done'");
     const h = await b.call("GET", `/threads/${A}/history`);
     assert.deepEqual(h.json.messages.map((m) => [m.role, m.runId ?? null, m.resumed ?? false]), [["user", K1, false], ["assistant", K1, false], ["assistant", null, true]]);
@@ -758,7 +758,7 @@ test("Codex: a resumed reply is bound to ITS turn: polling an earlier turn never
     { role: "assistant", content: [{ type: "text", text: "first reply" }], stopReason: "stop", timestamp: 2, __openclaw: { id: "row0002", runId: K1 } },
     { role: "user", idempotencyKey: `${K2}:user`, content: "second", timestamp: 3, __openclaw: { id: "row0003" } },
     { role: "assistant", content: [{ type: "text", text: "second, cut" }], timestamp: 4, __openclaw: { id: "row0004", runId: K2 } },
-    { role: "assistant", content: [{ type: "text", text: "second continued" }], timestamp: 6, __openclaw: { id: "row0006", runId: "run-r2", continuation: { source: "restart" } } },
+    { role: "assistant", content: [{ type: "text", text: "second continued" }], stopReason: "stop", timestamp: 6, __openclaw: { id: "row0006", runId: "run-r2", continuation: { source: "restart" } } },
     { role: "assistant", content: [{ type: "text", text: "someone else's run" }], timestamp: 7, __openclaw: { id: "row0007", runId: "run-other" } }] };
   link.waits[K1] = "ok";
   const b = await bridge({ link });
@@ -767,7 +767,7 @@ test("Codex: a resumed reply is bound to ITS turn: polling an earlier turn never
     assert.equal(r1.json.interrupted, false); assert.equal(r1.json.resumed, null); assert.equal(r1.json.text, "first reply"); assert.equal(r1.json.status, "done");
     const r2 = await b.call("GET", `/threads/${A}/runs/${K2}`);
     assert.equal(r2.json.interrupted, true);
-    assert.deepEqual(r2.json.resumed, { runId: "run-r2", text: "second continued" }, "only the continuation run's own rows");
+    assert.deepEqual(r2.json.resumed, { runId: "run-r2", text: "second continued", textPending: false }, "only the continuation run's own rows");
   } finally { await b.close(); }
 });
 
@@ -1016,7 +1016,7 @@ test("BUG-1 (repro 3): a gateway crash while the bridge stays up: the resumed tu
     await sleep(1600);
     const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
     assert.equal(r.json.status, "unknown"); assert.equal(r.json.interrupted, true);
-    assert.deepEqual(r.json.resumed, { runId: "1d963dd6-run", text: "RESUMED ack s7c" });
+    assert.deepEqual(r.json.resumed, { runId: "1d963dd6-run", text: "RESUMED ack s7c", textPending: false });
     assert.equal(b.writeLink.sends.length, 1, "nothing re-sent");
   } finally { await b.close(); }
 });
@@ -1188,7 +1188,7 @@ test("Codex: the resumed reply text is the continuation's answer, never a traili
   const b = await bridge({ link });
   try {
     const r = await b.call("GET", `/threads/${A}/runs/${K1}`);
-    assert.deepEqual(r.json.resumed, { runId: "run-r2", text: "continued answer" });
+    assert.deepEqual(r.json.resumed, { runId: "run-r2", text: "continued answer", textPending: false });
   } finally { await b.close(); }
 });
 
@@ -1322,11 +1322,12 @@ test("Codex (f0b6276 :561): an UNCACHED terminal run with only a toolUse preambl
     r = await b.call("GET", `/threads/${A}/runs/${K1}`);
     assert.equal(r.json.text, "the answer"); assert.equal(r.json.textPending, undefined);
   } finally { await b.close(); }
-  const { decideRun } = await import("./app-bridge-threads.js");
+  const { runOutcome } = await import("./app-bridge-threads.js");
   const mt = (m) => m.content[0].text;
-  const pre = { role: "assistant", content: [{ type: "text", text: "pre" }], stopReason: "toolUse" };
-  assert.deepEqual(decideRun({ live: null, wait: "timeout", own: [pre], resumed: null, messageText: mt }), { status: "unknown", text: "", textPending: false });
-  assert.deepEqual(decideRun({ live: null, wait: "error", own: [], resumed: null, messageText: mt }), { status: "error", text: "", textPending: true });
+  const pre = { role: "assistant", content: [{ type: "text", text: "pre" }], stopReason: "toolUse", __openclaw: { runId: K1 } };
+  assert.equal(runOutcome({ live: null, wait: "timeout", seg: { state: "found", rows: [pre] }, K: K1, messageText: mt }).status, "unknown");
+  const e = runOutcome({ live: null, wait: "error", seg: { state: "found", rows: [] }, K: K1, messageText: mt });
+  assert.deepEqual([e.status, e.text, e.textPending], ["error", "", true]);
 });
 
 test("Codex (f0b6276 :393): /threads/legacy/history pages across a reset with the reset-ledger cursor (as legacy /history)", async () => {
