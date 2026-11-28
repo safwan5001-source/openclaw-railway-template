@@ -18,13 +18,20 @@
 import crypto from "node:crypto";
 import { mediaHandler, parseImages } from "./app-bridge-media.js";
 import { stepsFrom } from "./app-bridge-convo.js";
-import { SESSIONS_CAP_PARAMS } from "./gateway-link.js";
+import { CHAT_HISTORY_MAX, SESSIONS_CAP_PARAMS } from "./gateway-link.js";
 import { CLIENT_MSG_ID_RE, DEFINITE_REFUSALS, commandRefusal, isClientMsgId, parseTid, threadKeys, threadOfKey } from "./thread-keys.js";
 
 export const RECENT_ACCEPT_MS = 3_000;   // an accepted send this recent counts as busy (ack -> visible in activeOnly took 105 ms, L1)
 export const RESEND_WINDOW_MS = 24 * 60 * 60_000;
 export const RECONCILE_PAGE = 200;
 export const RECONCILE_MAX_PAGES = 10;
+/**
+ * Review I3: `since` may come from the API's clock (after a bridge restart there is no in-memory record), which can be ahead of the
+ * engine's row times. Reconciliation only counts as complete once it has read back past `since - RECONCILE_SKEW_MS`.
+ */
+export const RECONCILE_SKEW_MS = 15 * 60_000;
+export const HISTORY_MAX_LIMIT = 100; // the advertised maximum of GET /threads/:tid/history
+export const ALREADY_SENT = "already_sent"; // NOT a definite refusal: the id was used before and may well have been sent
 export const NEVER_RESEND = Object.freeze(["conflict", "command_not_allowed", "bad_request", "too_large"]);
 const CAP_READ_TIMEOUT_MS = 4_000;
 const READ_TIMEOUT_MS = 15_000;
@@ -132,7 +139,34 @@ export function createThreadRuns({ writeLink, now = Date.now, messageText }) {
       return r;
     },
     get: (runId) => runs.get(runId) ?? null,
+    drop: (runId) => { runs.delete(runId); },
   };
+}
+
+/** Bounded serial queues by key; an entry is removed once its last job settled (review m1). */
+export function createKeyedSerial() {
+  const queues = new Map();
+  const run = (key, fn) => {
+    const p = (queues.get(key) ?? Promise.resolve()).then(fn, fn);
+    const tail = p.catch(() => {});
+    queues.set(key, tail);
+    tail.then(() => { if (queues.get(key) === tail) queues.delete(key); });
+    return p;
+  };
+  run.size = () => queues.size;
+  return run;
+}
+
+/**
+ * The rows of ONE turn K in a history page (review/Codex): from K's user row up to (not including) the next user row. The engine's
+ * restart-resume input is hidden from history (lab L5), so a later user row always starts a later turn.
+ */
+export function turnSegment(rows, K) {
+  const at = Array.isArray(rows) ? rows.findIndex((m) => userRowRunId(m) === K) : -1;
+  if (at < 0) return null;
+  const rest = rows.slice(at + 1);
+  const next = rest.findIndex((m) => m?.role === "user");
+  return next < 0 ? rest : rest.slice(0, next);
 }
 
 /**
@@ -152,7 +186,7 @@ export async function reconcile(link, qualified, K, since) {
       if (rows.some((m) => userRowRunId(m) === K)) { found = true; break; }
       const oldest = rows.find((m) => typeof m?.__openclaw?.id === "string");
       const oldestAt = Number(rows[0]?.timestamp);
-      if (Number.isFinite(oldestAt) && oldestAt < since) { complete = true; break; } // read back past the original send
+      if (Number.isFinite(oldestAt) && oldestAt < since - RECONCILE_SKEW_MS) { complete = true; break; } // read back past the original send, with skew margin
       // more rows before these? an anchored page must SAY so (anchor.hasOlder); not knowing is incomplete, never "nothing older"
       const more = anchor ? (typeof r?.anchor?.hasOlder === "boolean" ? r.anchor.hasOlder : null) : r?.hasMore === true || rows.length >= RECONCILE_PAGE;
       if (more === null) break;
@@ -183,7 +217,14 @@ export function registerThreadRoutes(router, ctx) {
   const reply = (res, status, error, extra = {}) => res.status(status).json({ ok: false, error, ...extra });
   const bad = (res, reason) => reply(res, 400, "bad_request", reason ? { reason } : {});
   const linkDown = (res) => reply(res, 503, link ? "link_down" : "not_available");
-  const keysOf = (req, res) => { const k = threadKeys(req.params.tid); if (!k) bad(res, "bad_tid"); return k; };
+  // the tid exactly as it appears in the raw path: a percent-encoded tid is refused, never decoded (review m8)
+  const keysOf = (req, res) => {
+    const raw = String(req.path ?? "").split("/")[2];
+    const k = raw === req.params.tid ? threadKeys(req.params.tid) : null;
+    if (!k) bad(res, "bad_tid");
+    return k;
+  };
+  const legacyBusy = (k) => k.tid === "legacy" && ctx.legacyResetActive?.() === true; // «محادثة جديدة» of the legacy conversation under way (m5)
   const failRead = (res, err, what) => {
     if (err?.code === "link_down") return linkDown(res);
     log?.warn?.("app-bridge", `threads ${what}: ${err?.code ?? err?.message ?? err}`);
@@ -216,17 +257,21 @@ export function registerThreadRoutes(router, ctx) {
   /** chat.send once over the write link and answer with the closed contract. Must run inside gate.exclusive. */
   async function dispatch(res, k, K, body, sessionSha256, extra = {}) {
     let ack;
+    // the live record exists BEFORE the write: terminal events that arrive while the ack is still awaited (or after an ack
+    // timeout) are not lost (review I2). A definite refusal removes it again.
+    const existed = runs.get(K) !== null;
+    runs.start(K, k.tid, k.qualified);
     try {
       ack = await writeLink.chatSend({ sessionKey: k.unqualified, message: body.message, idempotencyKey: K, attachments: body.attachments });
     } catch (err) {
       const c = classifySendError(err);
-      if (c.error === "outcome_unknown") { gate.noteAccepted(k.tid); runs.start(K, k.tid, k.qualified); } // it may be running: count it
+      if (c.error === "outcome_unknown") gate.noteAccepted(k.tid); // it may be running: it counts for the one-run cap
+      else if (!existed) runs.drop(K);
       log?.warn?.("app-bridge", `thread send: ${c.error}${c.reason ? ` (${c.reason})` : ""}`);
       return reply(res, c.status, c.error, c.reason ? { reason: c.reason } : {});
     }
     try {
       gate.noteAccepted(k.tid);
-      runs.start(K, k.tid, k.qualified);
       const status = ["started", "in_flight", "ok"].includes(ack?.status) ? ack.status : null;
       let sha = sessionSha256;
       if (!sha) { try { const s = await describe(k.qualified); sha = s?.sessionId ? sha256(s.sessionId) : null; } catch { sha = null; } }
@@ -268,12 +313,13 @@ export function registerThreadRoutes(router, ctx) {
 
   router.get("/threads/:tid/history", async (req, res) => {
     const k = keysOf(req, res); if (!k) return;
-    const limit = Math.min(Math.max(intOr(req.query.limit, 50), 1), 100);
+    const limit = Math.min(Math.max(intOr(req.query.limit, 50), 1), HISTORY_MAX_LIMIT);
     const before = req.query.before === undefined ? null : String(req.query.before);
     if (before !== null && !MESSAGE_ID_RE.test(before)) return bad(res, "bad_cursor");
     if (!link?.isUp?.()) return linkDown(res);
     try {
-      const r = await link.request("chat.history", { sessionKey: k.qualified, limit: before ? 2 * limit + 1 : limit, ...(before ? { messageId: before } : {}) },
+      // an anchored window spans both sides of the anchor: ask for 2*limit+1, never above the link's own cap (review I1)
+      const r = await link.request("chat.history", { sessionKey: k.qualified, limit: before ? Math.min(2 * limit + 1, CHAT_HISTORY_MAX) : limit, ...(before ? { messageId: before } : {}) },
         { timeoutMs: READ_TIMEOUT_MS });
       let rows = Array.isArray(r?.messages) ? r.messages : [];
       let found = true;
@@ -302,10 +348,15 @@ export function registerThreadRoutes(router, ctx) {
     if (!isClientMsgId(K)) return bad(res, "bad_client_msg_id");
     const body = parseBody(req, res, k); if (!body) return;
     // the normal send path NEVER calls the engine again for an id it has seen (the API turns a repeat into a status read)
-    if (sends.has(K)) return reply(res, 409, "conflict", { reason: "already_sent" });
+    if (sends.has(K)) return reply(res, 409, ALREADY_SENT);
     await gate.exclusive(async () => {
       const c = await gate.check();
       if (!c.ok) return reply(res, c.status, c.error, c.busyThread ? { busyThread: c.busyThread } : {});
+      if (legacyBusy(k)) return reply(res, 409, "busy", { busyThread: "legacy" });
+      // after a bridge restart the in-memory record is gone: ask the ENGINE whether this id already ran (in any conversation, m3)
+      let w;
+      try { w = await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }); } catch { return reply(res, 503, "not_written", { reason: "precheck_failed" }); }
+      if (w?.status === "ok" || w?.status === "error") return reply(res, 409, ALREADY_SENT);
       let s;
       try { s = await describe(k.qualified); } catch { return reply(res, 503, "not_written", { reason: "precheck_failed" }); }
       if (s?.archived === true) return reply(res, 409, "archived");
@@ -322,7 +373,8 @@ export function registerThreadRoutes(router, ctx) {
     const since = intOr(req.query.since, NaN);
     if (!Number.isSafeInteger(since) || since < 0) return bad(res, "bad_since");
     const r = await reconcile(link, k.qualified, K, since);
-    res.json({ ok: true, thread: k.tid, runId: K, found: r.found, complete: r.complete, wait: r.wait, boot: ctx.boot() });
+    // agent.wait is global to the engine: its answer is reported only for a run found in THIS conversation (review m2)
+    res.json({ ok: true, thread: k.tid, runId: K, found: r.found, complete: r.complete, wait: r.found ? r.wait : null, boot: ctx.boot() });
   });
 
   router.post("/threads/:tid/sends/:clientMsgId/resend", async (req, res) => {
@@ -346,6 +398,7 @@ export function registerThreadRoutes(router, ctx) {
     await gate.exclusive(async () => {
       const c = await gate.check();
       if (!c.ok) return reply(res, c.status, c.error, c.busyThread ? { busyThread: c.busyThread } : {});
+      if (legacyBusy(k)) return reply(res, 409, "busy", { busyThread: "legacy" });
       let s;
       try { s = await describe(k.qualified); } catch { return notAllowed("precheck_failed"); }
       if (s?.archived === true) return reply(res, 409, "archived");
@@ -367,7 +420,9 @@ export function registerThreadRoutes(router, ctx) {
     const live = runs.get(K);
     if (live && live.tid !== k.tid) return reply(res, 404, "not_found");
     if (!link?.isUp?.() && !live) return linkDown(res);
-    // after a restart, or for steps: the engine's own record (history rows tagged with K, the resumed run, agent.wait)
+    // The engine's own record: history rows tagged with K (bounded to K's turn), the resumed run, and agent.wait {timeoutMs:0}.
+    // Read for every poll of a finished or unknown run, and at most every 1.5 s for a live one, whose terminal event may have been
+    // missed (a write-link drop/reconnect, an ack timeout): the engine then decides, never the stale cache (review I2).
     let rows = null; let wait = null;
     if (link?.isUp?.() && (!live || live.status !== "running" || now() - live.stepsAt >= 1500)) {
       try {
@@ -375,19 +430,26 @@ export function registerThreadRoutes(router, ctx) {
         rows = Array.isArray(h?.messages) ? h.messages : [];
         if (live) live.stepsAt = now();
       } catch { rows = null; }
-      if (!live || live.status !== "running") {
-        try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
-      }
+      try { wait = str((await link.request("agent.wait", { runId: K, timeoutMs: 0 }, { timeoutMs: READ_TIMEOUT_MS }))?.status, 20); } catch { wait = null; }
     }
     if (!live && rows === null) return reply(res, 502, "engine_unavailable"); // could not read: never reported as "no such run"
-    const at = rows ? rows.findIndex((m) => userRowRunId(m) === K) : -1;
-    const after = at >= 0 ? rows.slice(at + 1) : [];
+    const seg = rows ? turnSegment(rows, K) : null;
+    // m2: with no live record, a run is reported only when K's own user row is in THIS conversation (agent.wait is engine-global)
+    if (!live && seg === null) return reply(res, 404, "not_found");
+    const after = seg ?? [];
     const own = after.filter((m) => assistantRunId(m) === K);
-    const resumedAt = after.findIndex((m) => isResumedRow(m) && m.__openclaw?.runId !== K);
-    const resumedRows = resumedAt >= 0 ? after.slice(resumedAt).filter((m) => m.role === "assistant") : [];
-    const resumed = resumedRows.length ? { runId: str(resumedRows[0].__openclaw?.runId, 100), text: ctx.messageText(resumedRows.at(-1)) } : null;
-    if (live && rows && live.status === "running") live.steps = stepsFrom(after, 0);
-    if (!live && at < 0 && wait !== "ok" && wait !== "error") return reply(res, 404, "not_found");
+    // the continuation run of THIS turn only (Codex): the first restart-continued reply inside K's segment, and only its own rows
+    const first = after.find((m) => isResumedRow(m) && m.__openclaw?.runId !== K);
+    const resumedId = first ? first.__openclaw.runId : null;
+    const resumedRows = resumedId ? after.filter((m) => m.role === "assistant" && m.__openclaw?.runId === resumedId) : [];
+    const resumed = resumedRows.length ? { runId: str(resumedId, 100), text: ctx.messageText(resumedRows.at(-1)) } : null;
+    if (live && live.status === "running") {
+      if (rows) live.steps = stepsFrom(after, 0);
+      if (wait === "ok" || wait === "error") {
+        live.status = wait === "ok" ? "done" : "error"; live.finishedAt = now();
+        if (own.length) live.text = ctx.messageText(own.at(-1));
+      } else if (resumed) { live.status = "unknown"; live.finishedAt = now(); } // K was interrupted; the engine continued it in another run
+    }
     const status = live ? live.status : wait === "ok" ? "done" : wait === "error" ? "error" : "unknown";
     const text = live ? live.text : own.length ? ctx.messageText(own.at(-1)) : "";
     res.json({ ok: true, runId: K, thread: k.tid, status, text: ctx.cleanLiveText(text, { streaming: status === "running" }), phase: live?.phase ?? null,
@@ -412,8 +474,9 @@ export function registerThreadRoutes(router, ctx) {
   });
 
   // ---- per-conversation settings: one write at a time per key; a change while a run is active is refused (it would be overwritten) ----
-  const queues = new Map();
-  const serial = (key, fn) => { const p = (queues.get(key) ?? Promise.resolve()).then(fn, fn); queues.set(key, p.catch(() => {})); return p; };
+  const keyed = createKeyedSerial();
+  // m5: the legacy conversation's settings share the legacy routes' ONE queue (which also forgets the legacy describe cache)
+  const serialFor = (k, fn) => (k.tid === "legacy" && ctx.legacySerial ? ctx.legacySerial(fn) : keyed(k.qualified, fn));
   const needCall = (res) => { if (gatewayCall && link) return false; reply(res, 503, "not_available"); return true; };
   async function modelsFor(qualified) {
     const r = await gatewayCall("models.list", { agentId: "main", sessionKey: qualified, view: "default", includeDetails: true });
@@ -441,7 +504,7 @@ export function registerThreadRoutes(router, ctx) {
     if (needCall(res)) return undefined;
     const want = typeof req.body?.model === "string" ? req.body.model.trim() : "";
     if (!want || want.length > 200) return bad(res);
-    return serial(k.qualified, async () => {
+    return serialFor(k, async () => {
       try {
         const s = await describe(k.qualified);
         if (s === null) return reply(res, 409, "not_started"); // a new conversation runs on the default model until its first turn
@@ -449,7 +512,8 @@ export function registerThreadRoutes(router, ctx) {
         if (want !== "default") {
           const row = (await modelsFor(k.qualified)).find((m) => m.id === want);
           if (!row) return bad(res, "unknown_model");
-          if (!row.selectable) return bad(res, row.available ? "model_not_selectable" : "model_unavailable");
+          if (!row.available) return bad(res, "model_unavailable"); // m6: as the legacy route
+          if (!row.selectable) return bad(res, "model_not_selectable");
         }
         await gatewayCall("sessions.patch", { key: k.qualified, model: want === "default" ? null : want });
         res.json(settingsView(k, await describe(k.qualified)));
@@ -462,7 +526,7 @@ export function registerThreadRoutes(router, ctx) {
     if (needCall(res)) return undefined;
     const level = typeof req.body?.level === "string" ? req.body.level.trim() : "";
     if (!level || level.length > 40) return bad(res);
-    return serial(k.qualified, async () => {
+    return serialFor(k, async () => {
       try {
         const s = await describe(k.qualified);
         if (s === null) return reply(res, 409, "not_started");
@@ -481,7 +545,7 @@ export function registerThreadRoutes(router, ctx) {
     if (needCall(res)) return undefined;
     const mode = typeof req.body?.mode === "string" ? req.body.mode.trim() : "";
     if (!Object.hasOwn(FAST, mode)) return bad(res);
-    return serial(k.qualified, async () => {
+    return serialFor(k, async () => {
       try {
         const s = await describe(k.qualified);
         if (s === null) return reply(res, 409, "not_started");
@@ -522,7 +586,7 @@ export function registerThreadRoutes(router, ctx) {
   router.post("/threads/:tid/restore", (req, res) => {
     const k = keysOf(req, res); if (!k) return undefined;
     if (needCall(res)) return undefined;
-    return serial(k.qualified, async () => {
+    return serialFor(k, async () => {
       try {
         const s = await describe(k.qualified);
         if (s === null) return reply(res, 404, "not_found");
@@ -535,5 +599,5 @@ export function registerThreadRoutes(router, ctx) {
     });
   });
 
-  return { runs, sends, definiteRefusals: DEFINITE_REFUSALS, parseTid };
+  return { runs, sends, definiteRefusals: DEFINITE_REFUSALS, parseTid, keyed };
 }

@@ -141,7 +141,8 @@ export function attachmentsTooLarge(attachments, limits) {
  *           ackTimeoutMs?: number, clientVersion?: string, setTimer?: typeof setTimeout, clearTimer?: typeof clearTimeout, random?: () => number }} o
  */
 export function createGatewayWriteLink({ url, token, log, WebSocketImpl = globalThis.WebSocket, now = Date.now, config = WRITE_LINK_CONFIG,
-  ackTimeoutMs = ACK_TIMEOUT_MS, clientVersion = "basht-bridge-write/1", setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random }) {
+  ackTimeoutMs = ACK_TIMEOUT_MS, clientVersion = "basht-bridge-write/1", setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random,
+  connectTimeoutMs = CONNECT_TIMEOUT_MS }) {
   const epoch = crypto.randomBytes(6).toString("hex");
   let ws = null;
   let state = "off";
@@ -208,7 +209,14 @@ export function createGatewayWriteLink({ url, token, log, WebSocketImpl = global
     ws = sock;
     let helloDone = false;
     let why = null;
-    sock.onclose = () => { if (ws === sock) dropped(why ?? "closed"); };
+    // m11: the whole handshake is bounded from the moment the socket exists, also when connect.challenge never arrives
+    const connectTimer = setTimer(() => {
+      if (helloDone || ws !== sock) return;
+      ws = null; try { sock.close(); } catch { /* ignore */ }
+      dropped("connect_timeout");
+    }, connectTimeoutMs);
+    connectTimer?.unref?.();
+    sock.onclose = () => { clearTimer(connectTimer); if (ws === sock) dropped(why ?? "closed"); };
     sock.onerror = () => { why ??= "socket_error"; };
     sock.onmessage = (m) => {
       if (ws !== sock) return;
@@ -230,6 +238,7 @@ export function createGatewayWriteLink({ url, token, log, WebSocketImpl = global
           const granted = Array.isArray(hello?.auth?.scopes) ? hello.auth.scopes : [];
           if (!config.scopes.every((s) => granted.includes(s))) { why = "scopes_not_granted"; try { sock.close(4001, "scopes"); } catch { /* ignore */ } return; }
           helloDone = true;
+          clearTimer(connectTimer);
           limits = limitsFromHello(hello);
           tickMs = posInt(hello?.policy?.tickIntervalMs) || DEFAULT_TICK_MS;
           attempt = 0; lastError = null;

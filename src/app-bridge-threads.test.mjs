@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import express from "express";
 import { createAppBridge } from "./app-bridge.js";
 import { RECENT_ACCEPT_MS, RESEND_WINDOW_MS, classifySendError } from "./app-bridge-threads.js";
-import { SESSIONS_CAP_PARAMS } from "./gateway-link.js";
+import { SESSIONS_CAP_PARAMS, validateLinkRequest } from "./gateway-link.js";
 import { DEFINITE_REFUSALS, THREAD_FEATURES } from "./thread-keys.js";
 import { BAD_TIDS } from "./fixtures/thread-key-negatives.mjs";
 
@@ -31,6 +31,9 @@ function fakeLink(o = {}) {
     approvalDeadline: () => null, pendingKind: () => null, forgetApproval() {}, approvalThreadOf: () => "unknown",
     events: () => ({ epoch: EPOCH, latest: 0, oldest: null, truncated: false, events: [] }), waitForEvents: () => Promise.resolve(),
     async request(method, params) {
+      // the REAL link allowlist and closed validators: a fake must never accept what the real link refuses (review I1/I4)
+      const refused = validateLinkRequest(method, params, { threads: this.threads });
+      if (refused) throw Object.assign(new Error(refused), { code: refused });
       this.requests.push({ method, params });
       if (method === "sessions.list") {
         if (JSON.stringify(params) === JSON.stringify(SESSIONS_CAP_PARAMS)) {
@@ -344,7 +347,8 @@ test("no retry and no CLI fallback: one failed write is exactly one chat.send an
     // the normal send path never calls the engine again for an id it has seen
     await sleep(W + 20);
     const again = await send(b, A, K1);
-    assert.equal(again.status, 409); assert.equal(again.json.reason, "already_sent");
+    assert.equal(again.status, 409); assert.deepEqual(again.json, { ok: false, error: "already_sent" });
+    assert.ok(!DEFINITE_REFUSALS.includes("already_sent"), "an id used before is NOT a definite refusal: it may have been sent (m4)");
     assert.equal(b.writeLink.sends.length, 1);
   } finally { await b.close(); }
 });
@@ -436,7 +440,7 @@ test("resend: allowed once, with the SAME id, only inside 24 h, same engine sess
     for (const p of ["conflict", "command_not_allowed", "bad_request", "too_large"]) await refuse(`/threads/${A}/sends/${K2}/resend`, { ...body, previousRefusal: p }, "refusal_final");
     assert.equal(b.writeLink.sends.length, 1, "no refused resend wrote anything");
     // the resend route is the only way back for a seen id: the normal send path refuses it
-    assert.equal((await send(b, A, K1)).json.reason, "already_sent");
+    assert.equal((await send(b, A, K1)).json.error, "already_sent");
     // resend of the SAME id with a different body is a conflict
     assert.deepEqual((await b.call("POST", `/threads/${A}/sends/${K1}/resend`, { ...body, message: "other" })).json, { ok: false, error: "conflict" });
   } finally { await b.close(); }

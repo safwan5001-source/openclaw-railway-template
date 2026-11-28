@@ -82,6 +82,19 @@ const PARAM_VALIDATORS = Object.freeze({
   "cron.list": sameParams(CRON_RUNNING_PARAMS),
   "tts.speak": (p) => isPlainObject(p) && Object.keys(p).length === 1 && typeof p.text === "string" && p.text.length >= 1 && p.text.length <= TTS_SPEAK_MAX_CHARS,
 });
+/**
+ * The link's own allowlist + closed param check, exported so tests (and fakes standing in for the link) apply EXACTLY the same
+ * rules: null when the request may be sent, else "not_allowed" (method) or "bad_params" (params). Nothing is sent either way.
+ */
+export function validateLinkRequest(method, params, { threads = false } = {}) {
+  const threadRead = threads && THREAD_LINK_METHODS.has(method);
+  if (!LINK_METHODS.has(method) && !threadRead) return "not_allowed";
+  const ok = threadRead ? THREAD_VALIDATORS[method](params)
+    : method === "sessions.list" && threads ? (PARAM_VALIDATORS[method](params) || isCapList(params))
+      : !PARAM_VALIDATORS[method] || PARAM_VALIDATORS[method](params);
+  return ok ? null : "bad_params";
+}
+
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
 export const APPROVAL_KINDS = Object.freeze({ exec: "exec", plugin: "plugin", openclaw: "system-agent" });
 const LIST_METHOD = { exec: "exec.approval.list", plugin: "plugin.approval.list", "system-agent": "openclaw.approval.list" };
@@ -438,12 +451,9 @@ export function createGatewayLink({ url, token, log, WebSocketImpl = globalThis.
      * retry a call that costs money.
      */
     request(method, params, { timeoutMs } = {}) {
-      const threadRead = threads && THREAD_LINK_METHODS.has(method);
-      if (!LINK_METHODS.has(method) && !threadRead) return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
-      const ok = threadRead ? THREAD_VALIDATORS[method](params)
-        : method === "sessions.list" && threads ? (PARAM_VALIDATORS[method](params) || isCapList(params))
-          : !PARAM_VALIDATORS[method] || PARAM_VALIDATORS[method](params);
-      if (!ok) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
+      const refused = validateLinkRequest(method, params, { threads });
+      if (refused === "not_allowed") return Promise.reject(Object.assign(new Error(`${method} is not allowed on the link`), { code: "not_allowed" }));
+      if (refused) return Promise.reject(Object.assign(new Error(`${method}: params not allowed`), { code: "bad_params" }));
       if (state !== "up") return Promise.reject(Object.assign(new Error("link_down"), { code: "link_down" }));
       const t = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, MAX_REQUEST_TIMEOUT_MS) : REQUEST_TIMEOUT_MS;
       return rpc(method, params, t);
