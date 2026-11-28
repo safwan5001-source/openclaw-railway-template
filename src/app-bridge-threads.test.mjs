@@ -94,7 +94,8 @@ function fakeHttp() {
   return g;
 }
 
-async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWriteLink(), httpGw = fakeHttp(), gatewayCall, now } = {}) {
+const W = 40; // the accept window in these tests (the real default, RECENT_ACCEPT_MS = 3 s, is tested on its own)
+async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWriteLink(), httpGw = fakeHttp(), gatewayCall, now, recentAcceptMs = W } = {}) {
   const calls = [];
   const gc = gatewayCall ?? (async (method, params) => {
     calls.push({ method, params });
@@ -105,7 +106,7 @@ async function bridge({ threads = true, link = fakeLink(), writeLink = fakeWrite
     throw new Error(`unexpected ${method}`);
   });
   const router = createAppBridge({ token: APP_TOKEN, gatewayUrl: "http://gw.invalid", gatewayToken: "synthetic-gateway-token-0123456789abcdef",
-    configPath: "/nonexistent/openclaw.json", fetchImpl: httpGw.fetch, gatewayCall: gc, link, writeLink, env: threads ? { BASHT_THREADS: "on" } : {}, ...(now ? { now } : {}) });
+    configPath: "/nonexistent/openclaw.json", fetchImpl: httpGw.fetch, gatewayCall: gc, link, writeLink, env: threads ? { BASHT_THREADS: "on" } : {}, ...(recentAcceptMs === null ? {} : { recentAcceptMs }), ...(now ? { now } : {}) });
   const app = express(); app.use("/app/v1", router);
   const server = http.createServer(app);
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -170,7 +171,7 @@ test("thread send: the bridge builds the UNQUALIFIED key from the tid, idempoten
     assert.deepEqual(b.writeLink.sends, [{ sessionKey: `app:owner:${A}`, message: "hello", idempotencyKey: K1, attachments: [] }]);
     assert.ok(!b.link.requests.some((q) => q.method === "chat.send"), "never on the admin link");
     assert.deepEqual(b.link.requests.find((q) => q.method === "sessions.describe").params, { key: `agent:main:app:owner:${A}` }, "the pre-check uses the qualified key");
-    await sleep(RECENT_ACCEPT_MS + 50);
+    await sleep(W + 30);
     const l = await send(b, "legacy", K2);
     assert.equal(l.status, 202);
     assert.equal(b.writeLink.sends[1].sessionKey, "app:owner", "legacy tid -> app:owner, never APP_SESSION_KEY of the request");
@@ -233,7 +234,7 @@ test("cap: a legacy HTTP turn running -> thread send busy (legacy); a thread run
     assert.equal(l.status, 202);
     const r = await send(b, B, K1);
     assert.deepEqual(r.json, { ok: false, error: "busy", busyThread: "legacy" });
-    open(); await sleep(50); await sleep(RECENT_ACCEPT_MS);
+    open(); await sleep(50); await sleep(W + 20);
     b.link.active = [`agent:main:app:owner:${B}`]; // another device's chat.send run in B
     const l2 = await b.call("POST", "/send", { message: "again" });
     assert.equal(l2.status, 409); assert.deepEqual(l2.json, { ok: false, error: "busy", busyThread: B });
@@ -243,12 +244,21 @@ test("cap: a legacy HTTP turn running -> thread send busy (legacy); a thread run
 });
 
 test("cap: an accepted send < 3 s ago is busy (the ack -> activeOnly window); two concurrent sends: one 202, one busy (the mutex)", async () => {
+  assert.equal(RECENT_ACCEPT_MS, 3000);
+  const d = await bridge({ recentAcceptMs: null }); // the bridge's own default
+  try {
+    assert.equal((await send(d, A, K1)).status, 202);
+    await sleep(2000);
+    assert.equal((await send(d, B, K2)).json.error, "busy", "still inside 3 s");
+    await sleep(1100);
+    assert.equal((await send(d, B, K2)).status, 202, "after 3 s");
+  } finally { await d.close(); }
   const b = await bridge();
   try {
     assert.equal((await send(b, A, K1)).status, 202);
     const r = await send(b, B, K2);
     assert.deepEqual(r.json, { ok: false, error: "busy", busyThread: A });
-    await sleep(RECENT_ACCEPT_MS + 50);
+    await sleep(W + 30);
     b.writeLink.ackDelay = 150; // the first check-then-send is still in flight when the second arrives
     const [x, y] = await Promise.all([send(b, A, K3), send(b, B, "44444444-4444-4444-8444-444444444444")]);
     assert.deepEqual([x.status, y.status].sort(), [202, 409]);
@@ -306,14 +316,14 @@ test("failure mapping: definite codes only from the closed list; ack_lost/ack_ti
     for (const [e, status, error] of CASES) {
       b.writeLink.behave = () => { throw e; };
       const K = (await import("node:crypto")).randomUUID();
-      await sleep(RECENT_ACCEPT_MS + 20); // an unknown outcome counts as "just accepted" for the cap
+      await sleep(W + 20); // an unknown outcome counts as "just accepted" for the cap
       const r = await send(b, A, K);
       assert.equal(r.status, status, `${e.message} -> ${r.text}`); assert.equal(r.json.error, error);
       assert.notEqual(r.json.error, "engine_unavailable");
     }
     // an ack with an unexpected shape is unknown, not accepted
     b.writeLink.behave = () => ({ status: "weird" });
-    await sleep(RECENT_ACCEPT_MS + 20);
+    await sleep(W + 20);
     const r = await send(b, A, "55555555-5555-4555-8555-555555555555");
     assert.equal(r.status, 502); assert.equal(r.json.error, "outcome_unknown");
   } finally { await b.close(); }
@@ -328,7 +338,7 @@ test("no retry and no CLI fallback: one failed write is exactly one chat.send an
     assert.equal(b.writeLink.sends.length, 1);
     assert.ok(!b.calls.some((c) => c.method === "chat.send"));
     // the normal send path never calls the engine again for an id it has seen
-    await sleep(RECENT_ACCEPT_MS + 20);
+    await sleep(W + 20);
     const again = await send(b, A, K1);
     assert.equal(again.status, 409); assert.equal(again.json.reason, "already_sent");
     assert.equal(b.writeLink.sends.length, 1);
@@ -394,7 +404,7 @@ test("resend: allowed once, with the SAME id, only inside 24 h, same engine sess
     assert.equal(ok.status, 202, ok.text); assert.equal(ok.json.resent, true); assert.equal(ok.json.runId, K1);
     assert.deepEqual(b.writeLink.sends.map((s) => s.idempotencyKey), [K1], "same id, one call");
     assert.ok(b.link.requests.some((q) => q.method === "agent.wait" && q.params.runId === K1 && q.params.timeoutMs === 0));
-    clock += RECENT_ACCEPT_MS + 1;
+    clock += W + 1;
     const refuse = async (path, bd, reason) => {
       const r = await b.call("POST", path, bd);
       assert.equal(r.status, 409, `${reason}: ${r.text}`); assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason });
@@ -436,7 +446,7 @@ test("resend: the bridge's stored sessionId for the original send wins over the 
     assert.equal((await send(b, A, K1)).json.error, "outcome_unknown");
     b.writeLink.behave = null;
     b.link.sessions[key] = { key, sessionId: "sid-2" }; // replaced after the original send
-    await sleep(RECENT_ACCEPT_MS + 20);
+    await sleep(W + 20);
     const r = await b.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: await sha("sid-2") });
     assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "session_changed" });
     assert.equal(b.writeLink.sends.length, 1);

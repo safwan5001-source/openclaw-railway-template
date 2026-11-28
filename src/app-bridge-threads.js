@@ -84,7 +84,7 @@ export function classifySendError(err) {
  *      The read failed, or is incomplete (totalCount above the rows, hasMore)   -> busy_unknown (fail closed)
  * cron and WhatsApp never count, as today.
  */
-export function createSendGate({ link, now = Date.now, legacyRunning = () => false }) {
+export function createSendGate({ link, now = Date.now, legacyRunning = () => false, recentAcceptMs = RECENT_ACCEPT_MS }) {
   let chain = Promise.resolve();
   let lastAccepted = null;
   const busy = (thread) => ({ ok: false, status: 409, error: "busy", busyThread: thread });
@@ -94,7 +94,7 @@ export function createSendGate({ link, now = Date.now, legacyRunning = () => fal
     exclusive(fn) { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; },
     async check() {
       if (legacyRunning()) return busy("legacy");
-      if (lastAccepted && now() - lastAccepted.at < RECENT_ACCEPT_MS) return busy(lastAccepted.thread);
+      if (lastAccepted && now() - lastAccepted.at < recentAcceptMs) return busy(lastAccepted.thread);
       if (!link?.isUp?.()) return unknown;
       let r;
       try { r = await link.request("sessions.list", { ...SESSIONS_CAP_PARAMS }, { timeoutMs: CAP_READ_TIMEOUT_MS }); } catch { return unknown; }

@@ -311,7 +311,7 @@ async function readCompletionStream(body, onText, onEngineRunId) {
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
 export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall, link,
-  writeLink, stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing, env = process.env }) {
+  writeLink, stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing, env = process.env, recentAcceptMs }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   // B4: independent conversations. OFF unless BASHT_THREADS=on: then nothing below behaves differently from before batch 4.
@@ -322,7 +322,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   const runLinks = new Map(); // engine run id -> runId of /send (this process only)
   const runs = new Map(); // runId -> { id, status, text, error, startedAt, firstTokenAt, finishedAt, abort }
   // B4: the mutex + global one-run cap shared by EVERY send path (only used while the flag is on)
-  const gate = createSendGate({ link, now, legacyRunning: () => [...runs.values()].some((r) => r.status === "running") });
+  const gate = createSendGate({ link, now, recentAcceptMs, legacyRunning: () => [...runs.values()].some((r) => r.status === "running") });
   let failures = { windowStart: 0, count: 0 };
   // B4: a reply that finishes while the app was not polling (phone locked / app closed) is worth a push; /events is the server's
   // own poller, never the app on screen, so it does not count.
