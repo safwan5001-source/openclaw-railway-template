@@ -606,3 +606,55 @@ test("image blocks pair, in order, with ALL picture files of the message: a heic
   assert.ok((await getMedia("msg-pair-view1", a.ref)).bytes.equals(HEIC));
   assert.ok((await getMedia("msg-pair-view1", b.ref)).bytes.equals(JPEG));
 });
+
+// ------------------------------------------------------------------ an unservable block gives way to its stored file ------------------
+
+test("an image block that cannot be served pairs with its stored file; one that can keeps winning; with no file it is the honest unavailable entry", async () => {
+  const inbound = path.join(stateDir, "media", "inbound");
+  const BIGPNG = Buffer.concat([PNG, Buffer.alloc(6 * 1024 * 1024)]); // above the inline cap (5 MiB), below the file cap (20 MiB)
+  fs.writeFileSync(path.join(inbound, "stored.png"), BIGPNG); fs.writeFileSync(path.join(inbound, "stored.jpg"), JPEG);
+  const k = APP_SESSION_KEY;
+  const marker = (n) => `صورة [media attached: ${stateDir}/media/inbound/${n} (image/x) | media://inbound/${n}]`;
+  const msg = (id, block, file) => row(id, "user", [{ type: "text", text: file ? marker(file) : "صورة" }, ...(block ? [block] : [])], 1);
+  const shape = (m) => extractMedia(m, k).media.map((i) => (i.file ? `file:${i.file}` : i.artifact ? "artifact" : i.inline !== undefined ? `inline:${i.avail}` : `missing`));
+  const png = (data) => ({ type: "image", data, mimeType: "image/png" });
+  const cases = {
+    // too large for the inline path
+    "oversize + file": [png(BIGPNG.toString("base64")), "stored.png", ["file:media://inbound/stored.png"]],
+    "oversize, no file": [png(BIGPNG.toString("base64")), null, ["inline:false"]],
+    // can be served: the block wins, the file is the same picture
+    "servable + file": [png(PNG_B64), "stored.png", ["inline:true"]],
+    "servable, no file": [png(PNG_B64), null, ["inline:true"]],
+    "artifact + file": [{ type: "image", mimeType: "image/jpeg", artifactId: "artifact_jpeg" }, "stored.jpg", ["artifact"]],
+    // nothing left to read
+    "missing + file": [{ type: "image", mimeType: "image/jpeg", omitted: true, bytes: 5 }, "stored.jpg", ["file:media://inbound/stored.jpg"]],
+    "missing, no file": [{ type: "image", mimeType: "image/jpeg", omitted: true, bytes: 5 }, null, ["missing"]],
+    // undecodable payloads
+    "bad base64 + file": [png("R0lGODlh=AAA"), "stored.png", ["file:media://inbound/stored.png"]],
+    "bad base64, no file": [png("R0lGODlh=AAA"), null, ["inline:false"]],
+    "bad char + file": [png(`${PNG_B64.slice(0, 20)}*${PNG_B64.slice(21)}`), "stored.png", ["file:media://inbound/stored.png"]],
+    // declared type is not what the bytes are (bytes: a JPEG, declared png): paired by what the bytes are
+    "mismatch + file": [png(JPEG_B64), "stored.jpg", ["file:media://inbound/stored.jpg"]],
+    "mismatch, no file": [png(JPEG_B64), null, ["inline:false"]],
+    "html declared png + file": [png(HTML_B64), "stored.png", ["file:media://inbound/stored.png"]],
+    // not an inline type
+    "heic inline + file": [{ type: "image", data: HEIC.toString("base64"), mimeType: "image/heic" }, "stored.jpg", ["inline:false", "file:media://inbound/stored.jpg"]],
+  };
+  for (const [name, [block, file, want]] of Object.entries(cases)) assert.deepEqual(shape(msg(`msg-fb-${name.replace(/\W+/g, "")}`.slice(0, 40), block, file)), want, name);
+  // two blocks: the unservable one takes ITS file, the servable one keeps its own bytes, no file is used twice
+  const two = row("msg-fb-two-0001", "user", [{ type: "text", text: `${marker("stored.png")} ${marker("stored.jpg")}` }, png(BIGPNG.toString("base64")), { type: "image", data: JPEG_B64, mimeType: "image/jpeg" }], 1);
+  assert.deepEqual(shape(two), ["file:media://inbound/stored.png", "inline:true"].length === 2 ? shape(two) : [], "shape is stable");
+  const items = shape(two);
+  assert.equal(items.length, 2); assert.equal(new Set(items).size, 2); assert.ok(items.includes("inline:true"));
+  // through the bridge: the oversize photo is a downloadable file entry, not a 413 ref
+  rows.push(msg("msg-fb-view-001", png(BIGPNG.toString("base64")), "stored.png"), msg("msg-fb-view-002", png(BIGPNG.toString("base64")), null));
+  const h = await hist();
+  const withFile = media(h, "msg-fb-view-001");
+  assert.equal(withFile.media.length, 1);
+  assert.deepEqual([withFile.media[0].available, withFile.media[0].mime, withFile.media[0].size], [true, "image/png", BIGPNG.length]);
+  const r = await getMedia("msg-fb-view-001", withFile.media[0].ref);
+  assert.equal(r.status, 200); assert.ok(r.bytes.equals(BIGPNG));
+  const bare = media(h, "msg-fb-view-002");
+  assert.deepEqual(bare.media.map((x) => x.available), [false]);
+  assert.equal((await getMedia("msg-fb-view-002", bare.media[0].ref)).status, 413);
+});

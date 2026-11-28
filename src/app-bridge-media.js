@@ -318,7 +318,10 @@ export function extractMedia(m, key, text = textOf(m)) {
     }
     const data = inlineData(p);
     if (data) {
-      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", inline: ci, mime, name: label(mime), size: base64Bytes(data), avail: inlineUsable(data, mime) });
+      const avail = inlineUsable(data, mime);
+      // an inline payload that cannot be served pairs with a file by what its bytes really are (its declared type may be wrong)
+      const sniffed = avail || !validBase64(data) ? null : ["image/png", "image/jpeg", "image/gif", "image/webp", "image/heic"].find((mm) => bytesMatch(mm, headBytes(data))) ?? null;
+      blocks.push({ kind: INLINE_MIMES.has(mime) ? "image" : "file", inline: ci, mime, name: label(mime), size: base64Bytes(data), avail, ...(sniffed ? { pairMime: sniffed } : {}) });
       return;
     }
     blocks.push({ kind: "image", missing: ci, mime, name: label(mime), size, avail: false });
@@ -360,10 +363,13 @@ export function extractMedia(m, key, text = textOf(m)) {
   for (const b of blocks) {
     // the next picture file of the message; one whose type is known and differs from the block's is another picture's (a heic block
     // without a file of its own must not take the jpeg's)
-    const at = spare.findIndex((r) => !b.mime || !r.mime || b.mime === r.mime);
+    const bm = b.pairMime ?? b.mime;
+    const at = spare.findIndex((r) => !bm || !r.mime || bm === r.mime);
     const own = at >= 0 ? spare.splice(at, 1)[0] : undefined;
     if (own) used.add(own);
-    items.push(b.missing !== undefined && own ? own : b);
+    // the block wins when it can be served (the file is the same picture, not a second one); a block that cannot (nothing left,
+    // too large for the inline path, undecodable, bytes not what it declares) gives way to its stored file, which is the working fallback
+    items.push(b.avail === false && own ? own : b);
   }
   items.push(...refs.filter((r) => !used.has(r)));
 
