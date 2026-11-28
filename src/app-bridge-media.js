@@ -273,14 +273,18 @@ function inlineData(p) {
   return d;
 }
 
+/** Standard base64 with correct padding (length a multiple of 4, `=` only at the very end, at most two). */
+const validBase64 = (data) => data.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(data);
+/** The decoded first bytes of a (valid) base64 payload: the first 48 characters (a multiple of 4, so cut on a byte boundary), or all of it. */
+const headBytes = (data) => Buffer.from(data.slice(0, 48), "base64");
+
 /**
- * Is the inline payload of block `p` something /media may serve? Looks at the declared type, the size and the first bytes only
- * (the whole payload is decoded, and checked again, when the bytes are asked for).
+ * Is the inline payload of block `p` something /media may serve? Looks at the declared type, the size, the base64 form (padding
+ * included) and the first bytes: exactly what inlineImageBytes enforces when the bytes are asked for.
  */
 function inlineUsable(data, mime) {
-  if (!INLINE_MIMES.has(mime) || data.length < 8 || base64Bytes(data) > MAX_INLINE_BYTES) return false;
-  const head = data.slice(0, Math.min(48, data.length - (data.length % 4)));
-  return /^[A-Za-z0-9+/]+$/.test(head) && bytesMatch(mime, Buffer.from(head, "base64"));
+  if (!INLINE_MIMES.has(mime) || data.length < 4 || base64Bytes(data) > MAX_INLINE_BYTES || !validBase64(data)) return false;
+  return bytesMatch(mime, headBytes(data));
 }
 
 /**
@@ -374,6 +378,7 @@ export function inlineImageBytes(m, item) {
   const data = p?.type === "image" ? inlineData(p) : "";
   if (!data || !INLINE_MIMES.has(item.mime)) return { error: "not_found" };
   if (base64Bytes(data) > MAX_INLINE_BYTES) return { error: "too_large" };
+  if (!validBase64(data)) return { error: "unsupported" };
   const bytes = Buffer.from(data, "base64");
   if (bytes.length > MAX_INLINE_BYTES) return { error: "too_large" };
   if (!bytesMatch(item.mime, bytes.subarray(0, 64))) return { error: "unsupported" };

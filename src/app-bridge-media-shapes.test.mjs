@@ -498,3 +498,32 @@ test("history: a conversation other than the app session never carries a runId, 
   assert.deepEqual(r.messages.map((m) => m.id), ["msg-wa-user-01", "msg-wa-asst-01"]);
   assert.ok(r.messages.every((m) => !("runId" in m)));
 });
+
+// ------------------------------------------------------------------ base64 padding: listing and serving agree --------------------------
+
+test("tiny inline images whose whole payload is one short base64 string: padding of 0, 1 and 2 characters is valid, malformed padding is not", async () => {
+  const gif = (n) => Buffer.concat([Buffer.from("GIF89a", "latin1"), Buffer.alloc(n - 6, 1)]);
+  const png = (n) => Buffer.concat([Buffer.from("\x89PNG\r\n\x1a\n", "latin1"), Buffer.alloc(n - 8, 2)]);
+  const good = [["gif33", gif(33), "image/gif", 0], ["gif34", gif(34), "image/gif", 2], ["gif35", gif(35), "image/gif", 1], ["gif40", gif(40), "image/gif", 2],
+    ["png33", png(33), "image/png", 0], ["png34", png(34), "image/png", 2], ["png35", png(35), "image/png", 1], ["png38", png(38), "image/png", 1]];
+  for (const [id, bytes, mime, pad] of good) {
+    const b64 = bytes.toString("base64");
+    assert.equal(b64.length <= 56 && b64.endsWith("=".repeat(pad)) && !b64.endsWith("=".repeat(pad + 1)), true, `${id} padding`);
+    rows.push({ ...row(`msg-pad-${id}`, "user", [{ type: "image", data: b64, mimeType: mime }], 6000), timestamp: 6000 });
+  }
+  const g = Buffer.from("GIF89a", "latin1").toString("base64").slice(0, 8); // "R0lGODlh"
+  const bad = { "misplaced-pad": `${g}=AAA`, "pad-in-middle": `${g}AA=AAAAA`, "three-pad": `${g}A===`, "length-3": `${g}AAA`, "bad-char": `${g}A*AA`, "empty-pad": "====" };
+  for (const [id, data] of Object.entries(bad)) rows.push({ ...row(`msg-pad-bad-${id}`, "user", [{ type: "image", data, mimeType: "image/gif" }], 6001), timestamp: 6001 });
+  const h = await hist();
+  for (const [id, bytes, mime] of good) {
+    const it = media(h, `msg-pad-${id}`).media[0];
+    assert.deepEqual([it.available, it.mime, it.size], [true, mime, bytes.length], id);
+    const r = await getMedia(`msg-pad-${id}`, it.ref);
+    assert.equal(r.status, 200, id); assert.ok(r.bytes.equals(bytes), id);
+  }
+  for (const id of Object.keys(bad)) {
+    const m = media(h, `msg-pad-bad-${id}`);
+    assert.equal(m.media[0].available, false, id);
+    assert.notEqual((await getMedia(`msg-pad-bad-${id}`, m.media[0].ref)).status, 200, id);
+  }
+});
