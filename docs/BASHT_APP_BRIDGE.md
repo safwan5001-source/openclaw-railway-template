@@ -49,7 +49,12 @@ The app holds **only** `BASHT_APP_TOKEN`. It never gets `OPENCLAW_GATEWAY_TOKEN`
 | `GET /app/v1/memory/file?name=&part=` | `MEMORY.md` or `USER.md` only, read-only | RPC `agents.files.get` |
 | `GET /app/v1/capabilities` | Channels, skills ready/missing, effective tools of the app session, plugins; cached 60 s | RPC `channels.status`, `skills.status`, `tools.effective`, `tools.catalog` (10 min), `plugins.list` |
 
-`/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. Its `text` (while
+`/runs/:id` also returns `firstTokenMs` and `totalMs`, measured by the bridge from the moment the turn started. When a turn ends in
+`status: "error"`, `error` stays the opaque `engine_error`; an additive `errorCode` is present only when the failure is a known kind:
+`rate_limited` (the provider answered HTTP 429, `usage_limit_reached`, "rate limit" or "too many requests"; lab: the gateway reports
+"429 The usage limit has been reached" on the stream). The provider's own text never leaves the bridge. Other failures carry no `errorCode`.
+That is the only place the bridge sees such a failure: when an image-generation tool fails inside a turn that otherwise completes, the
+failure is only in the model's reply text (and in the tool result, which the bridge never reads), so there is nothing to map. Its `text` (while
 running and when done) never contains the engine's own media markers: standalone `MEDIA:` lines and `[media attached: …]` markers are
 removed with the same rules as history rows, and while the reply is still streaming a half-written marker at the very end (`ME`,
 `MEDIA:`, `[media att…`) is held back until the next chunk completes it. The file itself is delivered as in history (`media` refs). Assistant messages in

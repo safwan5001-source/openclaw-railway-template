@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
-import { APP_SESSION_KEY, createAppBridge } from "./app-bridge.js";
+import { APP_SESSION_KEY, createAppBridge, runErrorCode } from "./app-bridge.js";
 import { IMAGE_ONLY_PLACEHOLDER, MAX_MEDIA_BYTES, extractMedia, inlineImageBytes, splitAttachedMarkers } from "./app-bridge-media.js";
 
 const APP_TOKEN = "synthetic-app-token-0123456789abcdef0123";
@@ -257,6 +257,30 @@ test("end to end: a photo sent through /send reaches the engine as an image_url 
   const r = await getMedia("msg-sent-001", m.media[0].ref);
   assert.equal(r.status, 200); assert.ok(r.bytes.equals(JPEG));
   assert.deepEqual(rpc.findLast((c) => c.method === "artifacts.download").params, { sessionKey: APP_SESSION_KEY, artifactId: "artifact_jpeg" });
+});
+
+// ------------------------------------------------------------------ errorCode ----------------------------------------------------
+
+test("runErrorCode: only a provider limit has a code", () => {
+  for (const msg of ["429 The usage limit has been reached", "usage_limit_reached", "Rate limit reached for requests", "rate_limit_exceeded", "HTTP 429", "Too Many Requests", "chat 429"]) {
+    assert.equal(runErrorCode(new Error(msg)), "rate_limited", msg);
+  }
+  for (const msg of ["provider exploded", "chat 500", "fetch failed", "port 14290 refused", ""]) assert.equal(runErrorCode(new Error(msg)), null, msg);
+  assert.equal(runErrorCode(null), null);
+});
+
+test("/runs/:id: a rate-limited turn carries errorCode next to the unchanged opaque error; other failures carry none", async () => {
+  chatMode = "limit";
+  const a = await call("/send", { method: "POST", body: { message: "x" } });
+  const done = await waitRun(a.json.runId);
+  assert.equal(done.status, "error"); assert.equal(done.error, "engine_error"); assert.equal(done.errorCode, "rate_limited");
+  assert.ok(!JSON.stringify(done).includes("usage limit"), "the provider's own text stays out");
+  chatMode = "boom";
+  const b = await waitRun((await call("/send", { method: "POST", body: { message: "y" } })).json.runId);
+  assert.equal(b.status, "error"); assert.equal(b.error, "engine_error"); assert.ok(!("errorCode" in b));
+  chatMode = "ok";
+  const c = await waitRun((await call("/send", { method: "POST", body: { message: "z" } })).json.runId);
+  assert.equal(c.status, "done"); assert.ok(!("errorCode" in c));
 });
 
 test("extractMedia: an assistant reply with an image block and a MEDIA: line shows both pictures", () => {

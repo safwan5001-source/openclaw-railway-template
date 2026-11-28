@@ -227,6 +227,16 @@ export function messageText(m) {
   return c.filter((p) => p && typeof p === "object" && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
 }
 
+/**
+ * A coarse, non-sensitive code for a turn that failed, read from what the engine / the provider said (the text itself never leaves
+ * the bridge): `rate_limited` for a provider limit (HTTP 429, `usage_limit_reached`, "rate limit", "too many requests").
+ * `null` when the failure has no known code; `run.error` stays `engine_error` either way.
+ */
+export function runErrorCode(err) {
+  const s = String(err?.message ?? err ?? "").slice(0, 2000);
+  return /usage[_ ]limit|rate[_ ]?limit|too many requests|(?:^|\D)429(?:\D|$)/i.test(s) ? "rate_limited" : null;
+}
+
 function sessionLabel(row) {
   if (row.key === APP_SESSION_KEY) return "التطبيق";
   if (row.key === MAIN_SESSION_KEY) return "الجلسة الرئيسية";
@@ -521,6 +531,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       .catch((err) => {
         run.status = ctl.signal.aborted ? "stopped" : "error";
         run.error = run.status === "error" ? "engine_error" : null;
+        if (run.status === "error") run.errorCode = runErrorCode(err);
         if (run.status === "error") log?.warn?.("app-bridge", `run failed: ${err?.message ?? err}`);
       })
       .finally(() => { clearTimeout(timer); run.finishedAt = now(); forgetDescribe(); }); // the turn saved the session: a cached describe is stale
@@ -533,7 +544,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     totalMs: r.finishedAt == null ? null : r.finishedAt - r.startedAt,
   });
   // the live text hides the engine's own media markers the same way history rows do (the app shows the file, not the marker)
-  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: cleanLiveText(r.text, { streaming: r.status === "running" }), error: r.error, startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
+  const view = (r) => ({ ok: true, runId: r.id, status: r.status, text: cleanLiveText(r.text, { streaming: r.status === "running" }), error: r.error, ...(r.errorCode ? { errorCode: r.errorCode } : {}), startedAt: r.startedAt, finishedAt: r.finishedAt, ...latency(r),
     steps: r.steps ?? [] });
 
   /** B1 tool progress: refreshed only while the app polls a running turn, at most every STEPS_EVERY_MS; names only. */
