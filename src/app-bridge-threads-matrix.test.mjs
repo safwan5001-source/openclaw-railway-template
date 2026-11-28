@@ -89,7 +89,8 @@ function rowsFor(c) {
     rows.push(asst(`R${n}`, `partial ${n}`, "toolUse", { turnBoundary: true, continuation: { source: "restart" } })); // a continuation's partial
     rows.push(asst(`R${n}`, `final ${n}`, "stop"));
   }
-  if (c.notice) rows.push({ role: "assistant", content: [{ type: "text", text: "↪️ Model Fallback: x", openclawStatusNotice: true }], timestamp: 9, __openclaw: { id: id("n"), runId: c.conts ? `R${c.conts}` : K } });
+  // the engine's notice row carries a stop reason too (integration BUG-2: the notice final has stopReason): only the notice flag excludes it
+  if (c.notice) rows.push({ role: "assistant", content: [{ type: "text", text: "↪️ Model Fallback: x", openclawStatusNotice: true }], stopReason: "stop", timestamp: 9, __openclaw: { id: id("n"), runId: c.conts ? `R${c.conts}` : K } });
   if (c.later) {
     rows.push({ role: "user", idempotencyKey: `${KL}:user`, content: "a later question", timestamp: 10, __openclaw: { id: id("l") } });
     rows.push(asst("RL", "LATER partial", "toolUse", { continuation: { source: "restart" } }));
