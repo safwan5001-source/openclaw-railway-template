@@ -460,18 +460,22 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
   /**
    * The runId /send returned for the turn that wrote user row `i` of `list`, or null. The engine does not store any id of its own on
    * the user row (its `idempotencyKey` is an internal run id the chat endpoint never reveals), but the reply row of the same turn
-   * carries the id of the stream (`__openclaw.runId`), which this process saw and linked to the runId it returned. So: a user row of
-   * the app session whose very next row is an assistant row with such an id, written no earlier than the user row. Nothing is
-   * taken from any other id: a row of another conversation, a turn this process did not start, or a turn with no reply has none.
+   * carries the id of the stream (`__openclaw.runId`), which this process saw and linked to the runId it returned. A user row gets it
+   * only when it is provably THE one user row of that turn: the key is the app session, the next row is an assistant row whose engine
+   * run id was linked in this process and which is not older than the user row, and the row before the user row is an assistant row
+   * or a reset (or the page starts here and `complete` says nothing older exists). Two user rows in a row before one reply (a turn
+   * that was stopped, then another) are ambiguous: neither gets an id. Nothing else is ever published.
    */
-  const runIdOf = (key, list, i) => {
+  const runIdOf = (key, list, i, complete) => {
     if (key !== APP_SESSION_KEY || list[i]?.role !== "user") return null;
+    const prev = i === 0 ? null : list[i - 1];
+    if (i === 0 ? complete !== true : prev.role === "user") return null;
     const next = list[i + 1];
     const engineId = next?.role === "assistant" ? next.__openclaw?.runId : null;
     if (typeof engineId !== "string" || !(Number(next.timestamp) >= Number(list[i].timestamp))) return null;
     return runLinks.get(engineId) ?? null;
   };
-  const mapRows = (key, rows) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
+  const mapRows = (key, rows, complete = false) => { const list = rows.filter((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m))); return list.map((m, i) => {
     if (isResetRow(m)) return { role: "system", kind: "reset", text: "", at: Number(m.timestamp) || 0, id: rowId(m), media: [] };
     const { text, media, messageId } = extractMedia(m, key, messageText(m));
     for (const it of media) if (it.ref && messageId) refs.put(key, messageId, it);
@@ -482,7 +486,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       const ok = c.ok; const size = ok ? c.size : null;
       return publicMedia({ ...it, size }, ok);
     });
-    const runId = runIdOf(key, list, i);
+    const runId = runIdOf(key, list, i, complete);
     return { role: m.role, text, at: Number(m.timestamp) || 0, id: rowId(m), media: pub, ...(runId ? { runId } : {}), ...(m.role === "assistant" ? assistantMeta(m) : {}) };
   }).filter((m) => m.kind === "reset" || m.text.trim() !== "" || m.media.length > 0); };
 
@@ -507,7 +511,7 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
       if (offsetRaw !== undefined) args.offset = Math.max(Number.parseInt(String(offsetRaw), 10) || 0, 0);
       const h = await invoke("sessions_history", args);
       const raw = Array.isArray(h.messages) ? h.messages : [];
-      const messages = mapRows(key, raw);
+      const messages = mapRows(key, raw, h.hasMore !== true && args.offset === undefined);
       // after «محادثة جديدة» the engine's default view starts at the reset row; the rows before it stay readable (anchored)
       const first = raw.find((m) => m && (m.role === "user" || m.role === "assistant" || isResetRow(m)));
       const earlier = h.hasMore !== true && key === APP_SESSION_KEY && first && isResetRow(first) && ledger.anchorFor(rowId(first)) ? rowId(first) : null;
