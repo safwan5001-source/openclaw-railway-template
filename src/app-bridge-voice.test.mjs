@@ -8,6 +8,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import express from "express";
 import { APP_SESSION_KEY, createAppBridge } from "./app-bridge.js";
+import { EXTRA_FEATURES } from "./app-bridge-status.js";
 import { FEATURES, REASONS, SPEAK_STATES, canonicalize, evaluateVoiceGuard, mergeDeep, normalizeSpeechProviderId, prefsPathFor, identityHash, isSecretKey, readVoiceGuard, speakStatus, stripSecrets, voiceIdentity } from "./app-bridge-voice.js";
 
 const CONTRACT = JSON.parse(fs.readFileSync(new URL("./fixtures/voice-contract.json", import.meta.url), "utf8"));
@@ -467,12 +468,12 @@ test("status: additive fixed fields — features, voice, runs, signing; engine v
     assert.equal(json.ok, true);
     assert.equal(json.appSession, APP_SESSION_KEY);
     assert.equal(json.link.state, "up", "existing fields stay");
-    assert.deepEqual(json.features, CONTRACT.features);
+    assert.deepEqual(json.features, [...CONTRACT.features, ...EXTRA_FEATURES], "the voice contract ids first, then the non-voice ids (app-bridge-status.js)");
     assert.deepEqual(json.voice, { speak: "ready", warnings: [] });
     assert.deepEqual(json.runs, { active: 0, engine: 0, cron: 0, approvalsPending: 0, total: 0, complete: true });
     assert.deepEqual(json.signing, { mode: "off", active: false, warnings: [], replayProtection: "memory+boot_fence" });
     assert.deepEqual(json.engine, { version: "2026.11.10" });
-    assert.deepEqual(Object.keys(json).sort(), ["appSession", "engine", "features", "link", "ok", "runs", "signing", "voice"]);
+    assert.deepEqual(Object.keys(json).sort(), ["appSession", "attachments", "engine", "features", "link", "ok", "runs", "signing", "voice", "wrapper"]);
     assert.equal(link.calls.length, 0, "status makes no TTS call and no write");
     assert.deepEqual(link.reads, ["sessions.list", "cron.list"], "only the two read-only counting reads");
   } finally { m.close(); }

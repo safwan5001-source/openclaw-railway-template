@@ -54,6 +54,7 @@ import { createLiveRoutes } from "./app-bridge-live.js";
 import { FEATURES, REASONS, normalizeSpeechProviderId, readVoiceGuard, speakStatus } from "./app-bridge-voice.js";
 import { createSigningVerifier } from "./app-bridge-signing.js";
 import { createRunsProbe } from "./app-bridge-runs.js";
+import { EXTRA_FEATURES, attachmentLimits, wrapperCommit } from "./app-bridge-status.js";
 import { createAppControl } from "./app-control.js";
 import { SEND_BODY_LIMIT, cleanLiveText, createRefCache, checkMediaFile, extractMedia, mediaRoots, parseImages, publicMedia, registerMediaRoute, turnContent } from "./app-bridge-media.js";
 import { CURSOR_RE, STEPS_EVERY_MS, anchoredPage, createResetLedger, isResetRow, registerConvoRoutes, rowId, stepsFrom } from "./app-bridge-convo.js";
@@ -301,12 +302,13 @@ async function readCompletionStream(body, onText, onEngineRunId) {
  *     answered ok:false (no audio model, provider error), `.badAudio` when the recording cannot be read. Without it /transcribe is 503.
  *   stateDir / workspaceDir: OpenClaw's state dir and the agent workspace — the only roots a MEDIA: file may be served from
  *     (B2), and where the reset ledger lives (B1). Without them no local file is served.
+ *   env: where /status reads the build commit from (only RAILWAY_GIT_COMMIT_SHA, see app-bridge-status.js); default process.env.
  * @param {ReturnType<import("./gateway-link.js").createGatewayLink>} [opts.link] the persistent gateway link (events, approvals,
  *   and the approval deadline that keeps a waiting turn alive); without it /events and /approvals* return 503 not_available.
  * @returns {import("express").Router | null} null when the bridge is not enabled
  */
 export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, log, fetchImpl = fetch, now = Date.now, gatewayCall: rawGatewayCall, link,
-  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing }) {
+  stateDir, workspaceDir, transcribe, transcribeTimeoutMs = TRANSCRIBE_TIMEOUT_MS, signing, env = process.env }) {
   const appToken = String(token ?? "").trim();
   if (appToken.length < MIN_TOKEN_LENGTH) return null;
   const gatewayCall = rawGatewayCall ? capConcurrency(rawGatewayCall, GATEWAY_CONCURRENCY, GATEWAY_QUEUE_MAX) : undefined;
@@ -427,7 +429,10 @@ export function createAppBridge({ token, gatewayUrl, gatewayToken, configPath, l
     const version = link?.serverVersion?.() ?? null;
     res.json({
       ok: true, appSession: APP_SESSION_KEY, link: link ? link.status() : { state: "off" },
-      features: [...FEATURES], // the shared contract with the app (src/fixtures/voice-contract.json)
+      // FEATURES is the shared voice contract with the app (src/fixtures/voice-contract.json); EXTRA_FEATURES are the non-voice ids after it
+      features: [...FEATURES, ...EXTRA_FEATURES],
+      wrapper: { commit: wrapperCommit(env) }, // 12 hex characters of the build's commit, or null; nothing else from the environment
+      attachments: attachmentLimits(), // the limits /send and /media enforce (bytes), from the real constants
       voice: { ...speakStatus(guard, { linkUp: link?.isUp?.() === true, toolPath: !!speechDir }), warnings: guard.warnings },
       // turns running right now: a restart of the engine while this is above 0 makes the gateway re-run them (docs: release rule)
       runs: await runsProbe.read([...runs.values()].filter((r) => r.status === "running").length),
