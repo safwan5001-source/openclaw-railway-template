@@ -1086,3 +1086,35 @@ test("BUG-5: a new conversation's session hash is captured after the ack (bounde
     assert.equal(b2.writeLink.sends.length, 0);
   } finally { await b2.close(); }
 });
+
+test("round-2 edges: two real finals keep the FIRST; ack 'ok' is done even with history unreadable; a non-final own row keeps 'running'; null-hash resend after a restart is already_received", async () => {
+  const key = `agent:main:app:owner:${A}`;
+  const b = await bridge();
+  try {
+    assert.equal((await send(b, A, K1)).status, 202);
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 1, state: "final", message: { role: "assistant", content: [{ type: "text", text: "first" }] } });
+    b.writeLink.emit("chat", { runId: K1, sessionKey: key, seq: 2, state: "final", message: { role: "assistant", content: [{ type: "text", text: "second" }] } });
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K1}`)).json.text, "first");
+    // a reply row of K that is NOT final (mid-turn text before a tool step, no stop reason): still running
+    await sleep(W + 20);
+    assert.equal((await send(b, A, K2)).status, 202);
+    b.link.history[key] = { messages: [userRow(K2, "row0010"), { role: "assistant", content: [{ type: "text", text: "let me check" }], stopReason: "toolUse", timestamp: 3, __openclaw: { id: "row0011", runId: K2 } }] };
+    await sleep(1600);
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K2}`)).json.status, "running");
+    // ack "ok" with history unreadable and agent.wait timing out: done (no final will ever come)
+    await sleep(W + 20);
+    b.writeLink.behave = (p) => ({ runId: p.idempotencyKey, status: "ok" });
+    assert.equal((await send(b, A, K3)).json.ack, "ok");
+    b.link.failHistory = true;
+    assert.equal((await b.call("GET", `/threads/${A}/runs/${K3}`)).json.status, "done");
+  } finally { await b.close(); }
+  // after a bridge restart (no record), the API stored null at reservation, the session the original created holds "<K>:user"
+  const link = fakeLink();
+  link.sessions[key] = { key, sessionId: "sid-created" };
+  link.history[key] = { messages: [userRow(K1, "row0001", Date.now())] };
+  const b2 = await bridge({ link });
+  try {
+    const r = await b2.call("POST", `/threads/${A}/sends/${K1}/resend`, { message: "hello", originalAt: Date.now() - 1000, sessionSha256: null });
+    assert.deepEqual(r.json, { ok: false, error: "resend_not_allowed", reason: "already_received" });
+  } finally { await b2.close(); }
+});
